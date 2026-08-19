@@ -16,6 +16,8 @@
     "@codemirror/lang-cpp": "^6.0.3",
     "@codemirror/lang-java": "^6.0.2",
     "@codemirror/lang-python": "^6.2.1",
+    "@mediapipe/tasks-audio": "^1.0.1",
+    "@mediapipe/tasks-vision": "^1.0.1",
     "@uiw/react-codemirror": "^4.25.11",
     "axios": "^1.18.1",
     "react": "^19.2.7",

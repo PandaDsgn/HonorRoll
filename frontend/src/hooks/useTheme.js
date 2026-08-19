@@ -6,8 +6,9 @@ function getInitialTheme() {
   const stored = window.localStorage.getItem(STORAGE_KEY);
   if (stored === 'light' || stored === 'dark') return stored;
 
-  // Fall back to the OS/browser preference on first visit
-  return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  // Light (white + orange) is the brand default — only defer to the OS/
+  // browser preference when it explicitly asks for dark.
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 }
 
 export function useTheme() {

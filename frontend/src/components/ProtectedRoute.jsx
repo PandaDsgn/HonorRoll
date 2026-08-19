@@ -23,7 +23,11 @@ export default function ProtectedRoute({ children, roles }) {
   }
 
   if (roles && !roles.includes(user.role)) {
-    return <Navigate to={user.role === 'admin' ? '/admin' : '/assignments'} replace />;
+    // Teacher lands in the same admin shell as admin for now — AdminDashboard
+    // itself hides admin-only panels (org structure, approvals) when the
+    // signed-in role is 'teacher'.
+    const home = user.role === 'admin' || user.role === 'teacher' ? '/admin' : '/assignments';
+    return <Navigate to={home} replace />;
   }
 
   return children;

@@ -2,6 +2,7 @@ import { useNavigate } from 'react-router-dom';
 import { useTheme } from '../hooks/useTheme';
 import { useAuth } from '../context/AuthContext';
 import ThemeToggle from '../components/ThemeToggle';
+import BrandMark from '../components/BrandMark';
 
 export default function Home() {
   const navigate = useNavigate();
@@ -18,7 +19,7 @@ export default function Home() {
   return (
     <div className="landing-shell">
       <header className="sb-topbar">
-        {/* Deliberately no "CodeJudge" wordmark here — it's the big heading below instead */}
+        {/* Deliberately no "AssignMeant" wordmark here — it's the big heading below instead */}
         <span />
         <div className="sb-actions">
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
@@ -26,17 +27,21 @@ export default function Home() {
       </header>
 
       <main className="landing-hero">
-        <h1 className="landing-brand">CodeJudge</h1>
-        <h2 className="landing-title">Write code. Run it. Get graded.</h2>
+        <h1 className="landing-brand"><BrandMark /></h1>
+        <h2 className="landing-title">The way assignments are meant to be graded.</h2>
         <p className="landing-sub">
-          Practice problems, run your code against real test cases, and submit
-          assignments — all in one place, no setup on your own machine required.
+          Write your solutions to your assignments, run codes independently, give exams, and get feedback.
         </p>
 
         <div className="landing-cta-row">
           <button type="button" className="btn btn-primary landing-cta" onClick={handleCta} disabled={loading}>
             {loading ? 'Loading…' : user ? 'Continue to your workspace' : 'Sign in to your workspace'}
           </button>
+          {!user && !loading && (
+            <button type="button" className="btn btn-ghost landing-cta" onClick={() => navigate('/signup')}>
+              Set up your school or college
+            </button>
+          )}
         </div>
       </main>
     </div>

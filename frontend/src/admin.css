@@ -233,3 +233,75 @@
   max-height: 320px;
   overflow-y: auto;
 }
+
+/* ---------- exam builder (ExamForm) ---------- */
+.exam-item-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.exam-item-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.exam-item-head {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.exam-item-index {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  white-space: nowrap;
+  padding-bottom: 10px;
+}
+
+.exam-item-field-sm { width: 90px; flex: 0 0 auto; }
+.exam-item-field-md { width: 170px; flex: 0 0 auto; }
+
+.exam-item-hint {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.mcq-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mcq-option-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mcq-option-row input[type='text'] {
+  flex: 1;
+  padding: 8px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.mcq-option-row input[type='radio'] {
+  accent-color: var(--accent);
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}

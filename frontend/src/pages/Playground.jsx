@@ -7,6 +7,7 @@ import { cpp } from '@codemirror/lang-cpp';
 import { java } from '@codemirror/lang-java';
 import { useTheme } from '../hooks/useTheme';
 import ThemeToggle from '../components/ThemeToggle';
+import BrandMark from '../components/BrandMark';
 import SpaceSwitcher from '../components/SpaceSwitcher';
 import { useAuth } from '../context/AuthContext';
 import { API } from '../config';
@@ -105,7 +106,7 @@ export default function Playground() {
   return (
     <div className="sb-shell">
       <header className="sb-topbar">
-        <button type="button" className="brand" onClick={() => navigate('/')}>CodeJudge</button>
+        <button type="button" className="brand" onClick={() => navigate('/')}><BrandMark /></button>
         <div className="sb-actions">
           <SpaceSwitcher activeTab="playground" />
           <ThemeToggle theme={theme} onToggle={toggleTheme} />

@@ -161,6 +161,11 @@ button, input, select { font-family: inherit; }
 }
 .auth-card .brand { font-size: 17px; }
 
+/* Two-tone wordmark: "Assign" in the neutral heading color, "Meant" always
+   orange — see components/BrandMark.jsx, used everywhere .brand appears. */
+.brand-assign { color: var(--text-h); }
+.brand-meant { color: var(--accent); }
+
 /* Lets the brand wordmark double as a "go home" button without picking up
    default <button> chrome â€” looks identical to the old plain text version. */
 button.brand {
@@ -170,7 +175,7 @@ button.brand {
   cursor: pointer;
   font: inherit;
 }
-button.brand:hover { color: var(--accent); }
+button.brand:hover .brand-assign { color: var(--accent); }
 
 /* ---------- corner-bracket frame ---------- */
 .bracket-frame { position: relative; }
@@ -338,6 +343,37 @@ button.brand:hover { color: var(--accent); }
   text-align: center;
 }
 
+/* ---------- auth: multi-org workspace picker ---------- */
+.org-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 6px;
+}
+.org-picker-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 14px 16px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: var(--text-h);
+  transition: border-color 0.15s ease, background 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+}
+.org-picker-item:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--surface-3);
+  transform: translateY(-1px);
+}
+.org-picker-item:disabled { cursor: not-allowed; opacity: 0.6; }
+.org-picker-item-name { font-size: 14.5px; font-weight: 600; }
+
 /* ---------- panel / chip ---------- */
 .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
 
@@ -427,6 +463,58 @@ button.brand:hover { color: var(--accent); }
 .auth-sub { font-size: 14px; color: var(--text-dim); margin-bottom: 24px; }
 .auth-form { display: flex; flex-direction: column; gap: 16px; }
 .auth-submit { width: 100%; padding: 12px; font-size: 15px; margin-top: 4px; }
+
+/* ---------- auth divider + alt-action banner ---------- */
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 26px 0 18px;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+}
+.auth-divider::before,
+.auth-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+.auth-alt-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  width: 100%;
+  padding: 14px 16px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+}
+.auth-alt-action:hover {
+  background: var(--surface-3);
+  border-color: var(--border-strong);
+  transform: translateY(-1px);
+}
+.auth-alt-action:active { transform: translateY(0); }
+.auth-alt-action-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.auth-alt-action-title { font-size: 13.5px; font-weight: 600; color: var(--text-h); }
+.auth-alt-action-sub { font-size: 12px; color: var(--text-dim); }
+.auth-alt-action-arrow {
+  color: var(--accent);
+  font-size: 17px;
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+}
+.auth-alt-action:hover .auth-alt-action-arrow { transform: translateX(3px); }
 
 /* ---------- sandbox shell ---------- */
 .sb-shell { min-height: 100vh; display: flex; flex-direction: column; flex: 1; }
@@ -643,10 +731,15 @@ button.brand:hover { color: var(--accent); }
 
 .landing-cta-row {
   margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  justify-content: center;
 }
 
 .landing-cta {
-  padding: 12px 28px;
+  padding: 13px 30px;
   font-size: 15px;
 }
 

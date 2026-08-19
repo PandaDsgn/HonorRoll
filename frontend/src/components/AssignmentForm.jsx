@@ -1,4 +1,6 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import axios from 'axios';
+import { API } from '../config';
 
 const LANGS = ['python', 'c', 'cpp', 'java'];
 const emptyTestCase = () => ({ input: '', expectedOutput: '', isHidden: true });
@@ -35,9 +37,21 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
 
   const [opensAt, setOpensAt] = useState(formatLocal(initialData?.opensAt));
   const [closesAt, setClosesAt] = useState(formatLocal(initialData?.closesAt));
+  const [subjectId, setSubjectId] = useState(initialData?.subjectId != null ? String(initialData.subjectId) : '');
+  const [subjects, setSubjects] = useState([]);
 
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+
+  // Best-effort — an admin sees every subject and can leave this on "No
+  // subject" for an org-wide item; a teacher only ever sees (via the
+  // backend's own org-scoping) the subjects they're actually assigned to,
+  // and must pick one since teacher-created items are always subject-scoped.
+  useEffect(() => {
+    axios.get(`${API}/api/admin/subjects`, { withCredentials: true })
+      .then((res) => setSubjects(res.data.subjects))
+      .catch(() => {});
+  }, []);
 
   const updateTestCase = (idx, patch) => {
     setTestCases((prev) => prev.map((tc, i) => (i === idx ? { ...tc, ...patch } : tc)));
@@ -73,6 +87,7 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
       testCases: cleanCases,
       opensAt: toIsoOrNull(opensAt),
       closesAt: toIsoOrNull(closesAt),
+      subjectId: subjectId || null,
     };
 
     setSubmitting(true);
@@ -110,6 +125,16 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
         <div className="field">
           <label htmlFor="af-closes">Deadline (optional)</label>
           <input id="af-closes" type="datetime-local" value={closesAt} onChange={(e) => setClosesAt(e.target.value)} />
+        </div>
+
+        <div className="field">
+          <label htmlFor="af-subject">Subject</label>
+          <select id="af-subject" value={subjectId} onChange={(e) => setSubjectId(e.target.value)}>
+            <option value="">No subject (org-wide)</option>
+            {subjects.map((s) => (
+              <option key={s.id} value={s.id}>{s.name} — {s.org_unit_name}</option>
+            ))}
+          </select>
         </div>
       </div>
 

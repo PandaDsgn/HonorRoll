@@ -4,11 +4,17 @@ import { AuthProvider } from './context/AuthContext';
 import ProtectedRoute from './components/ProtectedRoute';
 import Home from './pages/Home';
 import Login from './pages/Login';
+import Signup from './pages/Signup';
+import VerifyOrganization from './pages/VerifyOrganization';
 import ForgotPassword from './pages/ForgotPassword';
 import ResetPassword from './pages/ResetPassword';
 import Problems from './pages/Problems';
+import AssignmentResult from './pages/AssignmentResult';
 import Sandbox from './pages/Sandbox';
 import Playground from './pages/Playground';
+import Exams from './pages/Exams';
+import ExamAttempt from './pages/ExamAttempt';
+import ExamResult from './pages/ExamResult';
 import AdminDashboard from './pages/AdminDashboard';
 
 function App() {
@@ -19,18 +25,25 @@ function App() {
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/login" element={<Login />} />
+          <Route path="/signup" element={<Signup />} />
+          <Route path="/verify-organization" element={<VerifyOrganization />} />
           <Route path="/forgot-password" element={<ForgotPassword />} />
           <Route path="/reset-password" element={<ResetPassword />} />
 
           <Route path="/assignments" element={<ProtectedRoute><Problems /></ProtectedRoute>} />
           <Route path="/assignments/:id" element={<ProtectedRoute><Sandbox /></ProtectedRoute>} />
+          <Route path="/assignments/:id/result" element={<ProtectedRoute><AssignmentResult /></ProtectedRoute>} />
 
           <Route path="/ide" element={<ProtectedRoute><Playground /></ProtectedRoute>} />
+
+          <Route path="/exams" element={<ProtectedRoute><Exams /></ProtectedRoute>} />
+          <Route path="/exams/:id" element={<ProtectedRoute><ExamAttempt /></ProtectedRoute>} />
+          <Route path="/exams/:id/result" element={<ProtectedRoute><ExamResult /></ProtectedRoute>} />
 
           <Route
             path="/admin"
             element={
-              <ProtectedRoute roles={['admin']}>
+              <ProtectedRoute roles={['admin', 'teacher']}>
                 <AdminDashboard />
               </ProtectedRoute>
             }

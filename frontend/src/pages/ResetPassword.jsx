@@ -3,6 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import axios from 'axios';
 import { useTheme } from '../hooks/useTheme';
 import ThemeToggle from '../components/ThemeToggle';
+import BrandMark from '../components/BrandMark';
 import { EyeIcon, EyeOffIcon } from '../components/EyeIcons';
 import { API } from '../config';
 
@@ -58,7 +59,7 @@ export default function ResetPassword() {
         <span className="corner br" aria-hidden="true" />
 
         <div className="auth-card-head">
-          <button type="button" className="brand" onClick={() => navigate('/')}>CodeJudge</button>
+          <button type="button" className="brand" onClick={() => navigate('/')}><BrandMark /></button>
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
         </div>
 

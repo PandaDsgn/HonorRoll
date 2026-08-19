@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>CodeJudge</title>
+  <title>AssignMeant</title>
   <!-- Load CodeMirror CSS -->
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/codemirror.min.css">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.13/theme/monokai.min.css">
@@ -39,7 +39,7 @@
   <!-- ============================== -->
   <div id="login-screen">
     <div class="login-box">
-      <h2>CodeJudge Login</h2>
+      <h2>AssignMeant Login</h2>
       <input type="email" id="email" placeholder="Student Email" required>
       <input type="password" id="password" placeholder="Password" required>
       <button onclick="handleLogin()">Sign In</button>
@@ -52,7 +52,7 @@
   <!-- ============================== -->
   <div id="app-screen">
     <div class="header">
-      <h2>CodeJudge Sandbox</h2>
+      <h2>AssignMeant Sandbox</h2>
       <div class="controls">
         <select id="language">
           <option value="python">Python</option>
@@ -119,7 +119,7 @@
       mode: "python"
     });
 
-    editor.setValue('print("Hello from CodeJudge!")');
+    editor.setValue('print("Hello from AssignMeant!")');
 
     document.getElementById('language').addEventListener('change', (e) => {
       const lang = e.target.value;

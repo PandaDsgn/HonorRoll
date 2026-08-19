@@ -7,6 +7,7 @@ import { cpp } from '@codemirror/lang-cpp';
 import { java } from '@codemirror/lang-java';
 import { useTheme } from '../hooks/useTheme';
 import ThemeToggle from '../components/ThemeToggle';
+import BrandMark from '../components/BrandMark';
 import SpaceSwitcher from '../components/SpaceSwitcher';
 import { useAuth, TOKEN_KEY } from '../context/AuthContext';
 import { API } from '../config';
@@ -342,7 +343,7 @@ export default function Sandbox() {
   return (
     <div className="sb-shell">
       <header className="sb-topbar">
-        <button type="button" className="brand" onClick={() => navigate('/')}>CodeJudge</button>
+        <button type="button" className="brand" onClick={() => navigate('/')}><BrandMark /></button>
         {problem && (
           <button type="button" className="sb-crumb sb-crumb-link" onClick={() => navigate('/assignments')}>
             {problem.title}

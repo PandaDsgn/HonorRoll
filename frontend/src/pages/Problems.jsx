@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { useTheme } from '../hooks/useTheme';
 import ThemeToggle from '../components/ThemeToggle';
+import BrandMark from '../components/BrandMark';
 import SpaceSwitcher from '../components/SpaceSwitcher';
 import { useAuth } from '../context/AuthContext';
 import { API } from '../config';
@@ -86,7 +87,7 @@ export default function Problems() {
   return (
     <div className="sb-shell">
       <header className="sb-topbar">
-        <button type="button" className="brand" onClick={() => navigate('/')}>CodeJudge</button>
+        <button type="button" className="brand" onClick={() => navigate('/')}><BrandMark /></button>
         <div className="sb-actions">
           <SpaceSwitcher activeTab="assignments" />
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
@@ -118,32 +119,47 @@ export default function Problems() {
             {problems.map((p, idx) => {
               const timeLeft = p.status === 'open' ? formatTimeLeft(p.closes_at, now) : null;
               const sub = submissionChip(p.submission);
+              // Result tags only make sense once the deadline has passed (or
+              // there was never one) and the student has actually submitted
+              // — matches the same gate GET /api/problems/:id/result enforces.
+              const resultEligible = !!p.submission && (!p.closes_at || new Date(p.closes_at) <= new Date(now));
               return (
-                <button
-                  key={p.id}
-                  type="button"
-                  className="problem-card"
-                  onClick={() => navigate(`/assignments/${p.id}`)}
-                >
-                  <span className="problem-card-title">
-                    <span className="problem-card-index">{idx + 1}.</span> {p.title}
-                  </span>
-                  <span className="problem-card-badges">
-                    <span className={`chip ${DIFFICULTY_CLASS[p.difficulty] || 'chip-medium'}`}>
-                      <span className="dot" />
-                      {p.difficulty}
+                <div key={p.id}>
+                  <button
+                    type="button"
+                    className="problem-card"
+                    onClick={() => navigate(`/assignments/${p.id}`)}
+                  >
+                    <span className="problem-card-title">
+                      <span className="problem-card-index">{idx + 1}.</span> {p.title}
                     </span>
-                    <span className={`chip ${STATUS_CLASS[p.status] || 'chip-medium'}`}>
-                      <span className="dot" />
-                      {p.status === 'open' ? 'Open' : 'Closed'}
+                    <span className="problem-card-badges">
+                      <span className={`chip ${DIFFICULTY_CLASS[p.difficulty] || 'chip-medium'}`}>
+                        <span className="dot" />
+                        {p.difficulty}
+                      </span>
+                      <span className={`chip ${STATUS_CLASS[p.status] || 'chip-medium'}`}>
+                        <span className="dot" />
+                        {p.status === 'open' ? 'Open' : 'Closed'}
+                      </span>
+                      <span className={`chip ${sub.className}`}>
+                        <span className="dot" />
+                        {sub.label}
+                      </span>
+                      {timeLeft && <span className="problem-card-timeleft">{timeLeft}</span>}
                     </span>
-                    <span className={`chip ${sub.className}`}>
-                      <span className="dot" />
-                      {sub.label}
-                    </span>
-                    {timeLeft && <span className="problem-card-timeleft">{timeLeft}</span>}
-                  </span>
-                </button>
+                  </button>
+                  {resultEligible && (
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm"
+                      style={{ marginTop: 6 }}
+                      onClick={() => navigate(`/assignments/${p.id}/result`)}
+                    >
+                      View result
+                    </button>
+                  )}
+                </div>
               );
             })}
           </div>
