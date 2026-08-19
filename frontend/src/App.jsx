@@ -16,6 +16,7 @@ import Exams from './pages/Exams';
 import ExamAttempt from './pages/ExamAttempt';
 import ExamResult from './pages/ExamResult';
 import AdminDashboard from './pages/AdminDashboard';
+import SuperadminDashboard from './pages/SuperadminDashboard';
 
 function App() {
   return (
@@ -45,6 +46,15 @@ function App() {
             element={
               <ProtectedRoute roles={['admin', 'teacher']}>
                 <AdminDashboard />
+              </ProtectedRoute>
+            }
+          />
+
+          <Route
+            path="/superadmin"
+            element={
+              <ProtectedRoute roles={['superadmin']}>
+                <SuperadminDashboard />
               </ProtectedRoute>
             }
           />

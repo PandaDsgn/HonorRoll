@@ -39,7 +39,7 @@ export default function ForgotPassword() {
         <span className="corner br" aria-hidden="true" />
 
         <div className="auth-card-head">
-          <button type="button" className="brand" onClick={() => navigate('/')}><BrandMark /></button>
+          <button type="button" className="brand" onClick={() => navigate('/', { replace: true })}><BrandMark /></button>
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
         </div>
 
@@ -81,7 +81,7 @@ export default function ForgotPassword() {
         )}
 
         <div className="auth-back-row">
-          <button type="button" className="auth-link" onClick={() => navigate('/login')}>
+          <button type="button" className="auth-link" onClick={() => navigate('/login', { replace: true })}>
             Back to sign in
           </button>
         </div>

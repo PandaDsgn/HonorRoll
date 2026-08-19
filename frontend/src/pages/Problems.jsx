@@ -81,7 +81,7 @@ export default function Problems() {
   const { logout } = useAuth();
   const handleLogout = async () => {
     await logout();
-    navigate('/');
+    navigate('/', { replace: true });
   };
 
   return (

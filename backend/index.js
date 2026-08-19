@@ -103,6 +103,20 @@ async function ensureUsersOrgColumn() {
 }
 ensureUsersOrgColumn();
 
+// Nullable — a person's display name, collected wherever it's already
+// naturally available (a CSV/Google Form "Name" column, or the manual add
+// forms) and stored once on the global identity rather than per-org, since
+// it's the same person regardless of which organization is asking. No
+// dependency on organizations, so this can run standalone.
+async function ensureUsersNameColumn() {
+  try {
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT');
+  } catch (err) {
+    console.error('Failed to ensure users.name:', err);
+  }
+}
+ensureUsersNameColumn();
+
 async function ensureProblemsOrgColumn() {
   await ensureOrganizationsSchema();
   try {
@@ -780,16 +794,24 @@ function generateRandomPassword(length = 10) {
 // answers the first question — it never touches an existing identity's
 // password, so joining a second organization can never invalidate
 // credentials that already work somewhere else.
-async function findOrCreateGlobalUser(client, email) {
+async function findOrCreateGlobalUser(client, email, name = null) {
+  const trimmedName = name ? String(name).trim() : null;
   const existing = await client.query('SELECT id FROM users WHERE email = $1', [email]);
   if (existing.rows.length > 0) {
+    // Backfill only — never overwrite a name someone already has with a
+    // blank/different one from a later import; just fills the gap for an
+    // identity that was created (e.g. via create-student) before a name
+    // was ever supplied for them.
+    if (trimmedName) {
+      await client.query('UPDATE users SET name = $1 WHERE id = $2 AND name IS NULL', [trimmedName, existing.rows[0].id]);
+    }
     return { userId: existing.rows[0].id, isNew: false, temporaryPassword: null };
   }
   const rawPassword = generateRandomPassword();
   const hashedPassword = await bcrypt.hash(rawPassword, 10);
   const inserted = await client.query(
-    'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id',
-    [email, hashedPassword]
+    'INSERT INTO users (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id',
+    [email, hashedPassword, trimmedName]
   );
   return { userId: inserted.rows[0].id, isNew: true, temporaryPassword: rawPassword };
 }
@@ -962,6 +984,26 @@ function requireAdmin(req, res, next) {
 function requireAdminOrTeacher(req, res, next) {
   if (req.user?.role !== 'admin' && req.user?.role !== 'teacher') {
     return res.status(403).json({ error: 'Admin or teacher access required' });
+  }
+  next();
+}
+
+// Platform-owner allowlist — a handful of real people, not a role anyone
+// can be granted through the app itself (no UI/route ever sets this; it's
+// env-config only, same "no sane default for a secret" posture as
+// JWT_SECRET). Checked once, at login time, against the account's email —
+// see POST /api/login's zero-membership branch, which is what actually
+// mints a role:'superadmin' token for a matching email. requireSuperadmin
+// below just trusts that already-signed claim; it does no allowlist lookup
+// of its own; a leaked normal admin/teacher/student token can never
+// satisfy it since none of those roles are ever the string 'superadmin'.
+function getSuperadminEmails() {
+  return (process.env.SUPERADMIN_EMAILS || '').split(',').map((e) => e.trim().toLowerCase()).filter(Boolean);
+}
+
+function requireSuperadmin(req, res, next) {
+  if (req.user?.role !== 'superadmin') {
+    return res.status(403).json({ error: 'Superadmin access required' });
   }
   next();
 }
@@ -1534,7 +1576,7 @@ async function getTagVisibility(organizationId) {
 // 1. ADMIN ENDPOINT: Create a single student manually
 // ============================================================================
 app.post('/api/admin/create-student', authenticateToken, requireAdmin, async (req, res) => {
-  const { email } = req.body;
+  const { email, name } = req.body;
   const orgUnitId = req.body.orgUnitId != null ? Number(req.body.orgUnitId) : null;
 
   if (!email) {
@@ -1563,7 +1605,7 @@ app.post('/api/admin/create-student', authenticateToken, requireAdmin, async (re
 
     await client.query('BEGIN');
 
-    const { userId, isNew, temporaryPassword } = await findOrCreateGlobalUser(client, email);
+    const { userId, isNew, temporaryPassword } = await findOrCreateGlobalUser(client, email, name);
 
     const memberRes = await client.query(
       `INSERT INTO memberships (user_id, organization_id, role, org_unit_id) VALUES ($1, $2, 'student', $3)
@@ -1577,7 +1619,7 @@ app.post('/api/admin/create-student', authenticateToken, requireAdmin, async (re
 
     await client.query('COMMIT');
 
-    const student = { id: userId, email, role: 'student' };
+    const student = { id: userId, email, name: name || null, role: 'student' };
     if (isNew) {
       res.status(201).json({ message: 'Student account created successfully', student, temporaryPassword });
     } else {
@@ -1602,7 +1644,7 @@ app.post('/api/admin/create-student', authenticateToken, requireAdmin, async (re
 // here is optional and purely informational (org-chart placement), not an
 // authority boundary for teachers.
 app.post('/api/admin/create-teacher', authenticateToken, requireAdmin, async (req, res) => {
-  const { email } = req.body;
+  const { email, name } = req.body;
   const orgUnitId = req.body.orgUnitId != null ? Number(req.body.orgUnitId) : null;
 
   if (!email) {
@@ -1623,7 +1665,7 @@ app.post('/api/admin/create-teacher', authenticateToken, requireAdmin, async (re
 
     await client.query('BEGIN');
 
-    const { userId, isNew, temporaryPassword } = await findOrCreateGlobalUser(client, email);
+    const { userId, isNew, temporaryPassword } = await findOrCreateGlobalUser(client, email, name);
 
     const memberRes = await client.query(
       `INSERT INTO memberships (user_id, organization_id, role, org_unit_id) VALUES ($1, $2, 'teacher', $3)
@@ -1637,7 +1679,7 @@ app.post('/api/admin/create-teacher', authenticateToken, requireAdmin, async (re
 
     await client.query('COMMIT');
 
-    const teacher = { id: userId, email, role: 'teacher' };
+    const teacher = { id: userId, email, name: name || null, role: 'teacher' };
     if (isNew) {
       res.status(201).json({ message: 'Teacher account created successfully', teacher, temporaryPassword });
     } else {
@@ -1658,7 +1700,7 @@ app.post('/api/admin/create-teacher', authenticateToken, requireAdmin, async (re
 app.get('/api/admin/teachers', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT u.id, u.email, m.org_unit_id
+      `SELECT u.id, u.email, u.name, m.org_unit_id
        FROM users u JOIN memberships m ON m.user_id = u.id
        WHERE m.organization_id = $1 AND m.role = 'teacher'
        ORDER BY u.email ASC`,
@@ -1669,6 +1711,118 @@ app.get('/api/admin/teachers', authenticateToken, requireAdmin, async (req, res)
     console.error('List teachers error:', err);
     res.status(500).json({ error: 'Failed to load teachers' });
   }
+});
+
+// Teacher counterpart to the student CSV template/import pair below —
+// same header-defines-structure contract (any column besides Name/Email is
+// a tier, left to right), reusing splitTierAndIdentityColumns/
+// ensureLevelsForTierLabels/resolveOrCreateOrgUnit exactly as-is. No
+// student-cap check here — teacher seats aren't billed.
+app.get('/api/admin/teachers/csv-template', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const levels = await pool.query(
+      'SELECT label FROM org_level_defs WHERE organization_id = $1 ORDER BY tier_index ASC',
+      [req.user.organizationId]
+    );
+    const headers = levels.rows.length > 0
+      ? [...levels.rows.map((l) => l.label), 'Name', 'Email']
+      : ['Campus', 'Department', 'Name', 'Email'];
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="teacher-import-template.csv"');
+    res.status(200).send(`${headers.join(',')}\n`);
+  } catch (err) {
+    console.error('Teacher CSV template error:', err);
+    res.status(500).json({ error: 'Failed to build template' });
+  }
+});
+
+app.post('/api/admin/teachers/csv-import', authenticateToken, requireAdmin, csvUpload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'CSV file is required' });
+
+  const orgRes = await pool.query('SELECT status FROM organizations WHERE id = $1', [req.user.organizationId]);
+  if (orgRes.rows[0]?.status !== 'approved') {
+    return res.status(403).json({ error: 'Your organization is still pending approval — you cannot import teachers yet' });
+  }
+
+  let rows;
+  try {
+    rows = parseCsv(req.file.buffer, { columns: true, skip_empty_lines: true, trim: true });
+  } catch (err) {
+    return res.status(400).json({ error: 'Could not parse CSV file — check it is valid CSV with a header row' });
+  }
+  if (rows.length === 0) {
+    return res.status(400).json({ error: 'CSV has no data rows' });
+  }
+
+  const { emailKey, nameKey, tierKeys } = splitTierAndIdentityColumns(Object.keys(rows[0]));
+  if (!emailKey) {
+    return res.status(400).json({ error: 'CSV must have an Email column' });
+  }
+
+  const levelsResult = await ensureLevelsForTierLabels(req.user.organizationId, tierKeys);
+  if (levelsResult.error) {
+    return res.status(400).json({ error: levelsResult.reason });
+  }
+  const levels = levelsResult.levels;
+
+  // Unlike student import, temp passwords are returned in the response
+  // rather than emailed — matching the single create-teacher route, which
+  // has never sent a welcome email and instead relies on the admin relaying
+  // the password shown on screen.
+  const results = { created: 0, existingAdded: 0, skipped: 0, unitsCreated: [], newAccounts: [], errors: [] };
+  const seenCreatedUnits = new Set();
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const rowNum = i + 2;
+    const email = String(row[emailKey] || '').trim();
+    const name = nameKey ? String(row[nameKey] || '').trim() : '';
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      results.errors.push({ row: rowNum, email, reason: email ? 'Malformed email' : 'Missing email' });
+      continue;
+    }
+
+    let orgUnitId = null;
+    if (levels.length > 0) {
+      const resolution = await resolveOrCreateOrgUnit(req.user.organizationId, levels, tierKeys.map((k) => row[k]));
+      if (resolution.error) {
+        results.errors.push({ row: rowNum, email, reason: resolution.reason });
+        continue;
+      }
+      orgUnitId = resolution.orgUnitId;
+      resolution.created.forEach((c) => seenCreatedUnits.add(c));
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { userId, isNew, temporaryPassword } = await findOrCreateGlobalUser(client, email, name);
+      const memberRes = await client.query(
+        `INSERT INTO memberships (user_id, organization_id, role, org_unit_id) VALUES ($1, $2, 'teacher', $3)
+         ON CONFLICT (user_id, organization_id) DO NOTHING RETURNING id`,
+        [userId, req.user.organizationId, orgUnitId]
+      );
+      await client.query('COMMIT');
+
+      if (memberRes.rows.length === 0) {
+        results.skipped++;
+      } else if (isNew) {
+        results.created++;
+        results.newAccounts.push({ email, name, temporaryPassword });
+      } else {
+        results.existingAdded++;
+      }
+    } catch (err) {
+      await client.query('ROLLBACK');
+      results.errors.push({ row: rowNum, email, reason: 'Database error creating this row' });
+    } finally {
+      client.release();
+    }
+  }
+
+  results.unitsCreated = [...seenCreatedUnits];
+  res.status(200).json(results);
 });
 
 // ============================================================================
@@ -1779,7 +1933,7 @@ app.post('/api/admin/students/csv-import', authenticateToken, requireAdmin, csvU
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      const { userId, isNew, temporaryPassword } = await findOrCreateGlobalUser(client, email);
+      const { userId, isNew, temporaryPassword } = await findOrCreateGlobalUser(client, email, name);
       const memberRes = await client.query(
         `INSERT INTO memberships (user_id, organization_id, role, org_unit_id) VALUES ($1, $2, 'student', $3)
          ON CONFLICT (user_id, organization_id) DO NOTHING RETURNING id`,
@@ -2290,6 +2444,7 @@ app.get('/api/admin/students', authenticateToken, requireAdmin, async (req, res)
       SELECT
         u.id,
         u.email,
+        u.name,
         u.created_at,
         m.org_unit_id,
         COUNT(DISTINCT s.problem_id) FILTER (WHERE s.status = 'Accepted')::int AS problems_solved,
@@ -2300,8 +2455,17 @@ app.get('/api/admin/students', authenticateToken, requireAdmin, async (req, res)
         COALESCE(best.successful_test_cases, 0)::int AS successful_test_cases
       FROM users u
       JOIN memberships m ON m.user_id = u.id AND m.organization_id = $2 AND m.role = 'student'
+      -- Every submissions/problem_time_logs reference below is scoped to
+      -- THIS org's problems (via the "problem_id IN (SELECT ... WHERE
+      -- organization_id = $2)" clauses) — users are a global identity
+      -- shared across organizations, so without this scope a student who
+      -- belongs to more than one org would leak their OTHER org's
+      -- submission stats onto this org's admin dashboard. $1 (problemId)
+      -- is caller-supplied and otherwise unverified, so it needs the same
+      -- org check, not just the plain equality it had before.
       LEFT JOIN submissions s
         ON s.user_id = u.id AND ($1::int IS NULL OR s.problem_id = $1)
+        AND s.problem_id IN (SELECT id FROM problems WHERE organization_id = $2)
       -- Time-on-task, summed across every problem the student has opened
       -- (or just the one problem, when scoped).
       LEFT JOIN (
@@ -2309,7 +2473,8 @@ app.get('/api/admin/students', authenticateToken, requireAdmin, async (req, res)
                SUM(total_seconds)::int AS total_seconds,
                MAX(updated_at) AS last_time_log_at
         FROM problem_time_logs
-        WHERE $1::int IS NULL OR problem_id = $1
+        WHERE ($1::int IS NULL OR problem_id = $1)
+          AND problem_id IN (SELECT id FROM problems WHERE organization_id = $2)
         GROUP BY user_id
       ) t ON t.user_id = u.id
       -- "Successful test cases run" = test cases passed on each problem's BEST
@@ -2321,7 +2486,8 @@ app.get('/api/admin/students', authenticateToken, requireAdmin, async (req, res)
         FROM (
           SELECT DISTINCT ON (user_id, problem_id) user_id, problem_id, passed_count
           FROM submissions
-          WHERE $1::int IS NULL OR problem_id = $1
+          WHERE ($1::int IS NULL OR problem_id = $1)
+            AND problem_id IN (SELECT id FROM problems WHERE organization_id = $2)
           ORDER BY user_id, problem_id, (status = 'Accepted') DESC, passed_count DESC, created_at DESC
         ) best_per_problem
         GROUP BY user_id
@@ -2355,12 +2521,65 @@ app.get('/api/admin/students', authenticateToken, requireAdmin, async (req, res)
 });
 
 // ============================================================================
+// 1b-2. TEACHER-ONLY: students who have never submitted anything
+// ============================================================================
+// "Visible to a teacher" = every student under (at, or beneath) the org_unit
+// of any subject that teacher is linked to via subject_teachers — the same
+// tier-cascades-down rule getVisibleSubjectIds() uses for students looking
+// UP toward subjects, just walked the other direction (down toward
+// students). A teacher with no subjects assigned yet sees an empty list,
+// not an error. Deliberately admin-excluded — admins already get full
+// per-student stats from the route above; this is a teacher-facing signal
+// scoped to exactly their own classes, not a general admin report.
+app.get('/api/teacher/non-submitters', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'teacher') {
+    return res.status(403).json({ error: 'Teacher access required' });
+  }
+  try {
+    const result = await pool.query(
+      `WITH RECURSIVE my_subject_units AS (
+         SELECT DISTINCT s.org_unit_id
+         FROM subjects s
+         JOIN subject_teachers st ON st.subject_id = s.id
+         WHERE st.user_id = $1 AND s.organization_id = $2
+       ),
+       descendant_units AS (
+         SELECT id FROM org_units WHERE id IN (SELECT org_unit_id FROM my_subject_units)
+         UNION
+         SELECT ou.id FROM org_units ou JOIN descendant_units d ON ou.parent_unit_id = d.id
+       )
+       SELECT u.id, u.email, u.name, u.created_at, m.org_unit_id
+       FROM users u
+       JOIN memberships m ON m.user_id = u.id AND m.organization_id = $2 AND m.role = 'student'
+       WHERE m.org_unit_id IN (SELECT id FROM descendant_units)
+         AND NOT EXISTS (
+           SELECT 1 FROM submissions s
+           WHERE s.user_id = u.id AND s.problem_id IN (SELECT id FROM problems WHERE organization_id = $2)
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM exam_attempts ea
+           WHERE ea.user_id = u.id AND ea.exam_id IN (SELECT id FROM exams WHERE organization_id = $2)
+         )
+       ORDER BY u.email ASC`,
+      [req.user.userId, req.user.organizationId]
+    );
+
+    const unitLookup = await getOrgUnitLookup(req.user.organizationId);
+    const students = result.rows.map((s) => ({ ...s, unit_path: resolveOrgUnitPath(unitLookup, s.org_unit_id) }));
+    res.status(200).json({ students });
+  } catch (err) {
+    console.error('Non-submitters error:', err);
+    res.status(500).json({ error: 'Failed to load non-submitters' });
+  }
+});
+
+// ============================================================================
 // 1c. ADMIN: Per-student breakdown â€” every problem attempted and its result
 // ============================================================================
 app.get('/api/admin/students/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const studentRes = await pool.query(
-      `SELECT u.id, u.email, u.created_at, m.org_unit_id FROM users u
+      `SELECT u.id, u.email, u.name, u.created_at, m.org_unit_id FROM users u
        JOIN memberships m ON m.user_id = u.id AND m.organization_id = $2 AND m.role = 'student'
        WHERE u.id = $1`,
       [req.params.id, req.user.organizationId]
@@ -2579,7 +2798,7 @@ app.post('/api/webhook/google-form/:webhookSecret', async (req, res) => {
     }
 
     await client.query('BEGIN');
-    const { userId, isNew, temporaryPassword } = await findOrCreateGlobalUser(client, email);
+    const { userId, isNew, temporaryPassword } = await findOrCreateGlobalUser(client, email, name);
 
     // ON CONFLICT DO NOTHING means a repeat form submission for someone
     // who's already a member of this org is silently skipped — but a
@@ -2680,6 +2899,45 @@ app.post('/api/webhook/razorpay', async (req, res) => {
 // 'activated' case promote pending_* into the real columns exactly once;
 // a second delivery finds pending_* already NULL and no-ops on those
 // specific fields while the rest of the SET still safely reapplies.
+// Promotes pending_* into the real columns and marks the subscription
+// active — shared by 'activated' and 'charged'. Both events can be the
+// one that first confirms a brand-new subscription (Razorpay doesn't
+// guarantee 'activated' always arrives before/at all relative to
+// 'charged' for every payment method — a UPI/QR-autopay flow in
+// particular can go straight to a charge), so both need to be able to do
+// this promotion, not just 'activated'. Matches on EITHER column and only
+// COALESCEs pending_* in, so it's safe to call from both events in either
+// order, and safe against Razorpay redelivering the same event twice.
+async function promoteSubscriptionToActive(razorpaySubscriptionId, razorpayPlanId, currentPeriodEnd) {
+  // Captured BEFORE the update — used to tell a genuine first-activation
+  // (pending_razorpay_subscription_id was set) apart from an ordinary
+  // renewal charge on an already-active row (it's already NULL), so the
+  // caller only re-sends the "now active" email on the real transition,
+  // not on every recurring payment.
+  const before = await pool.query(
+    `SELECT (pending_razorpay_subscription_id IS NOT NULL) AS was_pending
+     FROM subscriptions WHERE pending_razorpay_subscription_id = $1 OR razorpay_subscription_id = $1`,
+    [razorpaySubscriptionId]
+  );
+  const wasPromotion = before.rows[0]?.was_pending === true;
+
+  const result = await pool.query(
+    `UPDATE subscriptions SET
+       plan_key = COALESCE(pending_plan_key, plan_key),
+       billing_cycle = COALESCE(pending_billing_cycle, billing_cycle),
+       razorpay_subscription_id = COALESCE(razorpay_subscription_id, pending_razorpay_subscription_id, $1),
+       razorpay_plan_id = COALESCE($2, razorpay_plan_id),
+       status = 'active',
+       current_period_end = COALESCE($3, current_period_end),
+       pending_plan_key = NULL, pending_billing_cycle = NULL, pending_razorpay_subscription_id = NULL,
+       updated_at = now()
+     WHERE pending_razorpay_subscription_id = $1 OR razorpay_subscription_id = $1
+     RETURNING organization_id, plan_key`,
+    [razorpaySubscriptionId, razorpayPlanId, currentPeriodEnd]
+  );
+  return result.rows[0] ? { ...result.rows[0], wasPromotion } : null;
+}
+
 async function applyRazorpaySubscriptionEvent(eventType, sub) {
   const razorpaySubscriptionId = sub.id;
   const currentPeriodEnd = sub.current_end ? new Date(sub.current_end * 1000) : null;
@@ -2694,32 +2952,16 @@ async function applyRazorpaySubscriptionEvent(eventType, sub) {
       break;
 
     case 'subscription.activated': {
-      const result = await pool.query(
-        `UPDATE subscriptions SET
-           plan_key = COALESCE(pending_plan_key, plan_key),
-           billing_cycle = COALESCE(pending_billing_cycle, billing_cycle),
-           razorpay_subscription_id = COALESCE(pending_razorpay_subscription_id, razorpay_subscription_id),
-           razorpay_plan_id = $2,
-           status = 'active',
-           current_period_end = $3,
-           pending_plan_key = NULL, pending_billing_cycle = NULL, pending_razorpay_subscription_id = NULL,
-           updated_at = now()
-         WHERE pending_razorpay_subscription_id = $1 OR razorpay_subscription_id = $1
-         RETURNING organization_id, plan_key`,
-        [razorpaySubscriptionId, sub.plan_id, currentPeriodEnd]
-      );
-      const org = result.rows[0];
-      if (org) await sendBillingEmail(org.organization_id, 'Your subscription is now active', `Your ${PLAN_CATALOG[org.plan_key]?.label || org.plan_key} plan is now active. Thank you!`);
+      const org = await promoteSubscriptionToActive(razorpaySubscriptionId, sub.plan_id, currentPeriodEnd);
+      if (org?.wasPromotion) await sendBillingEmail(org.organization_id, 'Your subscription is now active', `Your ${PLAN_CATALOG[org.plan_key]?.label || org.plan_key} plan is now active. Thank you!`);
       break;
     }
 
-    case 'subscription.charged':
-      await pool.query(
-        `UPDATE subscriptions SET status = 'active', current_period_end = $2, updated_at = now()
-         WHERE razorpay_subscription_id = $1`,
-        [razorpaySubscriptionId, currentPeriodEnd]
-      );
+    case 'subscription.charged': {
+      const org = await promoteSubscriptionToActive(razorpaySubscriptionId, sub.plan_id, currentPeriodEnd);
+      if (org?.wasPromotion) await sendBillingEmail(org.organization_id, 'Your subscription is now active', `Your ${PLAN_CATALOG[org.plan_key]?.label || org.plan_key} plan is now active. Thank you!`);
       break;
+    }
 
     case 'subscription.pending': {
       const result = await pool.query(
@@ -2992,6 +3234,60 @@ function mintSessionToken(membership) {
 }
 
 // ============================================================================
+// SUPERADMIN — platform-owner visibility across every organization. Built
+// as impersonation rather than a parallel set of cross-org query routes:
+// picking an org mints a completely ordinary admin session token for it
+// (via the exact same mintSessionToken() every real admin login uses), so
+// the entire existing AdminDashboard/StudentsPanel/BillingPanel/etc. UI and
+// every backend route work unmodified — there is no second code path to
+// keep in sync as the app grows. The superadmin's own user id is reused
+// directly as the "admin" in that session; it needs no real membership row
+// in the target org because nothing downstream checks for one — every
+// admin-gated route trusts the JWT's role/organizationId claims alone.
+// ============================================================================
+app.get('/api/superadmin/organizations', authenticateToken, requireSuperadmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        o.id, o.name, o.status, o.created_at,
+        COALESCE(sub.plan_key, 'free') AS plan_key,
+        COALESCE(sub.status, 'free') AS billing_status,
+        (SELECT COUNT(*)::int FROM memberships m WHERE m.organization_id = o.id AND m.role = 'student') AS student_count,
+        (SELECT COUNT(*)::int FROM memberships m WHERE m.organization_id = o.id AND m.role = 'teacher') AS teacher_count
+      FROM organizations o
+      LEFT JOIN subscriptions sub ON sub.organization_id = o.id
+      ORDER BY o.created_at DESC
+    `);
+    res.status(200).json({ organizations: result.rows });
+  } catch (err) {
+    console.error('Superadmin list organizations error:', err);
+    res.status(500).json({ error: 'Failed to load organizations' });
+  }
+});
+
+app.post('/api/superadmin/organizations/:id/impersonate', authenticateToken, requireSuperadmin, async (req, res) => {
+  try {
+    const orgRes = await pool.query('SELECT id, name FROM organizations WHERE id = $1', [req.params.id]);
+    if (orgRes.rows.length === 0) return res.status(404).json({ error: 'Organization not found' });
+    const userRes = await pool.query('SELECT email FROM users WHERE id = $1', [req.user.userId]);
+
+    const token = mintSessionToken({
+      user_id: req.user.userId,
+      role: 'admin',
+      organization_id: orgRes.rows[0].id,
+      org_unit_id: null,
+    });
+    res.status(200).json({
+      token,
+      user: { id: req.user.userId, email: userRes.rows[0]?.email, role: 'admin', organization_name: orgRes.rows[0].name },
+    });
+  } catch (err) {
+    console.error('Superadmin impersonate error:', err);
+    res.status(500).json({ error: 'Failed to enter organization' });
+  }
+});
+
+// ============================================================================
 // 3. AUTH ENDPOINT: Student & Admin Login
 // ============================================================================
 // Two-step under the hood: `users` is a single global identity per email
@@ -3030,6 +3326,18 @@ app.post('/api/login', async (req, res) => {
     );
 
     if (memberships.rows.length === 0) {
+      // A platform-owner account legitimately has zero tenant memberships —
+      // they're not staff at any one school. Mint a superadmin session
+      // instead of bouncing them, but only for an allowlisted email; anyone
+      // else with zero memberships still gets the ordinary rejection.
+      if (getSuperadminEmails().includes(email.toLowerCase())) {
+        const token = jwt.sign({ userId: user.id, role: 'superadmin' }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRATION || '24h' });
+        return res.status(200).json({
+          message: 'Login successful',
+          token,
+          user: { id: user.id, email, role: 'superadmin' },
+        });
+      }
       return res.status(403).json({ error: 'No organization membership found. Contact your administrator.' });
     }
 
@@ -3117,6 +3425,15 @@ app.post('/api/login/select-organization', async (req, res) => {
 // ============================================================================
 app.get('/api/me', authenticateToken, async (req, res) => {
   try {
+    // A superadmin session carries no organizationId/membership at all —
+    // skip the org join entirely rather than have it (correctly) find zero
+    // rows and bounce them as if their session were invalid.
+    if (req.user.role === 'superadmin') {
+      const userRes = await pool.query('SELECT id, email FROM users WHERE id = $1', [req.user.userId]);
+      if (userRes.rows.length === 0) return res.status(401).json({ error: 'Session no longer valid' });
+      return res.status(200).json({ user: { id: userRes.rows[0].id, email: userRes.rows[0].email, role: 'superadmin' } });
+    }
+
     const result = await pool.query(
       `SELECT u.id, u.email, m.role, m.org_unit_id, o.name AS organization_name
        FROM users u
@@ -3126,6 +3443,23 @@ app.get('/api/me', authenticateToken, async (req, res) => {
       [req.user.userId, req.user.organizationId]
     );
     if (result.rows.length === 0) {
+      // An impersonated session (see POST /api/superadmin/organizations/:id/
+      // impersonate) deliberately has no real membership row — it's a
+      // superadmin's own user id wearing a target org's admin token, not an
+      // actual member of that org. Recognize that case (allowlisted email +
+      // an org that really exists) and answer normally instead of bouncing
+      // them as if the session had gone stale; any other zero-row case
+      // really is a stale/removed membership and stays a 401.
+      const userRes = await pool.query('SELECT email FROM users WHERE id = $1', [req.user.userId]);
+      const email = userRes.rows[0]?.email;
+      if (email && getSuperadminEmails().includes(email.toLowerCase())) {
+        const orgRes = await pool.query('SELECT name FROM organizations WHERE id = $1', [req.user.organizationId]);
+        if (orgRes.rows.length > 0) {
+          return res.status(200).json({
+            user: { id: req.user.userId, email, role: req.user.role, org_unit_id: null, organization_name: orgRes.rows[0].name },
+          });
+        }
+      }
       // Token is still valid but the membership behind it is gone (e.g.
       // admin removed them from this org, or the account itself is gone)
       return res.status(401).json({ error: 'Session no longer valid' });
@@ -3793,7 +4127,7 @@ app.get('/api/admin/problems/:id/attempts', authenticateToken, requireAdmin, asy
     if (problemRes.rows.length === 0) return res.status(404).json({ error: 'Assignment not found' });
 
     const bestRes = await pool.query(
-      `SELECT DISTINCT ON (s.user_id) s.user_id, u.email, s.status, s.passed_count, s.total_count, s.created_at
+      `SELECT DISTINCT ON (s.user_id) s.user_id, u.email, u.name, s.status, s.passed_count, s.total_count, s.created_at
        FROM submissions s
        JOIN users u ON u.id = s.user_id
        WHERE s.problem_id = $1
@@ -3811,6 +4145,7 @@ app.get('/api/admin/problems/:id/attempts', authenticateToken, requireAdmin, asy
       const percentage = r.total_count > 0 ? (r.passed_count / r.total_count) * 100 : null;
       return {
         email: r.email,
+        name: r.name,
         status: r.status,
         passedCount: r.passed_count,
         totalCount: r.total_count,
@@ -4541,7 +4876,7 @@ app.get('/api/admin/exams/:id/attempts', authenticateToken, requireAdmin, async 
     const totalMarks = examRes.rows[0].total_marks;
 
     const result = await pool.query(
-      `SELECT a.id, a.status, a.score, a.end_reason, a.started_at, a.ended_at, u.email,
+      `SELECT a.id, a.status, a.score, a.end_reason, a.started_at, a.ended_at, u.email, u.name,
               COUNT(f.id) FILTER (WHERE f.severity = 'minor') AS minor_flag_count,
               COUNT(f.id) FILTER (WHERE f.severity = 'major') AS major_flag_count,
               NOT EXISTS (
@@ -4552,7 +4887,7 @@ app.get('/api/admin/exams/:id/attempts', authenticateToken, requireAdmin, async 
        JOIN users u ON u.id = a.user_id
        LEFT JOIN exam_proctor_flags f ON f.attempt_id = a.id
        WHERE a.exam_id = $1
-       GROUP BY a.id, u.email
+       GROUP BY a.id, u.email, u.name
        ORDER BY a.started_at DESC`,
       [req.params.id]
     );

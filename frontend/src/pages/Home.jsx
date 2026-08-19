@@ -11,9 +11,13 @@ export default function Home() {
 
   // Logged-in visitors get sent straight back into the app instead of being
   // asked to sign in again; logged-out visitors get the sign-in CTA.
+  // Both branches replace, not push — otherwise Home stays one swipe/
+  // back-button press behind the dashboard, the same history-pollution bug
+  // fixed for the actual login flow (see landingPathFor in Login.jsx).
   const handleCta = () => {
-    if (!user) return navigate('/login');
-    navigate(user.role === 'admin' ? '/admin' : '/assignments');
+    if (!user) return navigate('/login', { replace: true });
+    const home = user.role === 'superadmin' ? '/superadmin' : user.role === 'admin' || user.role === 'teacher' ? '/admin' : '/assignments';
+    navigate(home, { replace: true });
   };
 
   return (
@@ -38,7 +42,7 @@ export default function Home() {
             {loading ? 'Loading…' : user ? 'Continue to your workspace' : 'Sign in to your workspace'}
           </button>
           {!user && !loading && (
-            <button type="button" className="btn btn-ghost landing-cta" onClick={() => navigate('/signup')}>
+            <button type="button" className="btn btn-ghost landing-cta" onClick={() => navigate('/signup', { replace: true })}>
               Set up your school or college
             </button>
           )}

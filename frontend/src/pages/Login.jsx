@@ -11,6 +11,7 @@ import { API } from '../config';
 // Routes a freshly-issued session token to the right landing page, shared
 // by the direct-login path and the post-picker path below.
 function landingPathFor(role) {
+  if (role === 'superadmin') return '/superadmin';
   return role === 'admin' || role === 'teacher' ? '/admin' : '/assignments';
 }
 
@@ -48,7 +49,11 @@ export default function Login() {
 
       if (response.status === 200) {
         login(response.data.token, response.data.user);
-        navigate(landingPathFor(response.data.user.role));
+        // replace, not push — otherwise /login stays one swipe/back-button
+        // press behind the dashboard forever, and a signed-in user landing
+        // back on the login form (then having to swipe forward again to
+        // undo it) reads as a bug, not real "back" navigation.
+        navigate(landingPathFor(response.data.user.role), { replace: true });
       }
     } catch (err) {
       if (err.response?.data?.error) {
@@ -70,7 +75,7 @@ export default function Login() {
         organizationId,
       });
       login(response.data.token, response.data.user);
-      navigate(landingPathFor(response.data.user.role));
+      navigate(landingPathFor(response.data.user.role), { replace: true });
     } catch (err) {
       setError(err.response?.data?.error || 'Network error. Is the backend server running?');
       setOrgChoice(null);
@@ -89,7 +94,7 @@ export default function Login() {
           <span className="corner br" aria-hidden="true" />
 
           <div className="auth-card-head">
-            <button type="button" className="brand" onClick={() => navigate('/')}><BrandMark /></button>
+            <button type="button" className="brand" onClick={() => navigate('/', { replace: true })}><BrandMark /></button>
             <ThemeToggle theme={theme} onToggle={toggleTheme} />
           </div>
 
@@ -140,7 +145,7 @@ export default function Login() {
         <span className="corner br" aria-hidden="true" />
 
         <div className="auth-card-head">
-          <button type="button" className="brand" onClick={() => navigate('/')}><BrandMark /></button>
+          <button type="button" className="brand" onClick={() => navigate('/', { replace: true })}><BrandMark /></button>
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
         </div>
 
@@ -185,7 +190,7 @@ export default function Login() {
           </div>
 
           <div className="auth-forgot-row">
-            <button type="button" className="auth-link" onClick={() => navigate('/forgot-password')}>
+            <button type="button" className="auth-link" onClick={() => navigate('/forgot-password', { replace: true })}>
               Forgot your password?
             </button>
           </div>
@@ -197,7 +202,7 @@ export default function Login() {
         </form>
 
         <div className="auth-divider">New institution</div>
-        <button type="button" className="auth-alt-action" onClick={() => navigate('/signup')}>
+        <button type="button" className="auth-alt-action" onClick={() => navigate('/signup', { replace: true })}>
           <span className="auth-alt-action-text">
             <span className="auth-alt-action-title">Set up your school or college</span>
             <span className="auth-alt-action-sub">Create an isolated workspace for your institution</span>

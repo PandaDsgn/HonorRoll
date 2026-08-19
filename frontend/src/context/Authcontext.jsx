@@ -5,6 +5,11 @@ import { API } from '../config';
 const AuthContext = createContext(null);
 
 export const TOKEN_KEY = 'codejudge_token';
+// Holds the superadmin's own token+user while they're "inside" an
+// impersonated org session — set once on the first impersonate() call,
+// never overwritten by a nested one, so returning always lands back on the
+// real superadmin identity regardless of how many orgs were visited.
+const SUPERADMIN_BACKUP_KEY = 'codejudge_superadmin_backup';
 
 // Sets (or clears) the Authorization header on axios's shared defaults —
 // since every page imports the same 'axios' module instance, this one call
@@ -69,19 +74,55 @@ export function AuthProvider({ children }) {
       // out even if this call fails (e.g. already-expired token, offline).
     }
     localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(SUPERADMIN_BACKUP_KEY);
     setAuthHeader(null);
     setUser(null);
   }, []);
+
+  // Called after POST /api/superadmin/organizations/:id/impersonate
+  // succeeds, with the resulting { token, user }. Stashes the CURRENT
+  // (real superadmin) session first — but only if nothing's already
+  // stashed, so jumping from org A straight into org B doesn't overwrite
+  // the original identity with org A's impersonated one.
+  const enterImpersonation = useCallback((token, userData) => {
+    if (!localStorage.getItem(SUPERADMIN_BACKUP_KEY)) {
+      const realToken = localStorage.getItem(TOKEN_KEY);
+      if (realToken) localStorage.setItem(SUPERADMIN_BACKUP_KEY, realToken);
+    }
+    localStorage.setItem(TOKEN_KEY, token);
+    setAuthHeader(token);
+    setUser(userData);
+  }, []);
+
+  // Restores the real superadmin session from the stash and clears it.
+  const exitImpersonation = useCallback(async () => {
+    const realToken = localStorage.getItem(SUPERADMIN_BACKUP_KEY);
+    if (!realToken) return;
+    localStorage.removeItem(SUPERADMIN_BACKUP_KEY);
+    localStorage.setItem(TOKEN_KEY, realToken);
+    setAuthHeader(realToken);
+    try {
+      const res = await axios.get(`${API}/api/me`);
+      setUser(res.data.user);
+    } catch {
+      setUser(null);
+    }
+  }, []);
+
+  const isImpersonating = typeof window !== 'undefined' && !!localStorage.getItem(SUPERADMIN_BACKUP_KEY);
 
   const value = {
     user,
     role: user?.role ?? null,
     isAdmin: user?.role === 'admin',
+    isImpersonating,
     loading,
     setUser,
     refetch,
     login,
     logout,
+    enterImpersonation,
+    exitImpersonation,
   };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

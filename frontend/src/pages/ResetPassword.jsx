@@ -42,7 +42,7 @@ export default function ResetPassword() {
         newPassword: password,
       });
       setDone(true);
-      setTimeout(() => navigate('/login'), 2000);
+      setTimeout(() => navigate('/login', { replace: true }), 2000);
     } catch (err) {
       setError(err.response?.data?.error || 'Network error. Is the backend server running?');
     } finally {
@@ -59,7 +59,7 @@ export default function ResetPassword() {
         <span className="corner br" aria-hidden="true" />
 
         <div className="auth-card-head">
-          <button type="button" className="brand" onClick={() => navigate('/')}><BrandMark /></button>
+          <button type="button" className="brand" onClick={() => navigate('/', { replace: true })}><BrandMark /></button>
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
         </div>
 
@@ -143,7 +143,7 @@ export default function ResetPassword() {
         )}
 
         <div className="auth-back-row">
-          <button type="button" className="auth-link" onClick={() => navigate('/login')}>
+          <button type="button" className="auth-link" onClick={() => navigate('/login', { replace: true })}>
             Back to sign in
           </button>
         </div>

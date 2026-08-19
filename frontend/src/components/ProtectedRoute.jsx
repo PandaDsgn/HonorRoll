@@ -25,8 +25,10 @@ export default function ProtectedRoute({ children, roles }) {
   if (roles && !roles.includes(user.role)) {
     // Teacher lands in the same admin shell as admin for now — AdminDashboard
     // itself hides admin-only panels (org structure, approvals) when the
-    // signed-in role is 'teacher'.
-    const home = user.role === 'admin' || user.role === 'teacher' ? '/admin' : '/assignments';
+    // signed-in role is 'teacher'. A superadmin has no org membership at
+    // all, so /admin or /assignments would both 404 on them — they only
+    // ever belong on /superadmin.
+    const home = user.role === 'superadmin' ? '/superadmin' : user.role === 'admin' || user.role === 'teacher' ? '/admin' : '/assignments';
     return <Navigate to={home} replace />;
   }
 

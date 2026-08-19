@@ -33,7 +33,7 @@ export default function Signup() {
         organizationName, email, password,
       });
       login(response.data.token, response.data.user);
-      navigate('/admin');
+      navigate('/admin', { replace: true });
     } catch (err) {
       if (err.response?.data?.error) {
         setError(err.response.data.error);
@@ -54,7 +54,7 @@ export default function Signup() {
         <span className="corner br" aria-hidden="true" />
 
         <div className="auth-card-head">
-          <button type="button" className="brand" onClick={() => navigate('/')}><BrandMark /></button>
+          <button type="button" className="brand" onClick={() => navigate('/', { replace: true })}><BrandMark /></button>
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
         </div>
 
@@ -124,7 +124,7 @@ export default function Signup() {
         )}
 
         <div className="auth-divider">Already registered</div>
-        <button type="button" className="auth-alt-action" onClick={() => navigate('/login')}>
+        <button type="button" className="auth-alt-action" onClick={() => navigate('/login', { replace: true })}>
           <span className="auth-alt-action-text">
             <span className="auth-alt-action-title">Sign in to your workspace</span>
             <span className="auth-alt-action-sub">Already have an account at your institution?</span>

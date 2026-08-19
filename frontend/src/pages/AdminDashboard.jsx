@@ -42,17 +42,31 @@ function toDatetimeLocal(iso) {
 export default function AdminDashboard() {
   const navigate = useNavigate();
   const { theme, toggleTheme } = useTheme();
-  const { logout, user } = useAuth();
+  const { logout, user, isImpersonating, exitImpersonation } = useAuth();
   const [tab, setTab] = useState('students');
   const [selectedStudentId, setSelectedStudentId] = useState(null);
 
   const handleLogout = async () => {
     await logout();
-    navigate('/');
+    navigate('/', { replace: true });
+  };
+
+  const handleExitImpersonation = async () => {
+    await exitImpersonation();
+    navigate('/superadmin', { replace: true });
   };
 
   return (
     <div className="sb-shell">
+      {isImpersonating && (
+        <div className="alert" style={{ margin: 0, borderRadius: 0, justifyContent: 'center' }}>
+          <span className="alert-icon">!</span>
+          <span>Viewing {user?.organization_name || 'this organization'} as its admin (superadmin mode).</span>
+          <button type="button" className="btn btn-ghost btn-sm" style={{ marginLeft: 12 }} onClick={handleExitImpersonation}>
+            Exit
+          </button>
+        </div>
+      )}
       <header className="sb-topbar">
         <button type="button" className="brand" onClick={() => navigate('/')}><BrandMark /></button>
         <div className="sb-actions">
@@ -81,6 +95,11 @@ export default function AdminDashboard() {
             <button type="button" role="tab" aria-pressed={tab === 'grade-scale'} className={tab === 'grade-scale' ? 'active' : ''} onClick={() => setTab('grade-scale')}>
               Grading
             </button>
+            {user?.role === 'teacher' && (
+              <button type="button" role="tab" aria-pressed={tab === 'non-submitters'} className={tab === 'non-submitters' ? 'active' : ''} onClick={() => setTab('non-submitters')}>
+                Non-submitters
+              </button>
+            )}
             {user?.role === 'admin' && (
               <button type="button" role="tab" aria-pressed={tab === 'structure'} className={tab === 'structure' ? 'active' : ''} onClick={() => setTab('structure')}>
                 Structure
@@ -104,6 +123,8 @@ export default function AdminDashboard() {
           <AssignmentsPanel />
         ) : tab === 'exams' ? (
           <ExamsPanel />
+        ) : tab === 'non-submitters' ? (
+          user?.role === 'teacher' ? <NonSubmittersPanel /> : null
         ) : tab === 'structure' ? (
           user?.role === 'admin' ? (
             <>
@@ -122,6 +143,58 @@ export default function AdminDashboard() {
           </>
         )}
       </section>
+    </div>
+  );
+}
+
+// ============================================================================
+// NON-SUBMITTERS PANEL — teacher-only. Students in the teacher's own
+// classes (their subjects' org units, and everything beneath them) who
+// have zero submissions and zero exam attempts anywhere in the org.
+// ============================================================================
+function NonSubmittersPanel() {
+  const [students, setStudents] = useState(null);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    axios.get(`${API}/api/teacher/non-submitters`, { withCredentials: true })
+      .then((res) => setStudents(res.data.students))
+      .catch(() => setError('Failed to load non-submitters.'));
+  }, []);
+
+  if (error) return <div className="alert"><span className="alert-icon">!</span><span>{error}</span></div>;
+  if (!students) return <p className="sb-loading">Loading…</p>;
+
+  return (
+    <div className="panel" style={{ padding: 20 }}>
+      <h3 style={{ margin: '0 0 4px' }}>Students who haven't submitted anything</h3>
+      <p className="auth-sub" style={{ margin: '0 0 16px' }}>
+        Scoped to your own classes — students under the subjects you're assigned to who have zero
+        assignment submissions and zero exam attempts.
+      </p>
+      {students.length === 0 ? (
+        <p className="sb-loading">Nobody's flagged — every student in your classes has submitted something.</p>
+      ) : (
+        <div className="admin-table-wrap">
+          <table className="admin-table">
+            <thead><tr><th>Student</th><th>Unit</th><th>Joined</th></tr></thead>
+            <tbody>
+              {students.map((s) => (
+                <tr key={s.id}>
+                  <td className="admin-cell-strong">
+                    {s.name || s.email}
+                    {s.name && <div style={{ color: 'var(--text-dim)', fontSize: '12px', fontWeight: 400 }}>{s.email}</div>}
+                  </td>
+                  <td style={{ whiteSpace: 'nowrap', color: 'var(--text-dim)', fontSize: '12.5px' }}>
+                    {s.unit_path?.length ? s.unit_path.map((p) => p.name).join(' / ') : '—'}
+                  </td>
+                  <td>{formatDate(s.created_at)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
@@ -160,7 +233,8 @@ function StudentDetailPanel({ studentId, onBack }) {
       </div>
 
       <div className="panel" style={{ padding: '24px', marginBottom: '24px' }}>
-        <h2>{data.student.email}</h2>
+        <h2>{data.student.name || data.student.email}</h2>
+        {data.student.name && <p className="auth-sub" style={{ margin: '4px 0 0' }}>{data.student.email}</p>}
         <p className="auth-sub" style={{ margin: '8px 0 0' }}>Joined {formatDate(data.student.created_at)}</p>
         {data.unitPath?.length > 0 ? (
           <p style={{ margin: '10px 0 0', display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -322,6 +396,7 @@ function StudentsPanel({ onSelectStudent }) {
   // account. orgUnitId is optional (nullable on the backend) so this still
   // works for an org that hasn't built out its structure yet.
   const [units, setUnits] = useState([]);
+  const [newName, setNewName] = useState('');
   const [newEmail, setNewEmail] = useState('');
   const [newUnitId, setNewUnitId] = useState('');
   const [addResult, setAddResult] = useState('');
@@ -354,11 +429,13 @@ function StudentsPanel({ onSelectStudent }) {
     try {
       const res = await axios.post(`${API}/api/admin/create-student`, {
         email: newEmail.trim(),
+        name: newName.trim() || null,
         orgUnitId: newUnitId || null,
       }, { withCredentials: true });
       setAddResult(res.data.temporaryPassword
         ? `Created. Temporary password: ${res.data.temporaryPassword}`
         : res.data.message);
+      setNewName('');
       setNewEmail('');
       setNewUnitId('');
       fetchStudents();
@@ -512,6 +589,7 @@ function StudentsPanel({ onSelectStudent }) {
         {addError && <div className="alert" style={{ marginBottom: 12 }}><span className="alert-icon">!</span><span>{addError}</span></div>}
         {addResult && <div className="alert alert-success" style={{ marginBottom: 12 }}><span className="alert-icon">✓</span><span>{addResult}</span></div>}
         <form className="testcase-row" style={{ maxWidth: 560, marginBottom: 0 }} onSubmit={addStudent}>
+          <input type="text" placeholder="Full name (optional)" value={newName} onChange={(e) => setNewName(e.target.value)} disabled={atCap} />
           <input type="email" placeholder="student@school.edu" value={newEmail} onChange={(e) => setNewEmail(e.target.value)} required disabled={atCap} />
           <select value={newUnitId} onChange={(e) => setNewUnitId(e.target.value)} style={{ minWidth: 180 }} disabled={atCap}>
             <option value="">No unit (optional)</option>
@@ -612,8 +690,9 @@ function StudentsPanel({ onSelectStudent }) {
                 <tr key={s.id}>
                   <td>
                     <button type="button" className="auth-link admin-cell-strong" style={{ fontSize: '14px' }} onClick={() => onSelectStudent(s.id)}>
-                      {s.email}
+                      {s.name || s.email}
                     </button>
+                    {s.name && <div style={{ color: 'var(--text-dim)', fontSize: '12px' }}>{s.email}</div>}
                   </td>
                   <td style={{ whiteSpace: 'nowrap', color: 'var(--text-dim)', fontSize: '12.5px' }}>
                     {s.unit_path?.length ? s.unit_path.map((p) => p.name).join(' / ') : '—'}
@@ -850,7 +929,10 @@ function AssignmentAttemptsPanel({ problemId }) {
       <tbody>
         {attempts.map((a) => (
           <tr key={a.email}>
-            <td className="admin-cell-strong">{a.email}</td>
+            <td className="admin-cell-strong">
+              {a.name || a.email}
+              {a.name && <div style={{ color: 'var(--text-dim)', fontSize: '12px', fontWeight: 400 }}>{a.email}</div>}
+            </td>
             <td>
               <span className={`chip ${a.status === 'Accepted' ? 'chip-easy' : 'chip-medium'}`}>
                 <span className="dot" />{a.status} ({a.passedCount}/{a.totalCount})
@@ -1038,7 +1120,10 @@ function ExamAttemptsPanel({ examId }) {
         {attempts.map((a) => (
           <Fragment key={a.id}>
             <tr>
-              <td className="admin-cell-strong">{a.email}</td>
+              <td className="admin-cell-strong">
+                {a.name || a.email}
+                {a.name && <div style={{ color: 'var(--text-dim)', fontSize: '12px', fontWeight: 400 }}>{a.email}</div>}
+              </td>
               <td><span className={`chip ${a.status === 'submitted' ? 'chip-easy' : 'chip-medium'}`}><span className="dot" />{a.status}</span></td>
               <td>
                 {a.score ?? '—'}
@@ -1463,9 +1548,14 @@ function TeachersPanel() {
   const [units, setUnits] = useState([]);
   const [error, setError] = useState('');
   const [result, setResult] = useState('');
+  const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [unitId, setUnitId] = useState('');
   const [creating, setCreating] = useState(false);
+  const [csvFile, setCsvFile] = useState(null);
+  const [csvResult, setCsvResult] = useState(null);
+  const [csvError, setCsvError] = useState('');
+  const [csvImporting, setCsvImporting] = useState(false);
 
   const fetchAll = useCallback(async () => {
     try {
@@ -1490,11 +1580,13 @@ function TeachersPanel() {
     try {
       const res = await axios.post(`${API}/api/admin/create-teacher`, {
         email: email.trim(),
+        name: name.trim() || null,
         orgUnitId: unitId || null,
       }, { withCredentials: true });
       setResult(res.data.temporaryPassword
         ? `Created. Temporary password: ${res.data.temporaryPassword}`
         : res.data.message);
+      setName('');
       setEmail('');
       setUnitId('');
       fetchAll();
@@ -1502,6 +1594,39 @@ function TeachersPanel() {
       setError(err.response?.data?.error || 'Failed to create teacher.');
     } finally {
       setCreating(false);
+    }
+  };
+
+  const downloadCsvTemplate = async () => {
+    try {
+      const res = await axios.get(`${API}/api/admin/teachers/csv-template`, { withCredentials: true, responseType: 'blob' });
+      const url = URL.createObjectURL(res.data);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'teacher-import-template.csv';
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      setCsvError('Failed to download template.');
+    }
+  };
+
+  const importCsv = async () => {
+    if (!csvFile) return;
+    setCsvError('');
+    setCsvResult(null);
+    setCsvImporting(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', csvFile);
+      const res = await axios.post(`${API}/api/admin/teachers/csv-import`, formData, { withCredentials: true });
+      setCsvResult(res.data);
+      setCsvFile(null);
+      fetchAll();
+    } catch (err) {
+      setCsvError(err.response?.data?.error || 'Failed to import CSV.');
+    } finally {
+      setCsvImporting(false);
     }
   };
 
@@ -1519,15 +1644,16 @@ function TeachersPanel() {
       {teachers && teachers.length > 0 && (
         <div className="admin-table-wrap" style={{ marginBottom: 16 }}>
           <table className="admin-table">
-            <thead><tr><th>Email</th></tr></thead>
+            <thead><tr><th>Name</th><th>Email</th></tr></thead>
             <tbody>
-              {teachers.map((t) => <tr key={t.id}><td>{t.email}</td></tr>)}
+              {teachers.map((t) => <tr key={t.id}><td>{t.name || '—'}</td><td>{t.email}</td></tr>)}
             </tbody>
           </table>
         </div>
       )}
 
       <form className="testcase-row" style={{ maxWidth: 560 }} onSubmit={createTeacher}>
+        <input type="text" placeholder="Full name (optional)" value={name} onChange={(e) => setName(e.target.value)} />
         <input type="email" placeholder="teacher@school.edu" value={email} onChange={(e) => setEmail(e.target.value)} required />
         <select value={unitId} onChange={(e) => setUnitId(e.target.value)} style={{ minWidth: 180 }}>
           <option value="">No unit (optional)</option>
@@ -1539,6 +1665,57 @@ function TeachersPanel() {
           {creating ? 'Creating…' : 'Create teacher'}
         </button>
       </form>
+
+      <div style={{ marginTop: 24, paddingTop: 20, borderTop: '1px solid var(--border)' }}>
+        <div className="field-group-label" style={{ marginBottom: 10 }}>Bulk import from CSV</div>
+        <p className="auth-sub" style={{ margin: '0 0 10px' }}>
+          Upload a CSV where every column except Name/Email is a tier of your structure, in left-to-right
+          order — same format as the student import.
+        </p>
+        {csvError && <div className="alert" style={{ marginBottom: 12 }}><span className="alert-icon">!</span><span>{csvError}</span></div>}
+        {csvResult && (
+          <div className={csvResult.errors.length ? 'alert' : 'alert alert-success'} style={{ marginBottom: 12, flexDirection: 'column', alignItems: 'stretch' }}>
+            <span>
+              {csvResult.created} created, {csvResult.existingAdded} existing account(s) added, {csvResult.skipped} already members
+              {csvResult.errors.length > 0 && `, ${csvResult.errors.length} row(s) failed`}
+            </span>
+            {csvResult.unitsCreated?.length > 0 && (
+              <span style={{ marginTop: 6, fontSize: 12.5, color: 'var(--text-dim)' }}>
+                New units created: {csvResult.unitsCreated.join(', ')}
+              </span>
+            )}
+            {csvResult.newAccounts?.length > 0 && (
+              <table className="admin-table" style={{ marginTop: 10 }}>
+                <thead><tr><th>Name</th><th>Email</th><th>Temporary password</th></tr></thead>
+                <tbody>
+                  {csvResult.newAccounts.map((a, i) => (
+                    <tr key={i}><td>{a.name || '—'}</td><td>{a.email}</td><td>{a.temporaryPassword}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            {csvResult.errors.length > 0 && (
+              <table className="admin-table" style={{ marginTop: 10 }}>
+                <thead><tr><th>Row</th><th>Email</th><th>Reason</th></tr></thead>
+                <tbody>
+                  {csvResult.errors.map((e, i) => (
+                    <tr key={i}><td>{e.row}</td><td>{e.email}</td><td>{e.reason}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )}
+        <div className="testcase-row" style={{ maxWidth: 560, marginBottom: 0 }}>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={downloadCsvTemplate}>
+            Download template
+          </button>
+          <input type="file" accept=".csv" onChange={(e) => setCsvFile(e.target.files?.[0] || null)} />
+          <button type="button" className="btn btn-primary btn-sm" disabled={!csvFile || csvImporting} onClick={importCsv}>
+            {csvImporting ? 'Importing…' : 'Upload'}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

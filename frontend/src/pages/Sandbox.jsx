@@ -335,7 +335,7 @@ export default function Sandbox() {
   const { logout } = useAuth();
   const handleLogout = async () => {
     await logout();
-    navigate('/');
+    navigate('/', { replace: true });
   };
   const activeLang = LANGUAGES.find((l) => l.id === language);
   const activeTestCase = testCases[activeCaseIndex];
