@@ -13,9 +13,14 @@
   --text-dim: #6e767c;
   --text-h: #f2f4f5;
 
-  --accent: #ff9d4d;
-  --accent-strong: #ffb366;
-  --accent-dim: rgba(255, 157, 77, 0.12);
+  --accent: #5b8def;
+  --accent-strong: #7ba3f5;
+  --accent-dim: rgba(91, 141, 239, 0.14);
+
+  /* Gold — reserved for the wordmark's "Roll" half and similar one-off
+     highlights, never for buttons/links (navy --accent handles those and
+     carries the contrast guarantees a clickable surface needs). */
+  --highlight: #e5b93d;
 
   --teal: #4fd1c5;
   --teal-dim: rgba(79, 209, 197, 0.12);
@@ -60,9 +65,11 @@
   --text-dim: #8a8f94;
   --text-h: #16181a;
 
-  --accent: #d9701f;
-  --accent-strong: #c2621a;
-  --accent-dim: rgba(217, 112, 31, 0.12);
+  --accent: #1f3a5f;
+  --accent-strong: #16293f;
+  --accent-dim: rgba(31, 58, 95, 0.12);
+
+  --highlight: #a67c00;
 
   --teal: #0e8f83;
   --teal-dim: rgba(14, 143, 131, 0.12);
@@ -161,10 +168,10 @@ button, input, select { font-family: inherit; }
 }
 .auth-card .brand { font-size: 17px; }
 
-/* Two-tone wordmark: "Assign" in the neutral heading color, "Meant" always
-   orange — see components/BrandMark.jsx, used everywhere .brand appears. */
-.brand-assign { color: var(--text-h); }
-.brand-meant { color: var(--accent); }
+/* Two-tone wordmark: "Honor" in the neutral heading color, "Roll" always
+   gold — see components/BrandMark.jsx, used everywhere .brand appears. */
+.brand-honor { color: var(--text-h); }
+.brand-roll { color: var(--highlight); }
 
 /* Lets the brand wordmark double as a "go home" button without picking up
    default <button> chrome â€” looks identical to the old plain text version. */
@@ -175,7 +182,7 @@ button.brand {
   cursor: pointer;
   font: inherit;
 }
-button.brand:hover .brand-assign { color: var(--accent); }
+button.brand:hover .brand-honor { color: var(--accent); }
 
 /* ---------- corner-bracket frame ---------- */
 .bracket-frame { position: relative; }
@@ -381,22 +388,21 @@ button.brand:hover .brand-assign { color: var(--accent); }
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 10px;
-  border-radius: 999px;
   font-family: var(--font-sans);
   font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.03em;
-  border: 1px solid;
   flex-shrink: 0;
+  /* Tag text is always capitalized ("Hard", "Open"), regardless of how the
+     underlying value is cased (a raw lowercase DB status enum, etc.) — one
+     rule instead of fixing casing at every one of the ~40 call sites that
+     render a .chip. */
+  text-transform: capitalize;
 }
-.chip .dot { width: 6px; height: 6px; border-radius: 50%; }
-.chip-easy { color: var(--teal); background: var(--teal-dim); border-color: rgba(79, 209, 197, 0.3); }
-.chip-easy .dot { background: var(--teal); }
-.chip-medium { color: var(--warn); background: var(--warn-dim); border-color: rgba(255, 209, 102, 0.3); }
-.chip-medium .dot { background: var(--warn); }
-.chip-hard { color: var(--danger); background: var(--danger-dim); border-color: rgba(255, 92, 92, 0.3); }
-.chip-hard .dot { background: var(--danger); }
+.chip .dot { display: none; }
+.chip-easy { color: var(--teal); }
+.chip-medium { color: var(--warn); }
+.chip-hard { color: var(--danger); }
 
 /* ---------- segmented control ---------- */
 .segmented {

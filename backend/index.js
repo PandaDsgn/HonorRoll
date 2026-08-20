@@ -11,10 +11,13 @@ const bcrypt = require('bcrypt');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const fs = require('fs');
-const { Resend } = require('resend');
+const { sendEmail } = require('./mailer');
 const { exec } = require('child_process');
 const path = require('path');
 const multer = require('multer');
+const { isB2Configured, scanObjectKey, uploadScanPdf, deleteScanPdf, getScanPdfUrl, downloadScanPdf } = require('./storage');
+const { isOcrConfigured, runOcr } = require('./ocrClient');
+const { isGroqConfigured, assessAnswers } = require('./aiGrading');
 const { parse: parseCsv } = require('csv-parse/sync');
 const Razorpay = require('razorpay');
 
@@ -22,6 +25,16 @@ const Razorpay = require('razorpay');
 // rows, never large enough to need disk storage or a streaming parser. 2MB
 // cap is generous for a plain-text student roster.
 const csvUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
+
+// Memory storage (not disk) — a scanned answer-sheet PDF is uploaded once,
+// immediately forwarded to R2, then discarded; there's nothing to stream to
+// disk for. 25MB covers a realistically long multi-page handwritten answer
+// scanned at phone-camera resolution.
+const scanUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => cb(null, file.mimetype === 'application/pdf'),
+});
 
 const app = express();
 // The `verify` callback stashes the raw request-body bytes on req.rawBody —
@@ -41,8 +54,7 @@ app.use(express.json({
 }));
 const cors = require('cors');
 app.use(cors({
-  origin: ['http://localhost:5173',
-  'https://pandadsgn.github.io', 'https://codejudge.page', 'https://www.codejudge.page'],
+  origin: ['http://localhost:5173', 'https://pandadsgn.github.io'],
   credentials: true
 }));
 
@@ -511,6 +523,22 @@ function ensureOrgUnitsSchema() {
 }
 ensureOrgUnitsSchema();
 
+// Lives on memberships, not users — same reasoning as org_unit_id already
+// living here: a roll number is a per-org-enrollment fact, not global
+// identity (a student who's a member of two organizations could plausibly
+// have a different roll number at each). Nullable — most orgs won't have
+// this in their roster at all, and it's only ever set via CSV/webhook
+// import (see splitTierAndIdentityColumns) or left blank.
+async function ensureMembershipRollNumberColumn() {
+  await ensureMembershipsSchema();
+  try {
+    await pool.query('ALTER TABLE memberships ADD COLUMN IF NOT EXISTS roll_number TEXT');
+  } catch (err) {
+    console.error('Failed to ensure memberships.roll_number:', err);
+  }
+}
+ensureMembershipRollNumberColumn();
+
 // A subject is attached at whatever tier an admin picks — one on
 // "Computer Science" (a Department-tier unit) is visible to every "Year"
 // beneath it; one attached directly on a specific Year is scoped to just
@@ -544,6 +572,188 @@ function ensureSubjectsSchema() {
   return subjectsSchemaPromise;
 }
 ensureSubjectsSchema();
+
+// ============================================================================
+// SCANNED ASSIGNMENTS — Phase 1 schema only. Students scan a handwritten
+// answer sheet (instead of writing code) and upload the bundled PDF against
+// a `problems` row with submission_mode='scan' (see ensureScanAssignmentColumns
+// above). These three tables are created now, ahead of the OCR/upload/
+// detection routes that will populate them in later phases, so nothing
+// downstream needs its own migration step. No organization_id column on any
+// of them — scoped indirectly via problem_id -> problems.organization_id,
+// exactly like the existing `submissions` table.
+// ============================================================================
+let scanSubmissionsSchemaPromise = null;
+function ensureScanSubmissionsSchema() {
+  if (!scanSubmissionsSchemaPromise) {
+    scanSubmissionsSchemaPromise = pool.query(`
+      CREATE TABLE IF NOT EXISTS scan_submissions (
+        id SERIAL PRIMARY KEY,
+        problem_id INTEGER NOT NULL REFERENCES problems(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'ocr_done', 'ocr_failed')) DEFAULT 'pending',
+        storage_key TEXT NOT NULL,
+        original_filename TEXT NOT NULL,
+        page_count INTEGER,
+        ocr_text TEXT,
+        ocr_pages JSONB,
+        ocr_error TEXT,
+        handwriting_features JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        ocr_completed_at TIMESTAMPTZ
+      )
+    `).then(async () => {
+      await pool.query('CREATE INDEX IF NOT EXISTS scan_submissions_problem_idx ON scan_submissions(problem_id)');
+      await pool.query('CREATE INDEX IF NOT EXISTS scan_submissions_user_idx ON scan_submissions(user_id)');
+      // At most one row per (problem, student) — a resubmission before the
+      // deadline REPLACES the previous one outright (see the delete-then-
+      // insert logic in POST /api/problems/:id/scan-submit), not a second
+      // row to pick "the latest" from later. This index is the DB-level
+      // backstop against that invariant breaking under a race (e.g. the
+      // same student resubmitting from two tabs at once).
+      await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS scan_submissions_problem_user_idx ON scan_submissions(problem_id, user_id)');
+    }).catch((err) => console.error('Failed to ensure scan_submissions schema:', err));
+  }
+  return scanSubmissionsSchemaPromise;
+}
+ensureScanSubmissionsSchema();
+
+// Text-content similarity flags — same-assignment only (comparing two
+// answers to the same question is meaningful; comparing across different
+// questions isn't). submission_a_id < submission_b_id is enforced so a
+// pair only ever gets one row regardless of comparison order.
+let scanPlagiarismFlagsSchemaPromise = null;
+function ensureScanPlagiarismFlagsSchema() {
+  if (!scanPlagiarismFlagsSchemaPromise) {
+    scanPlagiarismFlagsSchemaPromise = ensureScanSubmissionsSchema().then(async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS scan_plagiarism_flags (
+          id SERIAL PRIMARY KEY,
+          problem_id INTEGER NOT NULL REFERENCES problems(id) ON DELETE CASCADE,
+          submission_a_id INTEGER NOT NULL REFERENCES scan_submissions(id) ON DELETE CASCADE,
+          submission_b_id INTEGER NOT NULL REFERENCES scan_submissions(id) ON DELETE CASCADE,
+          similarity_score REAL NOT NULL,
+          flag_type TEXT NOT NULL DEFAULT 'text_similarity',
+          status TEXT NOT NULL CHECK (status IN ('open', 'reviewed_confirmed', 'reviewed_dismissed')) DEFAULT 'open',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          CHECK (submission_a_id < submission_b_id)
+        )
+      `);
+      await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS scan_plagiarism_flags_pair_idx ON scan_plagiarism_flags(problem_id, submission_a_id, submission_b_id, flag_type)');
+    }).catch((err) => console.error('Failed to ensure scan_plagiarism_flags schema:', err));
+  }
+  return scanPlagiarismFlagsSchemaPromise;
+}
+ensureScanPlagiarismFlagsSchema();
+
+// Handwriting/style-match flags — deliberately NOT scoped to a single
+// problem_id, since the whole point is comparing a submission against the
+// organization's entire submission history (a student's handwriting from a
+// past assignment is valid reference material for flagging a completely
+// different assignment). Always review-only — no column here ever writes
+// to a grade; see the comparator that will populate this table in a later
+// phase for why (no trained writer-ID model, real false-positive risk).
+let scanHandwritingFlagsSchemaPromise = null;
+function ensureScanHandwritingFlagsSchema() {
+  if (!scanHandwritingFlagsSchemaPromise) {
+    scanHandwritingFlagsSchemaPromise = ensureScanSubmissionsSchema().then(async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS scan_handwriting_flags (
+          id SERIAL PRIMARY KEY,
+          submission_a_id INTEGER NOT NULL REFERENCES scan_submissions(id) ON DELETE CASCADE,
+          submission_b_id INTEGER NOT NULL REFERENCES scan_submissions(id) ON DELETE CASCADE,
+          similarity_score REAL NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('open', 'reviewed_confirmed', 'reviewed_dismissed')) DEFAULT 'open',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          CHECK (submission_a_id < submission_b_id)
+        )
+      `);
+      await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS scan_handwriting_flags_pair_idx ON scan_handwriting_flags(submission_a_id, submission_b_id)');
+    }).catch((err) => console.error('Failed to ensure scan_handwriting_flags schema:', err));
+  }
+  return scanHandwritingFlagsSchemaPromise;
+}
+ensureScanHandwritingFlagsSchema();
+
+// Questions a scan assignment actually asks — students see these before the
+// camera opens (see GET /api/me/scan-context), teachers author them in
+// AssignmentForm same as exam_items' prompt/marks/position, just without the
+// mcq/short/long/coding type branching exam_items needs (a scan answer is
+// always "written on paper").
+let scanAssignmentQuestionsSchemaPromise = null;
+function ensureScanAssignmentQuestionsSchema() {
+  if (!scanAssignmentQuestionsSchemaPromise) {
+    scanAssignmentQuestionsSchemaPromise = pool.query(`
+      CREATE TABLE IF NOT EXISTS scan_assignment_questions (
+        id SERIAL PRIMARY KEY,
+        problem_id INTEGER NOT NULL REFERENCES problems(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL DEFAULT 0,
+        prompt TEXT NOT NULL,
+        marks INTEGER NOT NULL DEFAULT 1
+      )
+    `).then(async () => {
+      await pool.query('CREATE INDEX IF NOT EXISTS scan_assignment_questions_problem_idx ON scan_assignment_questions(problem_id)');
+    }).catch((err) => console.error('Failed to ensure scan_assignment_questions schema:', err));
+  }
+  return scanAssignmentQuestionsSchemaPromise;
+}
+ensureScanAssignmentQuestionsSchema();
+
+// One row per (submission, question) — populated by the OCR pipeline once a
+// submission's assignment deadline passes (ai_assessment filled in by
+// aiGrading.js's Groq call), marks_awarded stays NULL until a teacher
+// grades it in ScanReview. Never overwritten by re-running OCR since a
+// resubmission deletes the old scan_submissions row outright (see
+// POST /api/problems/:id/scan-submit) and CASCADEs these away with it.
+let scanSubmissionAnswersSchemaPromise = null;
+function ensureScanSubmissionAnswersSchema() {
+  if (!scanSubmissionAnswersSchemaPromise) {
+    scanSubmissionAnswersSchemaPromise = Promise.all([ensureScanSubmissionsSchema(), ensureScanAssignmentQuestionsSchema()]).then(async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS scan_submission_answers (
+          id SERIAL PRIMARY KEY,
+          submission_id INTEGER NOT NULL REFERENCES scan_submissions(id) ON DELETE CASCADE,
+          question_id INTEGER NOT NULL REFERENCES scan_assignment_questions(id) ON DELETE CASCADE,
+          ai_assessment TEXT,
+          marks_awarded INTEGER
+        )
+      `);
+      await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS scan_submission_answers_pair_idx ON scan_submission_answers(submission_id, question_id)');
+    }).catch((err) => console.error('Failed to ensure scan_submission_answers schema:', err));
+  }
+  return scanSubmissionAnswersSchemaPromise;
+}
+ensureScanSubmissionAnswersSchema();
+
+// Flips true the moment a text-plagiarism flag against this submission is
+// confirmed (see PUT /api/admin/scan-flags/:id) — displayed total marks
+// become 0 while true, regardless of whatever marks_awarded values already
+// sit in scan_submission_answers, so un-penalizing later never loses a
+// teacher's prior grading work.
+async function ensureScanSubmissionPenalizedColumn() {
+  await ensureScanSubmissionsSchema();
+  try {
+    await pool.query('ALTER TABLE scan_submissions ADD COLUMN IF NOT EXISTS penalized BOOLEAN NOT NULL DEFAULT false');
+  } catch (err) {
+    console.error('Failed to ensure scan_submissions.penalized:', err);
+  }
+}
+ensureScanSubmissionPenalizedColumn();
+
+// Per-org Jaccard-similarity cutoff above which a pair of scan submissions
+// for the same assignment gets flagged for teacher review (see the deadline
+// sweep's text-plagiarism comparator). A single scalar, so a column on the
+// org row rather than a whole new settings table — same reasoning as any
+// other single per-org toggle in this file.
+async function ensureOrganizationsPlagiarismThresholdColumn() {
+  await ensureOrganizationsSchema();
+  try {
+    await pool.query('ALTER TABLE organizations ADD COLUMN IF NOT EXISTS scan_plagiarism_threshold REAL NOT NULL DEFAULT 0.4');
+  } catch (err) {
+    console.error('Failed to ensure organizations.scan_plagiarism_threshold:', err);
+  }
+}
+ensureOrganizationsPlagiarismThresholdColumn();
 
 // ============================================================================
 // BILLING — subscription plans by student headcount, via Razorpay.
@@ -635,8 +845,8 @@ ensureSubscriptionsSchema();
 // Lazily constructed — RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET don't exist yet
 // in this deploy (test-mode keys are still being set up), so this can't be
 // built at module load like most other external clients in this file
-// (compare to `const resend = new Resend(...)`, built eagerly since Resend
-// tolerates an unset key until actually used). Returns null — never
+// (compare to getGmailClient()/getB2Client(), each lazily built the same
+// way for the same reason). Returns null — never
 // throws — when unconfigured, so every caller can cleanly 503 instead of
 // crashing the process.
 let razorpayClient = null;
@@ -672,7 +882,7 @@ async function ensureRazorpayPlan(planKey, billingCycle) {
   const created = await rzp.plans.create({
     period: billingCycle === 'monthly' ? 'monthly' : 'yearly',
     interval: 1,
-    item: { name: `AssignMeant ${plan.label} (${billingCycle})`, amount, currency: 'INR' },
+    item: { name: `HonorRoll ${plan.label} (${billingCycle})`, amount, currency: 'INR' },
   });
 
   // ON CONFLICT covers two admins simultaneously triggering checkout for the
@@ -748,6 +958,23 @@ async function ensureProblemsSubjectColumn() {
 }
 ensureProblemsSubjectColumn();
 
+// 'scan' assignments (student scans a handwritten answer sheet instead of
+// writing code) reuse the `problems` table rather than a parallel one —
+// same org/subject scoping, same opens_at/closes_at window, same admin
+// list — distinguished only by this column. assignment_no is free-text
+// (e.g. "3", "HW-3"), needed verbatim for the scanned-PDF auto-filename
+// pattern; nullable for existing code rows, required at the route level
+// only when submission_mode='scan'.
+async function ensureScanAssignmentColumns() {
+  try {
+    await pool.query(`ALTER TABLE problems ADD COLUMN IF NOT EXISTS submission_mode TEXT NOT NULL DEFAULT 'code' CHECK (submission_mode IN ('code', 'scan'))`);
+    await pool.query('ALTER TABLE problems ADD COLUMN IF NOT EXISTS assignment_no TEXT');
+  } catch (err) {
+    console.error('Failed to ensure problems scan-assignment columns:', err);
+  }
+}
+ensureScanAssignmentColumns();
+
 async function ensureExamsSubjectColumn() {
   await Promise.all([ensureSubjectsSchema(), ensureExamSchema()]);
   try {
@@ -758,15 +985,6 @@ async function ensureExamsSubjectColumn() {
 }
 ensureExamsSubjectColumn();
 
-// Email sending via Resend's HTTPS API instead of raw SMTP — Render blocks
-// outbound traffic on SMTP ports 25/465/587 for free web services (since
-// Sep 2025), which is what made nodemailer/Gmail time out. Resend just makes
-// a normal HTTPS request, so it isn't affected by that restriction.
-const resend = new Resend(process.env.RESEND_API_KEY);
-// Until you verify your own domain in the Resend dashboard, you can only
-// send FROM this address, and only TO the email you signed up to Resend
-// with — see the note further down where this is used.
-const EMAIL_FROM = process.env.EMAIL_FROM || 'AssignMeant <onboarding@resend.dev>';
 // Single source of truth for the deployed frontend URL, used by every email
 // that needs to link back into the app (credentials email, reset-password
 // email). Defined once so changing domains later only means updating one
@@ -814,6 +1032,24 @@ async function findOrCreateGlobalUser(client, email, name = null) {
     [email, hashedPassword, trimmedName]
   );
   return { userId: inserted.rows[0].id, isNew: true, temporaryPassword: rawPassword };
+}
+
+// One shared welcome-email template for every path that provisions a
+// brand-new student identity (single admin create-student, CSV import, the
+// Google Form webhook) — previously each hand-rolled its own copy, and one
+// of the three (create-student) simply never sent an email at all, leaving
+// the admin to relay the temporary password to the student out-of-band
+// themselves. Names the signing-up institution explicitly: since `users`
+// is a single global identity shared across every org that email belongs
+// to, a student receiving this out of the blue has no other way to know
+// which school/college just created it for them.
+async function sendStudentWelcomeEmail(email, name, organizationName, temporaryPassword) {
+  const { error } = await sendEmail({
+    to: email,
+    subject: 'Your HonorRoll Account Credentials',
+    text: `Hello ${name || 'Student'},\n\n${organizationName} has set up your HonorRoll account.\n\nYour temporary password is: ${temporaryPassword}\n\nLogin via ${FRONTEND_URL}\n\nPlease log in and change your password after logging in.`,
+  });
+  if (error) console.error(`Welcome email failed to send to ${email}:`, error);
 }
 
 // Validates the optional per-assignment time limit sent from AssignmentForm.
@@ -1391,19 +1627,24 @@ async function resolveOrCreateOrgUnit(organizationId, levels, tierValues) {
 }
 
 // Given a header row (or, for the webhook, the POSTed field names), splits
-// out which columns are Name/Email and returns the rest in their original
-// left-to-right order — that order IS the tier chain, top to bottom.
+// out which columns are Name/Email/Roll and returns the rest in their
+// original left-to-right order — that order IS the tier chain, top to
+// bottom. Roll is optional (most rosters won't have it) — a header without
+// it just leaves rollKey null and every caller already treats a missing
+// identity column as "nothing to write," same as Name always has.
 function splitTierAndIdentityColumns(headerKeys) {
   let nameKey = null;
   let emailKey = null;
+  let rollKey = null;
   const tierKeys = [];
   for (const key of headerKeys) {
     const normalized = key.trim().toLowerCase();
     if (normalized === 'name' && nameKey === null) nameKey = key;
     else if (normalized === 'email' && emailKey === null) emailKey = key;
+    else if ((normalized === 'roll' || normalized === 'roll number' || normalized === 'roll no') && rollKey === null) rollKey = key;
     else tierKeys.push(key);
   }
-  return { nameKey, emailKey, tierKeys };
+  return { nameKey, emailKey, rollKey, tierKeys };
 }
 
 // Resolves the FULL (including hidden) test-case list for a coding exam
@@ -1585,7 +1826,7 @@ app.post('/api/admin/create-student', authenticateToken, requireAdmin, async (re
 
   const client = await pool.connect();
   try {
-    const orgRes = await client.query('SELECT status FROM organizations WHERE id = $1', [req.user.organizationId]);
+    const orgRes = await client.query('SELECT status, name FROM organizations WHERE id = $1', [req.user.organizationId]);
     if (orgRes.rows[0]?.status !== 'approved') {
       return res.status(403).json({ error: 'Your organization is still pending approval — you cannot add students yet' });
     }
@@ -1619,12 +1860,19 @@ app.post('/api/admin/create-student', authenticateToken, requireAdmin, async (re
 
     await client.query('COMMIT');
 
+    // Best-effort, after the transaction is already committed — an email
+    // hiccup here shouldn't turn an otherwise-successful account creation
+    // into a 500 (matches the CSV import / Google Form webhook posture).
+    if (isNew) {
+      await sendStudentWelcomeEmail(email, name, orgRes.rows[0].name, temporaryPassword);
+    }
+
     const student = { id: userId, email, name: name || null, role: 'student' };
     if (isNew) {
-      res.status(201).json({ message: 'Student account created successfully', student, temporaryPassword });
+      res.status(201).json({ message: 'Student account created successfully — credentials emailed to them', student, temporaryPassword });
     } else {
       res.status(201).json({
-        message: 'This email already had an AssignMeant account elsewhere — added to your organization. They sign in with their existing password.',
+        message: 'This email already had a HonorRoll account elsewhere — added to your organization. They sign in with their existing password.',
         student,
       });
     }
@@ -1684,7 +1932,7 @@ app.post('/api/admin/create-teacher', authenticateToken, requireAdmin, async (re
       res.status(201).json({ message: 'Teacher account created successfully', teacher, temporaryPassword });
     } else {
       res.status(201).json({
-        message: 'This email already had an AssignMeant account elsewhere — added to your organization. They sign in with their existing password.',
+        message: 'This email already had a HonorRoll account elsewhere — added to your organization. They sign in with their existing password.',
         teacher,
       });
     }
@@ -1754,7 +2002,7 @@ app.post('/api/admin/teachers/csv-import', authenticateToken, requireAdmin, csvU
     return res.status(400).json({ error: 'CSV has no data rows' });
   }
 
-  const { emailKey, nameKey, tierKeys } = splitTierAndIdentityColumns(Object.keys(rows[0]));
+  const { emailKey, nameKey, rollKey, tierKeys } = splitTierAndIdentityColumns(Object.keys(rows[0]));
   if (!emailKey) {
     return res.status(400).json({ error: 'CSV must have an Email column' });
   }
@@ -1777,6 +2025,7 @@ app.post('/api/admin/teachers/csv-import', authenticateToken, requireAdmin, csvU
     const rowNum = i + 2;
     const email = String(row[emailKey] || '').trim();
     const name = nameKey ? String(row[nameKey] || '').trim() : '';
+    const rollNumber = rollKey ? String(row[rollKey] || '').trim() || null : null;
 
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       results.errors.push({ row: rowNum, email, reason: email ? 'Malformed email' : 'Missing email' });
@@ -1799,9 +2048,9 @@ app.post('/api/admin/teachers/csv-import', authenticateToken, requireAdmin, csvU
       await client.query('BEGIN');
       const { userId, isNew, temporaryPassword } = await findOrCreateGlobalUser(client, email, name);
       const memberRes = await client.query(
-        `INSERT INTO memberships (user_id, organization_id, role, org_unit_id) VALUES ($1, $2, 'teacher', $3)
+        `INSERT INTO memberships (user_id, organization_id, role, org_unit_id, roll_number) VALUES ($1, $2, 'teacher', $3, $4)
          ON CONFLICT (user_id, organization_id) DO NOTHING RETURNING id`,
-        [userId, req.user.organizationId, orgUnitId]
+        [userId, req.user.organizationId, orgUnitId, rollNumber]
       );
       await client.query('COMMIT');
 
@@ -1858,7 +2107,7 @@ app.get('/api/admin/students/csv-template', authenticateToken, requireAdmin, asy
 app.post('/api/admin/students/csv-import', authenticateToken, requireAdmin, csvUpload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'CSV file is required' });
 
-  const orgRes = await pool.query('SELECT status FROM organizations WHERE id = $1', [req.user.organizationId]);
+  const orgRes = await pool.query('SELECT status, name FROM organizations WHERE id = $1', [req.user.organizationId]);
   if (orgRes.rows[0]?.status !== 'approved') {
     return res.status(403).json({ error: 'Your organization is still pending approval — you cannot import students yet' });
   }
@@ -1878,7 +2127,7 @@ app.post('/api/admin/students/csv-import', authenticateToken, requireAdmin, csvU
   // exactly the shape described when this was designed: no separate
   // "build your structure first" step required before a roster can be
   // uploaded at all).
-  const { emailKey, nameKey, tierKeys } = splitTierAndIdentityColumns(Object.keys(rows[0]));
+  const { emailKey, nameKey, rollKey, tierKeys } = splitTierAndIdentityColumns(Object.keys(rows[0]));
   if (!emailKey) {
     return res.status(400).json({ error: 'CSV must have an Email column' });
   }
@@ -1908,6 +2157,7 @@ app.post('/api/admin/students/csv-import', authenticateToken, requireAdmin, csvU
     const rowNum = i + 2; // +1 for 0-index, +1 for the header row itself
     const email = String(row[emailKey] || '').trim();
     const name = nameKey ? String(row[nameKey] || '').trim() : '';
+    const rollNumber = rollKey ? String(row[rollKey] || '').trim() || null : null;
 
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       results.errors.push({ row: rowNum, email, reason: email ? 'Malformed email' : 'Missing email' });
@@ -1935,9 +2185,9 @@ app.post('/api/admin/students/csv-import', authenticateToken, requireAdmin, csvU
       await client.query('BEGIN');
       const { userId, isNew, temporaryPassword } = await findOrCreateGlobalUser(client, email, name);
       const memberRes = await client.query(
-        `INSERT INTO memberships (user_id, organization_id, role, org_unit_id) VALUES ($1, $2, 'student', $3)
+        `INSERT INTO memberships (user_id, organization_id, role, org_unit_id, roll_number) VALUES ($1, $2, 'student', $3, $4)
          ON CONFLICT (user_id, organization_id) DO NOTHING RETURNING id`,
-        [userId, req.user.organizationId, orgUnitId]
+        [userId, req.user.organizationId, orgUnitId, rollNumber]
       );
       await client.query('COMMIT');
 
@@ -1961,12 +2211,7 @@ app.post('/api/admin/students/csv-import', authenticateToken, requireAdmin, csvU
 
   // Best-effort, after everything's committed — one bad Resend send
   // shouldn't stop the rest of the batch from going out.
-  await Promise.allSettled(newAccounts.map((a) => resend.emails.send({
-    from: EMAIL_FROM,
-    to: a.email,
-    subject: 'Your AssignMeant Account Credentials',
-    text: `Hello ${a.name || 'Student'},\n\nYour AssignMeant account is ready!\n\nYour temporary password is: ${a.temporaryPassword}\n\nLogin via ${FRONTEND_URL}\n\nPlease log in and change your password after logging in.`,
-  })));
+  await Promise.allSettled(newAccounts.map((a) => sendStudentWelcomeEmail(a.email, a.name, orgRes.rows[0].name, a.temporaryPassword)));
 
   results.unitsCreated = [...seenCreatedUnits];
   res.status(200).json(results);
@@ -2579,7 +2824,7 @@ app.get('/api/teacher/non-submitters', authenticateToken, async (req, res) => {
 app.get('/api/admin/students/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const studentRes = await pool.query(
-      `SELECT u.id, u.email, u.name, u.created_at, m.org_unit_id FROM users u
+      `SELECT u.id, u.email, u.name, u.created_at, m.org_unit_id, m.roll_number FROM users u
        JOIN memberships m ON m.user_id = u.id AND m.organization_id = $2 AND m.role = 'student'
        WHERE u.id = $1`,
       [req.params.id, req.user.organizationId]
@@ -2688,6 +2933,73 @@ app.get('/api/admin/students/:studentId/problems/:problemId/submissions', authen
 });
 
 // ============================================================================
+// 1c-2. ADMIN ONLY: Edit a student's own details — name, class/unit
+// placement, roll number. Deliberately requireAdmin, not
+// requireAdminOrTeacher — a teacher's authority is scoped to grading
+// within their assigned subjects, not to changing a student's identity/
+// roster placement. Email is NOT editable here: `users.email` is the
+// global-identity key shared across every organization that email belongs
+// to (see findOrCreateGlobalUser), so changing it here would rename that
+// person's login everywhere, not just within this org — a materially
+// different, riskier operation than fixing a name/class typo, and not
+// something this route takes on.
+// ============================================================================
+app.put('/api/admin/students/:id', authenticateToken, requireAdmin, async (req, res) => {
+  const studentId = req.params.id;
+  const name = req.body.name !== undefined ? (String(req.body.name || '').trim() || null) : undefined;
+  const orgUnitId = req.body.orgUnitId !== undefined
+    ? (req.body.orgUnitId === null || req.body.orgUnitId === '' ? null : Number(req.body.orgUnitId))
+    : undefined;
+  const rollNumber = req.body.rollNumber !== undefined ? (String(req.body.rollNumber || '').trim() || null) : undefined;
+
+  try {
+    // Scoped to role='student' on purpose, same reasoning as the delete
+    // route right below — never lets this touch an admin/teacher account
+    // even if a stale/tampered id is passed in. 404, not 403, on a miss so
+    // this can't be used to probe which ids exist in another organization.
+    const membershipRes = await pool.query(
+      `SELECT m.id FROM memberships m WHERE m.user_id = $1 AND m.organization_id = $2 AND m.role = 'student'`,
+      [studentId, req.user.organizationId]
+    );
+    if (membershipRes.rows.length === 0) return res.status(404).json({ error: 'Student not found' });
+
+    if (orgUnitId !== undefined && orgUnitId !== null) {
+      const unitCheck = await pool.query('SELECT 1 FROM org_units WHERE id = $1 AND organization_id = $2', [orgUnitId, req.user.organizationId]);
+      if (unitCheck.rows.length === 0) return res.status(404).json({ error: 'Unit not found' });
+    }
+
+    if (name !== undefined) {
+      await pool.query('UPDATE users SET name = $1 WHERE id = $2', [name, studentId]);
+    }
+    if (orgUnitId !== undefined || rollNumber !== undefined) {
+      // Distinguishes "field not sent at all" (leave unchanged) from
+      // "field explicitly sent as null" (clear it, e.g. moving a student
+      // back to no unit) via the two boolean flags — a plain COALESCE
+      // against the existing value can't tell those apart, since both
+      // look identical (a NULL parameter) from SQL's point of view.
+      await pool.query(
+        `UPDATE memberships SET
+           org_unit_id = CASE WHEN $3::boolean THEN $1 ELSE org_unit_id END,
+           roll_number = CASE WHEN $4::boolean THEN $2 ELSE roll_number END
+         WHERE user_id = $5 AND organization_id = $6`,
+        [orgUnitId ?? null, rollNumber ?? null, orgUnitId !== undefined, rollNumber !== undefined, studentId, req.user.organizationId]
+      );
+    }
+
+    const updated = await pool.query(
+      `SELECT u.id, u.email, u.name, m.org_unit_id, m.roll_number FROM users u
+       JOIN memberships m ON m.user_id = u.id AND m.organization_id = $2
+       WHERE u.id = $1`,
+      [studentId, req.user.organizationId]
+    );
+    res.status(200).json({ message: 'Student updated', student: updated.rows[0] });
+  } catch (err) {
+    console.error('Update student error:', err);
+    res.status(500).json({ error: 'Failed to update student' });
+  }
+});
+
+// ============================================================================
 // 1d. ADMIN: Remove a student from the platform
 // ============================================================================
 // Scoped to role = 'student' in the WHERE clause on purpose â€” even if an admin's
@@ -2754,9 +3066,10 @@ app.post('/api/webhook/google-form/:webhookSecret', async (req, res) => {
   // import, so an admin building a Google Form question-by-question
   // (Campus -> Department -> Year -> Name -> Email) gets the exact same
   // auto-built structure a CSV upload would.
-  const { emailKey, nameKey, tierKeys } = splitTierAndIdentityColumns(Object.keys(req.body || {}));
+  const { emailKey, nameKey, rollKey, tierKeys } = splitTierAndIdentityColumns(Object.keys(req.body || {}));
   const email = emailKey ? String(req.body[emailKey] || '').trim() : '';
   const name = nameKey ? String(req.body[nameKey] || '').trim() : '';
+  const rollNumber = rollKey ? String(req.body[rollKey] || '').trim() || null : null;
 
   if (!email) {
     return res.status(400).json({ error: 'Email required' });
@@ -2764,7 +3077,7 @@ app.post('/api/webhook/google-form/:webhookSecret', async (req, res) => {
 
   const client = await pool.connect();
   try {
-    const orgRes = await client.query('SELECT id, status, default_org_unit_id FROM organizations WHERE webhook_secret = $1', [req.params.webhookSecret]);
+    const orgRes = await client.query('SELECT id, status, name, default_org_unit_id FROM organizations WHERE webhook_secret = $1', [req.params.webhookSecret]);
     if (orgRes.rows.length === 0) {
       return res.status(404).json({ error: 'Unknown webhook' });
     }
@@ -2807,9 +3120,9 @@ app.post('/api/webhook/google-form/:webhookSecret', async (req, res) => {
     // identity and the membership were newly created this call, or the
     // student gets a password that doesn't match what's actually stored.
     const memberRes = await client.query(
-      `INSERT INTO memberships (user_id, organization_id, role, org_unit_id) VALUES ($1, $2, 'student', $3)
+      `INSERT INTO memberships (user_id, organization_id, role, org_unit_id, roll_number) VALUES ($1, $2, 'student', $3, $4)
        ON CONFLICT (user_id, organization_id) DO NOTHING RETURNING id`,
-      [userId, organizationId, orgUnitId]
+      [userId, organizationId, orgUnitId, rollNumber]
     );
     await client.query('COMMIT');
 
@@ -2827,13 +3140,7 @@ app.post('/api/webhook/google-form/:webhookSecret', async (req, res) => {
     // an email hiccup here shouldn't turn an otherwise-successful signup
     // into a 500 (matches the same best-effort treatment CSV import gives
     // its own credentials emails).
-    const { error: emailError } = await resend.emails.send({
-      from: EMAIL_FROM,
-      to: email,
-      subject: 'Your AssignMeant Account Credentials',
-      text: `Hello ${name || 'Student'},\n\nYour AssignMeant account is ready!\n\nYour temporary password is: ${temporaryPassword}\n\nLogin via ${FRONTEND_URL}\n\nPlease log in and change your password after logging in.`,
-    });
-    if (emailError) console.error('Onboarding email failed to send:', emailError);
+    await sendStudentWelcomeEmail(email, name, orgRes.rows[0].name, temporaryPassword);
 
     console.log(`Automated Onboarding Complete for: ${email}`);
     res.status(200).send('Success');
@@ -3008,7 +3315,7 @@ async function applyRazorpaySubscriptionEvent(eventType, sub) {
   }
 }
 
-// Best-effort billing notification — reuses the same Resend pattern as
+// Best-effort billing notification — reuses the same Gmail-send pattern as
 // every other transactional email in this file. Looks up the org's admin
 // by membership role rather than requiring callers to already have an
 // email address on hand.
@@ -3021,7 +3328,7 @@ async function sendBillingEmail(organizationId, subject, text) {
     );
     const to = adminRes.rows[0]?.email;
     if (!to) return;
-    const { error } = await resend.emails.send({ from: EMAIL_FROM, to, subject: `AssignMeant — ${subject}`, text });
+    const { error } = await sendEmail({ to, subject: `HonorRoll — ${subject}`, text });
     if (error) console.error('Billing email failed to send:', error);
   } catch (err) {
     console.error('Billing email error:', err);
@@ -3112,11 +3419,10 @@ app.post('/api/organizations/signup', async (req, res) => {
     // while verification/approval is pending — see the status check inside
     // create-student/the webhook for what's actually gated on 'approved'.
     const verifyLink = `${FRONTEND_URL}/#/verify-organization?token=${verificationToken}`;
-    const { error: emailError } = await resend.emails.send({
-      from: EMAIL_FROM,
+    const { error: emailError } = await sendEmail({
       to: email,
-      subject: 'Confirm your AssignMeant organization',
-      text: `Hello,\n\nPlease confirm you own this email address to continue setting up "${org.name}" on AssignMeant:\n\n${verifyLink}\n\nThis link expires in 24 hours. You can already sign in and start building your organization's structure — but you'll need to confirm this email, and have your organization approved, before you can add students.`,
+      subject: 'Confirm your HonorRoll organization',
+      text: `Hello,\n\nPlease confirm you own this email address to continue setting up "${org.name}" on HonorRoll:\n\n${verifyLink}\n\nThis link expires in 24 hours. You can already sign in and start building your organization's structure — but you'll need to confirm this email, and have your organization approved, before you can add students.`,
     });
     if (emailError) console.error('Verification email failed to send:', emailError);
 
@@ -3512,10 +3818,9 @@ app.post('/api/forgot-password', async (req, res) => {
     // Router never sees "/reset-password" at all.
     const resetLink = `${FRONTEND_URL}/#/reset-password?token=${resetToken}`;
 
-    const { error: emailError } = await resend.emails.send({
-      from: EMAIL_FROM,
+    const { error: emailError } = await sendEmail({
       to: email,
-      subject: 'AssignMeant Password Reset',
+      subject: 'HonorRoll Password Reset',
       text: `You requested a password reset.\n\nClick here to reset it: ${resetLink}\n\nThis link expires in 1 hour.`
     });
     if (emailError) throw emailError;
@@ -3609,7 +3914,7 @@ app.post('/api/playground/execute/:language', authenticateToken, async (req, res
 app.get('/api/problems', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, title, difficulty, opens_at, closes_at, subject_id FROM problems WHERE organization_id = $1 ORDER BY id ASC',
+      'SELECT id, title, difficulty, opens_at, closes_at, subject_id, submission_mode FROM problems WHERE organization_id = $1 ORDER BY id ASC',
       [req.user.organizationId]
     );
 
@@ -3654,6 +3959,17 @@ app.get('/api/problems', authenticateToken, async (req, res) => {
           ? { status: best.status, passed: best.passed_count, total: best.total_count }
           : null;
       });
+
+      // scan_submissions is a separate table (a scan-mode assignment is
+      // never in `submissions` above) — attached as its own field rather
+      // than forced into `submission`'s code-judge shape (status/passed/
+      // total), which a scanned answer sheet has no equivalent of.
+      const scanRes = await pool.query(
+        `SELECT problem_id FROM scan_submissions WHERE user_id = $1 AND problem_id = ANY($2::int[])`,
+        [req.user.userId, problemIds]
+      );
+      const scanSubmittedIds = new Set(scanRes.rows.map((r) => r.problem_id));
+      visible.forEach((p) => { p.scanSubmitted = scanSubmittedIds.has(p.id); });
     }
 
     res.status(200).json({ problems: visible });
@@ -3795,12 +4111,30 @@ app.get('/api/problems/:id/result', authenticateToken, async (req, res) => {
 app.post('/api/admin/problems', authenticateToken, requireAdminOrTeacher, async (req, res) => {
   const { title, difficulty, description, starterCode = {}, testCases = [], opensAt = null, closesAt = null } = req.body;
   const subjectId = req.body.subjectId != null ? Number(req.body.subjectId) : null;
+  // 'scan' assignments skip the code-judge machinery entirely (no starter
+  // code, no test cases) — students upload a scanned PDF instead. See
+  // ensureScanAssignmentColumns for the column definitions.
+  const submissionMode = req.body.submissionMode === 'scan' ? 'scan' : 'code';
+  const assignmentNo = submissionMode === 'scan' ? String(req.body.assignmentNo || '').trim() : null;
+  // Scan-mode questions: what a student actually needs to answer, shown
+  // before the camera opens (see GET /api/me/scan-context). Required same
+  // as test cases are for code mode — a scan assignment with no questions
+  // would just be a bare upload box with no idea what's being asked.
+  const questions = submissionMode === 'scan' && Array.isArray(req.body.questions)
+    ? req.body.questions.filter((q) => q && String(q.prompt || '').trim())
+    : [];
 
   if (!title || !difficulty || !description) {
     return res.status(400).json({ error: 'Title, difficulty, and description are required' });
   }
-  if (!Array.isArray(testCases) || testCases.length === 0) {
+  if (submissionMode === 'code' && (!Array.isArray(testCases) || testCases.length === 0)) {
     return res.status(400).json({ error: 'At least one test case is required' });
+  }
+  if (submissionMode === 'scan' && !assignmentNo) {
+    return res.status(400).json({ error: 'Assignment number is required for scanned assignments' });
+  }
+  if (submissionMode === 'scan' && questions.length === 0) {
+    return res.status(400).json({ error: 'At least one question is required for scanned assignments' });
   }
   if (await enforceSubjectAuthority(req, res, subjectId)) return;
 
@@ -3816,26 +4150,35 @@ app.post('/api/admin/problems', authenticateToken, requireAdminOrTeacher, async 
     await client.query('BEGIN');
 
     const problemRes = await client.query(
-      `INSERT INTO problems (title, difficulty, description, created_by, opens_at, closes_at, time_limit_seconds, organization_id, subject_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-      [title, difficulty, description, req.user.userId, opensAt, closesAt, timeLimitSeconds, req.user.organizationId, subjectId]
+      `INSERT INTO problems (title, difficulty, description, created_by, opens_at, closes_at, time_limit_seconds, organization_id, subject_id, submission_mode, assignment_no)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
+      [title, difficulty, description, req.user.userId, opensAt, closesAt, timeLimitSeconds, req.user.organizationId, subjectId, submissionMode, assignmentNo]
     );
     const problemId = problemRes.rows[0].id;
 
-    for (const [language, code] of Object.entries(starterCode)) {
-      await client.query(
-        `INSERT INTO starter_code (problem_id, language, code) VALUES ($1, $2, $3)`,
-        [problemId, language, code]
-      );
-    }
+    if (submissionMode === 'code') {
+      for (const [language, code] of Object.entries(starterCode)) {
+        await client.query(
+          `INSERT INTO starter_code (problem_id, language, code) VALUES ($1, $2, $3)`,
+          [problemId, language, code]
+        );
+      }
 
-    for (const testCase of testCases) {
-      if (!testCase.expectedOutput) continue;
-      await client.query(
-        `INSERT INTO test_cases (problem_id, input, expected_output, is_hidden)
-         VALUES ($1, $2, $3, $4)`,
-        [problemId, testCase.input || '', testCase.expectedOutput, testCase.isHidden !== false]
-      );
+      for (const testCase of testCases) {
+        if (!testCase.expectedOutput) continue;
+        await client.query(
+          `INSERT INTO test_cases (problem_id, input, expected_output, is_hidden)
+           VALUES ($1, $2, $3, $4)`,
+          [problemId, testCase.input || '', testCase.expectedOutput, testCase.isHidden !== false]
+        );
+      }
+    } else {
+      for (let i = 0; i < questions.length; i++) {
+        await client.query(
+          `INSERT INTO scan_assignment_questions (problem_id, position, prompt, marks) VALUES ($1, $2, $3, $4)`,
+          [problemId, i, String(questions[i].prompt).trim(), Number(questions[i].marks) > 0 ? Number(questions[i].marks) : 1]
+        );
+      }
     }
 
     await client.query('COMMIT');
@@ -3857,31 +4200,41 @@ app.get('/api/admin/problems/:id', authenticateToken, requireAdminOrTeacher, asy
   const problemId = req.params.id;
   try {
     const problemRes = await pool.query(
-      'SELECT id, title, difficulty, description, opens_at, closes_at, subject_id FROM problems WHERE id = $1 AND organization_id = $2',
+      'SELECT id, title, difficulty, description, opens_at, closes_at, subject_id, submission_mode, assignment_no FROM problems WHERE id = $1 AND organization_id = $2',
       [problemId, req.user.organizationId]
     );
     if (problemRes.rows.length === 0) return res.status(404).json({ error: 'Problem not found' });
     const problem = problemRes.rows[0];
     if (await enforceSubjectAuthority(req, res, problem.subject_id)) return;
 
-    const codeRes = await pool.query(
-      'SELECT language, code FROM starter_code WHERE problem_id = $1',
-      [problemId]
-    );
-    const starterCode = {};
-    codeRes.rows.forEach((row) => { starterCode[row.language] = row.code; });
+    let starterCode = {};
+    let testCases = [];
+    let questions = [];
+    if (problem.submission_mode === 'scan') {
+      const questionsRes = await pool.query(
+        'SELECT prompt, marks FROM scan_assignment_questions WHERE problem_id = $1 ORDER BY position ASC',
+        [problemId]
+      );
+      questions = questionsRes.rows.map((q) => ({ prompt: q.prompt, marks: q.marks }));
+    } else {
+      const codeRes = await pool.query(
+        'SELECT language, code FROM starter_code WHERE problem_id = $1',
+        [problemId]
+      );
+      codeRes.rows.forEach((row) => { starterCode[row.language] = row.code; });
 
-    // Every test case, hidden ones included â€” unlike the student-facing
-    // GET /api/problems/:id, which only returns visible samples.
-    const testCasesRes = await pool.query(
-      'SELECT input, expected_output, is_hidden FROM test_cases WHERE problem_id = $1 ORDER BY id ASC',
-      [problemId]
-    );
-    const testCases = testCasesRes.rows.map((tc) => ({
-      input: tc.input,
-      expectedOutput: tc.expected_output,
-      isHidden: tc.is_hidden,
-    }));
+      // Every test case, hidden ones included â€” unlike the student-facing
+      // GET /api/problems/:id, which only returns visible samples.
+      const testCasesRes = await pool.query(
+        'SELECT input, expected_output, is_hidden FROM test_cases WHERE problem_id = $1 ORDER BY id ASC',
+        [problemId]
+      );
+      testCases = testCasesRes.rows.map((tc) => ({
+        input: tc.input,
+        expectedOutput: tc.expected_output,
+        isHidden: tc.is_hidden,
+      }));
+    }
 
     res.status(200).json({
       title: problem.title,
@@ -3892,6 +4245,9 @@ app.get('/api/admin/problems/:id', authenticateToken, requireAdminOrTeacher, asy
       opensAt: problem.opens_at,
       closesAt: problem.closes_at,
       subjectId: problem.subject_id,
+      submissionMode: problem.submission_mode,
+      assignmentNo: problem.assignment_no,
+      questions,
     });
   } catch (err) {
     console.error('Fetch full problem error:', err);
@@ -3908,22 +4264,39 @@ app.put('/api/admin/problems/:id', authenticateToken, requireAdminOrTeacher, asy
   const problemId = req.params.id;
   const { title, difficulty, description, starterCode = {}, testCases = [], opensAt = null, closesAt = null } = req.body;
   const subjectId = req.body.subjectId != null ? Number(req.body.subjectId) : null;
+  const questions = Array.isArray(req.body.questions)
+    ? req.body.questions.filter((q) => q && String(q.prompt || '').trim())
+    : [];
+  const assignmentNo = String(req.body.assignmentNo || '').trim() || null;
 
   if (!title || !difficulty || !description) {
     return res.status(400).json({ error: 'Title, difficulty, and description are required' });
-  }
-  if (!Array.isArray(testCases) || testCases.length === 0) {
-    return res.status(400).json({ error: 'At least one test case is required' });
   }
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    const existing = await client.query('SELECT id, subject_id FROM problems WHERE id = $1 AND organization_id = $2', [problemId, req.user.organizationId]);
+    // submission_mode is fixed at creation (not part of the SET below) —
+    // fetched here purely to decide which of test-cases-vs-questions this
+    // update should validate/replace.
+    const existing = await client.query('SELECT id, subject_id, submission_mode FROM problems WHERE id = $1 AND organization_id = $2', [problemId, req.user.organizationId]);
     if (existing.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Problem not found' });
+    }
+    const submissionMode = existing.rows[0].submission_mode;
+    if (submissionMode === 'code' && (!Array.isArray(testCases) || testCases.length === 0)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'At least one test case is required' });
+    }
+    if (submissionMode === 'scan' && questions.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'At least one question is required for scanned assignments' });
+    }
+    if (submissionMode === 'scan' && !assignmentNo) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Assignment number is required for scanned assignments' });
     }
     // A teacher must be authorized on both the item's current subject and
     // whatever subject they're moving it to (a no-op check for admins).
@@ -3931,9 +4304,27 @@ app.put('/api/admin/problems/:id', authenticateToken, requireAdminOrTeacher, asy
     if (subjectId !== existing.rows[0].subject_id && await enforceSubjectAuthority(req, res, subjectId)) { await client.query('ROLLBACK'); return; }
 
     await client.query(
-      `UPDATE problems SET title = $1, difficulty = $2, description = $3, opens_at = $4, closes_at = $5, subject_id = $6 WHERE id = $7`,
-      [title, difficulty, description, opensAt, closesAt, subjectId, problemId]
+      submissionMode === 'scan'
+        ? `UPDATE problems SET title = $1, difficulty = $2, description = $3, opens_at = $4, closes_at = $5, subject_id = $6, assignment_no = $7 WHERE id = $8`
+        : `UPDATE problems SET title = $1, difficulty = $2, description = $3, opens_at = $4, closes_at = $5, subject_id = $6 WHERE id = $7`,
+      submissionMode === 'scan'
+        ? [title, difficulty, description, opensAt, closesAt, subjectId, assignmentNo, problemId]
+        : [title, difficulty, description, opensAt, closesAt, subjectId, problemId]
     );
+
+    if (submissionMode === 'scan') {
+      // Full replace, same as starter_code/test_cases below — matches how
+      // AssignmentForm sends its payload (the whole question set at once).
+      await client.query('DELETE FROM scan_assignment_questions WHERE problem_id = $1', [problemId]);
+      for (let i = 0; i < questions.length; i++) {
+        await client.query(
+          `INSERT INTO scan_assignment_questions (problem_id, position, prompt, marks) VALUES ($1, $2, $3, $4)`,
+          [problemId, i, String(questions[i].prompt).trim(), Number(questions[i].marks) > 0 ? Number(questions[i].marks) : 1]
+        );
+      }
+      await client.query('COMMIT');
+      return res.status(200).json({ message: 'Assignment updated successfully', problemId });
+    }
 
     // Starter code and test cases are fully replaced rather than diffed â€”
     // matches how AssignmentForm sends its payload (the whole set at once).
@@ -5010,6 +5401,693 @@ app.put('/api/admin/exam-answers/:answerId/grade', authenticateToken, requireAdm
   }
 });
 
+// ============================================================================
+// SCANNED ASSIGNMENTS — Phase 2. Client-side capture/bundling/upload only;
+// no OCR/comparator processing happens yet (see ensureScanSubmissionsSchema
+// etc. above — those tables exist, but the columns OCR would fill in stay
+// NULL until a later phase runs the actual pipeline against 'pending' rows).
+// ============================================================================
+
+// Resolves everything the frontend needs to build the auto-filename
+// (<student>_<class>_<roll>_<assignment>_<subject>.pdf) — kept server-side
+// rather than reimplemented in the frontend, since org-tree path resolution
+// (getOrgUnitLookup/resolveOrgUnitPath) and roll-number/subject lookups
+// already exist here and nowhere on the client.
+app.get('/api/me/scan-context', authenticateToken, async (req, res) => {
+  const problemId = req.query.problemId;
+  if (!problemId) return res.status(400).json({ error: 'problemId is required' });
+
+  try {
+    const problemRes = await pool.query(
+      `SELECT p.assignment_no, p.submission_mode, s.name AS subject_name
+       FROM problems p LEFT JOIN subjects s ON s.id = p.subject_id
+       WHERE p.id = $1 AND p.organization_id = $2`,
+      [problemId, req.user.organizationId]
+    );
+    if (problemRes.rows.length === 0) return res.status(404).json({ error: 'Problem not found' });
+    if (problemRes.rows[0].submission_mode !== 'scan') {
+      return res.status(400).json({ error: 'This assignment does not accept scanned submissions' });
+    }
+
+    const userRes = await pool.query(
+      `SELECT u.name, m.org_unit_id, m.roll_number
+       FROM users u JOIN memberships m ON m.user_id = u.id AND m.organization_id = $2
+       WHERE u.id = $1`,
+      [req.user.userId, req.user.organizationId]
+    );
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'Membership not found' });
+    const { name, org_unit_id: orgUnitId, roll_number: rollNumber } = userRes.rows[0];
+
+    const unitLookup = await getOrgUnitLookup(req.user.organizationId);
+    const classPath = resolveOrgUnitPath(unitLookup, orgUnitId).map((p) => p.name).join(' ');
+
+    // Shown to the student before the camera opens (see ScanCapture.jsx's
+    // pre-scan questions screen) — they should know what's being asked
+    // before they start scanning, not find out by re-reading a paper copy.
+    const questionsRes = await pool.query(
+      'SELECT prompt, marks FROM scan_assignment_questions WHERE problem_id = $1 ORDER BY position ASC',
+      [problemId]
+    );
+
+    res.status(200).json({
+      studentName: name || null,
+      classPath: classPath || null,
+      rollNumber: rollNumber || null,
+      assignmentNo: problemRes.rows[0].assignment_no,
+      subjectName: problemRes.rows[0].subject_name || null,
+      questions: questionsRes.rows.map((q) => ({ prompt: q.prompt, marks: q.marks })),
+    });
+  } catch (err) {
+    console.error('Scan context error:', err);
+    res.status(500).json({ error: 'Failed to load scan context' });
+  }
+});
+
+// Accepts the client-bundled PDF, uploads it to B2, and records a 'pending'
+// row — no OCR is triggered here. OCR is deliberately deferred until the
+// assignment's own deadline passes (a later phase's sweep will pick up
+// 'pending' rows on already-closed assignments), not run per-upload —
+// since a student can resubmit freely up to the deadline (see the
+// replace-on-resubmit logic below) and only the LAST submission before
+// closes_at is ever graded, running OCR on every intermediate attempt
+// would just burn through the OCR Space's free-tier compute on discarded
+// work. Responds as soon as the upload completes; the frontend can poll
+// GET /api/scan-submissions/:id/status, which for now will just always
+// read back 'pending' — accurate given nothing progresses it yet.
+app.post('/api/problems/:id/scan-submit', authenticateToken, scanUpload.single('file'), async (req, res) => {
+  const problemId = req.params.id;
+  if (!req.file) return res.status(400).json({ error: 'A PDF file is required' });
+  if (!isB2Configured()) return res.status(503).json({ error: 'Scanned-assignment storage is not configured yet' });
+
+  try {
+    const problemRes = await pool.query(
+      'SELECT submission_mode, opens_at, closes_at FROM problems WHERE id = $1 AND organization_id = $2',
+      [problemId, req.user.organizationId]
+    );
+    if (problemRes.rows.length === 0) return res.status(404).json({ error: 'Problem not found' });
+    if (problemRes.rows[0].submission_mode !== 'scan') {
+      return res.status(400).json({ error: 'This assignment does not accept scanned submissions' });
+    }
+    const status = getProblemStatus(problemRes.rows[0]);
+    if (status !== 'open' && req.user.role !== 'admin') {
+      return res.status(403).json({ error: status === 'upcoming' ? 'This assignment is not open yet' : 'This assignment is closed' });
+    }
+
+    // A student can resubmit as many times as they like before the
+    // deadline — each new upload REPLACES the previous one outright (not
+    // "keep both, use the latest"), since only the final submission is
+    // ever meant to count. Delete the old row's storage object too, not
+    // just the DB row, so repeated resubmission doesn't quietly accumulate
+    // orphaned files in the bucket.
+    const existing = await pool.query(
+      'SELECT id, storage_key FROM scan_submissions WHERE problem_id = $1 AND user_id = $2',
+      [problemId, req.user.userId]
+    );
+    if (existing.rows.length > 0) {
+      const previous = existing.rows[0];
+      await pool.query('DELETE FROM scan_submissions WHERE id = $1', [previous.id]);
+      if (previous.storage_key) {
+        try {
+          await deleteScanPdf(previous.storage_key);
+        } catch (err) {
+          console.error('Failed to delete superseded scan PDF (continuing anyway):', err);
+        }
+      }
+    }
+
+    const filename = String(req.body.filename || 'scan.pdf').trim();
+    const insertRes = await pool.query(
+      `INSERT INTO scan_submissions (problem_id, user_id, storage_key, original_filename, status)
+       VALUES ($1, $2, '', $3, 'pending') RETURNING id`,
+      [problemId, req.user.userId, filename]
+    );
+    const submissionId = insertRes.rows[0].id;
+    const objectKey = scanObjectKey(req.user.organizationId, problemId, submissionId);
+
+    await uploadScanPdf(objectKey, req.file.buffer);
+    await pool.query('UPDATE scan_submissions SET storage_key = $1 WHERE id = $2', [objectKey, submissionId]);
+
+    res.status(201).json({ submissionId, status: 'pending' });
+  } catch (err) {
+    console.error('Scan submit error:', err);
+    res.status(500).json({ error: 'Failed to upload scanned submission' });
+  }
+});
+
+app.get('/api/scan-submissions/:id/status', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT ss.id, ss.status, ss.ocr_error, ss.created_at, ss.ocr_completed_at
+       FROM scan_submissions ss JOIN problems p ON p.id = ss.problem_id
+       WHERE ss.id = $1 AND p.organization_id = $2 AND ss.user_id = $3`,
+      [req.params.id, req.user.organizationId, req.user.userId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Submission not found' });
+    res.status(200).json(result.rows[0]);
+  } catch (err) {
+    console.error('Scan submission status error:', err);
+    res.status(500).json({ error: 'Failed to load submission status' });
+  }
+});
+
+// A student's own submission for one scan-mode assignment — since a
+// resubmission always replaces the previous one (see scan-submit above),
+// there's at most one row to find. Returns null (not 404) when the student
+// simply hasn't submitted yet, since "not submitted" is a normal, expected
+// state for the caller to render around, not an error.
+app.get('/api/me/scan-submission', authenticateToken, async (req, res) => {
+  const problemId = req.query.problemId;
+  if (!problemId) return res.status(400).json({ error: 'problemId is required' });
+
+  try {
+    const result = await pool.query(
+      `SELECT ss.id, ss.status, ss.original_filename, ss.storage_key, ss.created_at, ss.ocr_error, ss.penalized
+       FROM scan_submissions ss JOIN problems p ON p.id = ss.problem_id
+       WHERE ss.problem_id = $1 AND p.organization_id = $2 AND ss.user_id = $3`,
+      [problemId, req.user.organizationId, req.user.userId]
+    );
+    if (result.rows.length === 0) return res.status(200).json({ submission: null });
+
+    const row = result.rows[0];
+    const viewUrl = isB2Configured() ? await getScanPdfUrl(row.storage_key) : null;
+
+    // Only shown once every question has actually been graded — a partial
+    // grade-in-progress isn't a result yet, and marks_awarded IS NULL for
+    // every question until a teacher enters something (see
+    // PUT /api/admin/scan-submissions/:id/grade).
+    const answersRes = await pool.query(
+      `SELECT q.prompt, q.marks AS max_marks, sa.marks_awarded
+       FROM scan_assignment_questions q
+       LEFT JOIN scan_submission_answers sa ON sa.question_id = q.id AND sa.submission_id = $1
+       WHERE q.problem_id = $2 ORDER BY q.position ASC`,
+      [row.id, problemId]
+    );
+    const fullyGraded = answersRes.rows.length > 0 && answersRes.rows.every((a) => a.marks_awarded !== null);
+
+    res.status(200).json({
+      submission: {
+        id: row.id,
+        status: row.status,
+        filename: row.original_filename,
+        createdAt: row.created_at,
+        ocrError: row.ocr_error,
+        penalized: row.penalized,
+        viewUrl,
+        grade: fullyGraded ? {
+          totalMarks: answersRes.rows.reduce((sum, a) => sum + a.max_marks, 0),
+          awardedMarks: row.penalized ? 0 : answersRes.rows.reduce((sum, a) => sum + a.marks_awarded, 0),
+          questions: answersRes.rows.map((a) => ({ prompt: a.prompt, maxMarks: a.max_marks, marksAwarded: row.penalized ? 0 : a.marks_awarded })),
+        } : null,
+      },
+    });
+  } catch (err) {
+    console.error('Get own scan submission error:', err);
+    res.status(500).json({ error: 'Failed to load your submission' });
+  }
+});
+
+// Every student's scan submission for one assignment — admin-only, same
+// gating as the code-judge equivalent (GET /api/admin/problems/:id/attempts)
+// right above this, which is also requireAdmin-only rather than
+// requireAdminOrTeacher; matched here for consistency rather than widening
+// access unilaterally. At most one row per student (see the UNIQUE
+// (problem_id, user_id) index), so this is already every student's FINAL
+// submission, not a "best of many" pick the way code-judge attempts are.
+app.get('/api/admin/problems/:id/scan-submissions', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const problemRes = await pool.query('SELECT id FROM problems WHERE id = $1 AND organization_id = $2', [req.params.id, req.user.organizationId]);
+    if (problemRes.rows.length === 0) return res.status(404).json({ error: 'Assignment not found' });
+
+    const totalMarksRes = await pool.query('SELECT COALESCE(SUM(marks), 0) AS total FROM scan_assignment_questions WHERE problem_id = $1', [req.params.id]);
+    const totalMarks = Number(totalMarksRes.rows[0].total);
+
+    const result = await pool.query(
+      `SELECT ss.id, ss.status, ss.original_filename, ss.storage_key, ss.created_at, ss.ocr_error, ss.penalized, u.email, u.name,
+              (SELECT COALESCE(SUM(sa.marks_awarded), 0) FROM scan_submission_answers sa WHERE sa.submission_id = ss.id) AS awarded_marks,
+              (SELECT COUNT(*) FROM scan_submission_answers sa WHERE sa.submission_id = ss.id AND sa.marks_awarded IS NOT NULL) AS graded_count,
+              (SELECT COUNT(*) FROM scan_assignment_questions WHERE problem_id = ss.problem_id) AS question_count
+       FROM scan_submissions ss JOIN users u ON u.id = ss.user_id
+       WHERE ss.problem_id = $1
+       ORDER BY u.email ASC`,
+      [req.params.id]
+    );
+
+    const configured = isB2Configured();
+    const submissions = await Promise.all(result.rows.map(async (row) => ({
+      id: row.id,
+      email: row.email,
+      name: row.name,
+      status: row.status,
+      filename: row.original_filename,
+      createdAt: row.created_at,
+      ocrError: row.ocr_error,
+      penalized: row.penalized,
+      totalMarks,
+      awardedMarks: row.penalized ? 0 : Number(row.awarded_marks),
+      fullyGraded: Number(row.graded_count) === Number(row.question_count) && Number(row.question_count) > 0,
+      viewUrl: configured ? await getScanPdfUrl(row.storage_key) : null,
+    })));
+
+    res.status(200).json({ submissions });
+  } catch (err) {
+    console.error('List scan submissions error:', err);
+    res.status(500).json({ error: 'Failed to load submissions' });
+  }
+});
+
+// ============================================================================
+// SCAN OCR PIPELINE — runs OCR + AI assessment + both comparators once a
+// scan assignment's deadline passes, never per-upload. A resubmission
+// before the deadline REPLACES the previous row outright (see
+// POST /api/problems/:id/scan-submit), so running this on an intermediate
+// upload would just be discarded work burning through the free OCR Space's
+// compute budget for nothing — only the row that survives to the deadline
+// is ever the final one.
+// ============================================================================
+
+// 5-word-shingle Jaccard similarity — standard, cheap near-duplicate-text
+// technique, no ML needed. Threshold is per-org and teacher-configurable
+// (organizations.scan_plagiarism_threshold) since "how similar is too
+// similar" is a judgment call a teacher is better placed to make than a
+// hardcoded constant — unlike the handwriting comparator below, which stays
+// a fixed conservative constant because nobody would know how to
+// meaningfully tune an abstract cosine-similarity number.
+function textShingles(text, k = 5) {
+  const words = String(text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+  const set = new Set();
+  for (let i = 0; i <= words.length - k; i++) set.add(words.slice(i, i + k).join(' '));
+  return set;
+}
+function jaccardSimilarity(setA, setB) {
+  if (setA.size === 0 || setB.size === 0) return 0;
+  let intersection = 0;
+  for (const shingle of setA) if (setB.has(shingle)) intersection += 1;
+  const union = setA.size + setB.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+// handwriting_features -> a flat 21-dim vector (8 stroke-width bins + 12
+// slant-angle bins + 1 ink-density scalar) for cosine similarity.
+function flattenHandwritingFeatures(features) {
+  if (!features) return null;
+  return [...(features.stroke_width_hist || []), ...(features.slant_angle_hist || []), features.ink_density ?? 0];
+}
+function cosineSimilarity(a, b) {
+  if (!a || !b || a.length !== b.length || a.length === 0) return 0;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+// High and fixed on purpose — see the false-positive-risk note on
+// ensureScanHandwritingFlagsSchema above; this never auto-penalizes, only
+// ever surfaces for teacher review, so a conservative threshold keeps that
+// review queue meaningful rather than flooded with coincidental matches.
+const HANDWRITING_SIMILARITY_THRESHOLD = 0.9;
+
+async function runTextPlagiarismComparator(client, submission) {
+  const orgRes = await client.query(
+    'SELECT o.scan_plagiarism_threshold FROM organizations o JOIN problems p ON p.organization_id = o.id WHERE p.id = $1',
+    [submission.problem_id]
+  );
+  const threshold = orgRes.rows[0]?.scan_plagiarism_threshold ?? 0.4;
+  const mySet = textShingles(submission.ocr_text);
+  if (mySet.size === 0) return;
+
+  const othersRes = await client.query(
+    `SELECT id, ocr_text FROM scan_submissions
+     WHERE problem_id = $1 AND id != $2 AND status = 'ocr_done' AND ocr_text IS NOT NULL`,
+    [submission.problem_id, submission.id]
+  );
+  for (const other of othersRes.rows) {
+    const similarity = jaccardSimilarity(mySet, textShingles(other.ocr_text));
+    if (similarity < threshold) continue;
+    const [a, b] = submission.id < other.id ? [submission.id, other.id] : [other.id, submission.id];
+    await client.query(
+      `INSERT INTO scan_plagiarism_flags (problem_id, submission_a_id, submission_b_id, similarity_score, flag_type)
+       VALUES ($1, $2, $3, $4, 'text_similarity')
+       ON CONFLICT (problem_id, submission_a_id, submission_b_id, flag_type) DO NOTHING`,
+      [submission.problem_id, a, b, similarity]
+    );
+  }
+}
+
+async function runHandwritingComparator(client, submission) {
+  const myVector = flattenHandwritingFeatures(submission.handwriting_features);
+  if (!myVector) return;
+
+  // The org's ENTIRE submission history, not just this assignment — a
+  // student's handwriting from a past assignment is valid reference
+  // material for flagging a completely different one.
+  const othersRes = await client.query(
+    `SELECT ss.id, ss.handwriting_features FROM scan_submissions ss
+     JOIN problems p ON p.id = ss.problem_id
+     WHERE p.organization_id = (SELECT organization_id FROM problems WHERE id = $1)
+       AND ss.id != $2 AND ss.status = 'ocr_done' AND ss.handwriting_features IS NOT NULL`,
+    [submission.problem_id, submission.id]
+  );
+  for (const other of othersRes.rows) {
+    const similarity = cosineSimilarity(myVector, flattenHandwritingFeatures(other.handwriting_features));
+    if (similarity < HANDWRITING_SIMILARITY_THRESHOLD) continue;
+    const [a, b] = submission.id < other.id ? [submission.id, other.id] : [other.id, submission.id];
+    await client.query(
+      `INSERT INTO scan_handwriting_flags (submission_a_id, submission_b_id, similarity_score)
+       VALUES ($1, $2, $3) ON CONFLICT (submission_a_id, submission_b_id) DO NOTHING`,
+      [a, b, similarity]
+    );
+  }
+}
+
+async function processOneScanSubmission(submissionId) {
+  const client = await pool.connect();
+  try {
+    await client.query(`UPDATE scan_submissions SET status = 'processing' WHERE id = $1`, [submissionId]);
+
+    const subRes = await client.query('SELECT id, problem_id, storage_key FROM scan_submissions WHERE id = $1', [submissionId]);
+    if (subRes.rows.length === 0) return;
+    const submission = subRes.rows[0];
+
+    if (!isB2Configured()) throw new Error('B2 storage is not configured');
+    if (!isOcrConfigured()) throw new Error('OCR Space is not configured');
+
+    const pdfBuffer = await downloadScanPdf(submission.storage_key);
+    const { pages, handwriting_features: handwritingFeatures } = await runOcr(pdfBuffer);
+    const ocrText = pages.map((p) => p.text).join('\n\n');
+
+    const questionsRes = await client.query(
+      'SELECT id, prompt, marks FROM scan_assignment_questions WHERE problem_id = $1 ORDER BY position ASC',
+      [submission.problem_id]
+    );
+    const questions = questionsRes.rows;
+
+    // Best-effort — an AI-assessment hiccup shouldn't block OCR text from
+    // being saved and the submission from becoming teacher-gradable.
+    const assessments = isGroqConfigured()
+      ? await assessAnswers(questions.map((q) => ({ prompt: q.prompt, marks: q.marks })), ocrText)
+      : questions.map(() => 'AI assessment unavailable (Groq not configured).');
+
+    for (let i = 0; i < questions.length; i++) {
+      await client.query(
+        `INSERT INTO scan_submission_answers (submission_id, question_id, ai_assessment)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (submission_id, question_id) DO UPDATE SET ai_assessment = EXCLUDED.ai_assessment`,
+        [submissionId, questions[i].id, assessments[i] || null]
+      );
+    }
+
+    await client.query(
+      `UPDATE scan_submissions SET ocr_text = $1, ocr_pages = $2, handwriting_features = $3,
+         status = 'ocr_done', ocr_completed_at = now(), ocr_error = NULL WHERE id = $4`,
+      [ocrText, JSON.stringify(pages), handwritingFeatures ? JSON.stringify(handwritingFeatures) : null, submissionId]
+    );
+
+    const fullSubmission = { ...submission, ocr_text: ocrText, handwriting_features: handwritingFeatures };
+    await runTextPlagiarismComparator(client, fullSubmission);
+    await runHandwritingComparator(client, fullSubmission);
+  } catch (err) {
+    console.error(`Scan OCR pipeline failed for submission ${submissionId}:`, err);
+    await client.query(
+      `UPDATE scan_submissions SET status = 'ocr_failed', ocr_error = $1 WHERE id = $2`,
+      [String(err.message || err).slice(0, 500), submissionId]
+    ).catch(() => {});
+  } finally {
+    client.release();
+  }
+}
+
+// Runs at most OCR_CONCURRENCY submissions at once, modest by default so a
+// deadline shared by many students doesn't hammer the free OCR Space all at
+// once — same pLimit pattern as sandboxLimit above, just a separate limiter
+// since these are unrelated resource pools.
+const ocrLimit = pLimit(Number(process.env.OCR_CONCURRENCY || 2));
+const scanOcrInFlight = new Set();
+
+async function sweepScanSubmissions() {
+  try {
+    // Recover rows stuck in 'processing' from a crashed prior process — safe
+    // because this sweep runs single-process; anything in 'processing' that
+    // isn't in this process's own in-flight set right now can only be stale
+    // (a live in-flight row is always tracked here, so it's never touched).
+    await pool.query(
+      `UPDATE scan_submissions SET status = 'pending' WHERE status = 'processing' AND id != ALL($1::int[])`,
+      [[...scanOcrInFlight]]
+    );
+
+    const dueRes = await pool.query(
+      `SELECT ss.id FROM scan_submissions ss JOIN problems p ON p.id = ss.problem_id
+       WHERE ss.status = 'pending' AND p.closes_at IS NOT NULL AND p.closes_at <= now()`
+    );
+    for (const row of dueRes.rows) {
+      if (scanOcrInFlight.has(row.id)) continue;
+      scanOcrInFlight.add(row.id);
+      ocrLimit(() => processOneScanSubmission(row.id)).finally(() => scanOcrInFlight.delete(row.id));
+    }
+  } catch (err) {
+    console.error('Scan OCR sweep error:', err);
+  }
+}
+const SCAN_OCR_SWEEP_INTERVAL_MS = 60 * 1000;
+setInterval(sweepScanSubmissions, SCAN_OCR_SWEEP_INTERVAL_MS);
+sweepScanSubmissions();
+
+// Full detail for one submission — OCR'd pages, each question with its AI
+// assessment and current marks, and this submission's own flags (both
+// types). Backs ScanReview.jsx. requireAdmin-only, same gating as every
+// other scan-review route (see the note on the list route above).
+app.get('/api/admin/scan-submissions/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const subRes = await pool.query(
+      `SELECT ss.*, u.email, u.name FROM scan_submissions ss
+       JOIN users u ON u.id = ss.user_id
+       JOIN problems p ON p.id = ss.problem_id
+       WHERE ss.id = $1 AND p.organization_id = $2`,
+      [req.params.id, req.user.organizationId]
+    );
+    if (subRes.rows.length === 0) return res.status(404).json({ error: 'Submission not found' });
+    const submission = subRes.rows[0];
+
+    const answersRes = await pool.query(
+      `SELECT q.id AS question_id, q.position, q.prompt, q.marks AS max_marks, sa.ai_assessment, sa.marks_awarded
+       FROM scan_assignment_questions q
+       LEFT JOIN scan_submission_answers sa ON sa.question_id = q.id AND sa.submission_id = $1
+       WHERE q.problem_id = $2
+       ORDER BY q.position ASC`,
+      [submission.id, submission.problem_id]
+    );
+
+    const flagsRes = await pool.query(
+      `SELECT id, submission_a_id, submission_b_id, similarity_score, status, 'text_similarity' AS type
+       FROM scan_plagiarism_flags WHERE submission_a_id = $1 OR submission_b_id = $1
+       UNION ALL
+       SELECT id, submission_a_id, submission_b_id, similarity_score, status, 'handwriting' AS type
+       FROM scan_handwriting_flags WHERE submission_a_id = $1 OR submission_b_id = $1`,
+      [submission.id]
+    );
+
+    const configured = isB2Configured();
+    res.status(200).json({
+      id: submission.id,
+      email: submission.email,
+      name: submission.name,
+      status: submission.status,
+      ocrError: submission.ocr_error,
+      penalized: submission.penalized,
+      createdAt: submission.created_at,
+      pages: submission.ocr_pages || [],
+      viewUrl: configured ? await getScanPdfUrl(submission.storage_key) : null,
+      questions: answersRes.rows.map((r) => ({
+        questionId: r.question_id,
+        prompt: r.prompt,
+        maxMarks: r.max_marks,
+        aiAssessment: r.ai_assessment,
+        marksAwarded: r.marks_awarded,
+      })),
+      flags: flagsRes.rows.map((f) => ({
+        id: f.id,
+        type: f.type,
+        otherSubmissionId: f.submission_a_id === submission.id ? f.submission_b_id : f.submission_a_id,
+        similarityScore: f.similarity_score,
+        status: f.status,
+      })),
+    });
+  } catch (err) {
+    console.error('Scan submission detail error:', err);
+    res.status(500).json({ error: 'Failed to load submission' });
+  }
+});
+
+// Teacher-entered marks per question — the only thing that ever actually
+// grades a scan submission (the AI assessment on each answer is an aid,
+// never authoritative; see aiGrading.js). Ignored while penalized=true, so
+// a confirmed plagiarism flag can't be silently undone by re-saving a grade
+// — see PUT /api/admin/scan-flags/:type/:id for how that flag gets cleared.
+app.put('/api/admin/scan-submissions/:id/grade', authenticateToken, requireAdmin, async (req, res) => {
+  const { marks } = req.body; // [{ questionId, marksAwarded }, ...]
+  if (!Array.isArray(marks)) return res.status(400).json({ error: 'marks array is required' });
+
+  try {
+    const subRes = await pool.query(
+      `SELECT ss.id FROM scan_submissions ss JOIN problems p ON p.id = ss.problem_id
+       WHERE ss.id = $1 AND p.organization_id = $2`,
+      [req.params.id, req.user.organizationId]
+    );
+    if (subRes.rows.length === 0) return res.status(404).json({ error: 'Submission not found' });
+
+    for (const entry of marks) {
+      const questionId = Number(entry.questionId);
+      const marksAwarded = entry.marksAwarded === null || entry.marksAwarded === '' ? null : Number(entry.marksAwarded);
+      if (!questionId || Number.isNaN(marksAwarded)) continue;
+      await pool.query(
+        `INSERT INTO scan_submission_answers (submission_id, question_id, marks_awarded)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (submission_id, question_id) DO UPDATE SET marks_awarded = EXCLUDED.marks_awarded`,
+        [req.params.id, questionId, marksAwarded]
+      );
+    }
+
+    res.status(200).json({ message: 'Grade saved' });
+  } catch (err) {
+    console.error('Save scan grade error:', err);
+    res.status(500).json({ error: 'Failed to save grade' });
+  }
+});
+
+// Every open flag (both types) touching this assignment's submissions —
+// backs a per-assignment review queue in ScanReview.jsx. Handwriting flags
+// aren't problem-scoped in the schema (a match can span two different
+// assignments), so this pulls in any flag where AT LEAST ONE side belongs
+// to this assignment — a teacher reviewing this assignment's submissions
+// should see that one of them matched something elsewhere too.
+app.get('/api/admin/problems/:id/scan-flags', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const problemRes = await pool.query('SELECT id FROM problems WHERE id = $1 AND organization_id = $2', [req.params.id, req.user.organizationId]);
+    if (problemRes.rows.length === 0) return res.status(404).json({ error: 'Assignment not found' });
+
+    const plagiarismRes = await pool.query(
+      `SELECT f.id, f.submission_a_id, f.submission_b_id, f.similarity_score, f.status, f.created_at,
+              ua.email AS email_a, ub.email AS email_b
+       FROM scan_plagiarism_flags f
+       JOIN scan_submissions sa ON sa.id = f.submission_a_id JOIN users ua ON ua.id = sa.user_id
+       JOIN scan_submissions sb ON sb.id = f.submission_b_id JOIN users ub ON ub.id = sb.user_id
+       WHERE f.problem_id = $1 AND f.status = 'open'
+       ORDER BY f.similarity_score DESC`,
+      [req.params.id]
+    );
+
+    const handwritingRes = await pool.query(
+      `SELECT f.id, f.submission_a_id, f.submission_b_id, f.similarity_score, f.status, f.created_at,
+              ua.email AS email_a, ub.email AS email_b
+       FROM scan_handwriting_flags f
+       JOIN scan_submissions sa ON sa.id = f.submission_a_id JOIN users ua ON ua.id = sa.user_id
+       JOIN scan_submissions sb ON sb.id = f.submission_b_id JOIN users ub ON ub.id = sb.user_id
+       WHERE f.status = 'open' AND (sa.problem_id = $1 OR sb.problem_id = $1)
+       ORDER BY f.similarity_score DESC`,
+      [req.params.id]
+    );
+
+    const toFlag = (type) => (f) => ({
+      id: f.id, type,
+      submissionA: { id: f.submission_a_id, email: f.email_a },
+      submissionB: { id: f.submission_b_id, email: f.email_b },
+      similarityScore: f.similarity_score,
+      createdAt: f.created_at,
+    });
+
+    res.status(200).json({
+      flags: [...plagiarismRes.rows.map(toFlag('text_similarity')), ...handwritingRes.rows.map(toFlag('handwriting'))],
+    });
+  } catch (err) {
+    console.error('List scan flags error:', err);
+    res.status(500).json({ error: 'Failed to load flags' });
+  }
+});
+
+// Confirm/dismiss one flag. Confirming a text_similarity flag penalizes
+// BOTH submissions in the pair (marks display as 0 while penalized=true,
+// see the list/detail routes above) — handwriting flags never penalize
+// anything regardless of status, confirmed or not (see the false-positive-
+// risk note on ensureScanHandwritingFlagsSchema).
+app.put('/api/admin/scan-flags/:type/:id', authenticateToken, requireAdmin, async (req, res) => {
+  const { type, id } = req.params;
+  const { status } = req.body; // 'reviewed_confirmed' | 'reviewed_dismissed'
+  if (!['reviewed_confirmed', 'reviewed_dismissed'].includes(status)) {
+    return res.status(400).json({ error: 'status must be reviewed_confirmed or reviewed_dismissed' });
+  }
+  const table = type === 'text_similarity' ? 'scan_plagiarism_flags' : type === 'handwriting' ? 'scan_handwriting_flags' : null;
+  if (!table) return res.status(400).json({ error: 'Invalid flag type' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Org-scoped via a join through problems even for scan_handwriting_flags
+    // (which has no problem_id of its own) — either side's submission's
+    // problem is enough to prove org ownership of the flag.
+    const flagRes = await client.query(
+      `SELECT f.id, f.submission_a_id, f.submission_b_id FROM ${table} f
+       JOIN scan_submissions sa ON sa.id = f.submission_a_id
+       JOIN problems p ON p.id = sa.problem_id
+       WHERE f.id = $1 AND p.organization_id = $2`,
+      [id, req.user.organizationId]
+    );
+    if (flagRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Flag not found' });
+    }
+    const flag = flagRes.rows[0];
+
+    await client.query(`UPDATE ${table} SET status = $1 WHERE id = $2`, [status, id]);
+
+    if (table === 'scan_plagiarism_flags' && status === 'reviewed_confirmed') {
+      await client.query(
+        'UPDATE scan_submissions SET penalized = true WHERE id IN ($1, $2)',
+        [flag.submission_a_id, flag.submission_b_id]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.status(200).json({ message: 'Flag updated' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Update scan flag error:', err);
+    res.status(500).json({ error: 'Failed to update flag' });
+  } finally {
+    client.release();
+  }
+});
+
+// Per-org Jaccard-similarity cutoff for the text-plagiarism comparator —
+// admin-only, same as every other org-wide setting (grade_bands,
+// tag_visibility_settings).
+app.get('/api/admin/settings/scan-plagiarism-threshold', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT scan_plagiarism_threshold FROM organizations WHERE id = $1', [req.user.organizationId]);
+    res.status(200).json({ threshold: result.rows[0]?.scan_plagiarism_threshold ?? 0.4 });
+  } catch (err) {
+    console.error('Get plagiarism threshold error:', err);
+    res.status(500).json({ error: 'Failed to load threshold' });
+  }
+});
+
+app.put('/api/admin/settings/scan-plagiarism-threshold', authenticateToken, requireAdmin, async (req, res) => {
+  const threshold = Number(req.body.threshold);
+  if (Number.isNaN(threshold) || threshold < 0 || threshold > 1) {
+    return res.status(400).json({ error: 'threshold must be a number between 0 and 1' });
+  }
+  try {
+    await pool.query('UPDATE organizations SET scan_plagiarism_threshold = $1 WHERE id = $2', [threshold, req.user.organizationId]);
+    res.status(200).json({ message: 'Threshold updated', threshold });
+  } catch (err) {
+    console.error('Update plagiarism threshold error:', err);
+    res.status(500).json({ error: 'Failed to update threshold' });
+  }
+});
+
 app.post('/api/problems/:id/submit', authenticateToken, async (req, res) => {
   const problemId = req.params.id;
   const { language, code } = req.body;
@@ -5150,5 +6228,5 @@ process.on('unhandledRejection', (err) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`AssignMeant API running on http://localhost:${PORT}`);
+  console.log(`HonorRoll API running on http://localhost:${PORT}`);
 });

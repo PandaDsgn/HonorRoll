@@ -4,6 +4,7 @@ import { API } from '../config';
 
 const LANGS = ['python', 'c', 'cpp', 'java'];
 const emptyTestCase = () => ({ input: '', expectedOutput: '', isHidden: true });
+const emptyQuestion = () => ({ prompt: '', marks: 1 });
 
 function toIsoOrNull(localValue) {
   if (!localValue) return null;
@@ -21,6 +22,17 @@ function formatLocal(iso) {
 
 export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
   const isEditMode = !!initialData;
+
+  // 'scan' assignments skip the code-judge fields entirely — students
+  // scan handwritten answers to these questions instead of writing code.
+  // submissionMode itself can't change after creation (the type toggle
+  // below is hidden in edit mode), but everything else — including the
+  // question set — is fully editable.
+  const [submissionMode, setSubmissionMode] = useState(initialData?.submissionMode || 'code');
+  const [assignmentNo, setAssignmentNo] = useState(initialData?.assignmentNo || '');
+  const [questions, setQuestions] = useState(
+    initialData?.questions?.length ? initialData.questions : [emptyQuestion()]
+  );
 
   const [title, setTitle] = useState(initialData?.title || '');
   const [difficulty, setDifficulty] = useState(initialData?.difficulty || 'Easy');
@@ -59,6 +71,12 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
   const addTestCase = () => setTestCases((prev) => [...prev, emptyTestCase()]);
   const removeTestCase = (idx) => setTestCases((prev) => prev.filter((_, i) => i !== idx));
 
+  const updateQuestion = (idx, patch) => {
+    setQuestions((prev) => prev.map((q, i) => (i === idx ? { ...q, ...patch } : q)));
+  };
+  const addQuestion = () => setQuestions((prev) => [...prev, emptyQuestion()]);
+  const removeQuestion = (idx) => setQuestions((prev) => prev.filter((_, i) => i !== idx));
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
@@ -68,10 +86,26 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
       return;
     }
 
-    const cleanCases = testCases.filter((tc) => tc.expectedOutput.trim() !== '');
-    if (cleanCases.length === 0) {
-      setError('At least one test case with an expected output is required.');
-      return;
+    let cleanCases = [];
+    let cleanQuestions = [];
+    if (submissionMode === 'code') {
+      cleanCases = testCases.filter((tc) => tc.expectedOutput.trim() !== '');
+      if (cleanCases.length === 0) {
+        setError('At least one test case with an expected output is required.');
+        return;
+      }
+    } else {
+      if (!assignmentNo.trim()) {
+        setError('Assignment number is required for scanned assignments.');
+        return;
+      }
+      cleanQuestions = questions
+        .filter((q) => q.prompt.trim() !== '')
+        .map((q) => ({ prompt: q.prompt.trim(), marks: Number(q.marks) > 0 ? Number(q.marks) : 1 }));
+      if (cleanQuestions.length === 0) {
+        setError('At least one question is required for scanned assignments.');
+        return;
+      }
     }
 
     if (opensAt && closesAt && new Date(closesAt) <= new Date(opensAt)) {
@@ -83,11 +117,16 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
       title: title.trim(),
       difficulty,
       description: description.trim(),
-      starterCode: Object.fromEntries(Object.entries(starterCode).filter(([, code]) => code.trim() !== '')),
-      testCases: cleanCases,
+      submissionMode,
       opensAt: toIsoOrNull(opensAt),
       closesAt: toIsoOrNull(closesAt),
       subjectId: subjectId || null,
+      ...(submissionMode === 'code'
+        ? {
+            starterCode: Object.fromEntries(Object.entries(starterCode).filter(([, code]) => code.trim() !== '')),
+            testCases: cleanCases,
+          }
+        : { assignmentNo: assignmentNo.trim(), questions: cleanQuestions }),
     };
 
     setSubmitting(true);
@@ -102,6 +141,20 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
 
   return (
     <form className="panel assignment-form" onSubmit={handleSubmit}>
+      {!isEditMode && (
+        <div className="field" style={{ marginBottom: 16 }}>
+          <label>Assignment type</label>
+          <div className="segmented" role="tablist" aria-label="Assignment type">
+            <button type="button" role="tab" aria-pressed={submissionMode === 'code'} className={submissionMode === 'code' ? 'active' : ''} onClick={() => setSubmissionMode('code')}>
+              Code
+            </button>
+            <button type="button" role="tab" aria-pressed={submissionMode === 'scan'} className={submissionMode === 'scan' ? 'active' : ''} onClick={() => setSubmissionMode('scan')}>
+              Scanned handwritten
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="assignment-form-grid">
         <div className="field">
           <label htmlFor="af-title">Title</label>
@@ -116,6 +169,13 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
             <option>Hard</option>
           </select>
         </div>
+
+        {submissionMode === 'scan' && (
+          <div className="field">
+            <label htmlFor="af-assignment-no">Assignment number</label>
+            <input id="af-assignment-no" placeholder="e.g. 3 or HW-3" value={assignmentNo} onChange={(e) => setAssignmentNo(e.target.value)} required />
+          </div>
+        )}
 
         <div className="field">
           <label htmlFor="af-opens">Opens at (optional)</label>
@@ -143,37 +203,57 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
         <textarea id="af-desc" rows={5} value={description} onChange={(e) => setDescription(e.target.value)} required />
       </div>
 
-      <div className="field-group-label">Starter code (optional per language)</div>
-      <div className="assignment-form-grid">
-        {LANGS.map((lang) => (
-          <div className="field" key={lang}>
-            <label htmlFor={`af-code-${lang}`}>{lang}</label>
-            <textarea
-              id={`af-code-${lang}`}
-              rows={4}
-              className="code-textarea"
-              value={starterCode[lang]}
-              onChange={(e) => setStarterCode((prev) => ({ ...prev, [lang]: e.target.value }))}
-            />
+      {submissionMode === 'code' && (
+        <>
+          <div className="field-group-label">Starter code (optional per language)</div>
+          <div className="assignment-form-grid">
+            {LANGS.map((lang) => (
+              <div className="field" key={lang}>
+                <label htmlFor={`af-code-${lang}`}>{lang}</label>
+                <textarea
+                  id={`af-code-${lang}`}
+                  rows={4}
+                  className="code-textarea"
+                  value={starterCode[lang]}
+                  onChange={(e) => setStarterCode((prev) => ({ ...prev, [lang]: e.target.value }))}
+                />
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
 
-      <div className="field-group-label">Test cases</div>
-      <div className="testcase-list">
-        {testCases.map((tc, idx) => (
-          <div className="testcase-row" key={idx}>
-            <input placeholder="stdin (optional)" value={tc.input} onChange={(e) => updateTestCase(idx, { input: e.target.value })} />
-            <input placeholder="expected output" value={tc.expectedOutput} onChange={(e) => updateTestCase(idx, { expectedOutput: e.target.value })} required />
-            <label className="testcase-hidden-toggle">
-              <input type="checkbox" checked={tc.isHidden} onChange={(e) => updateTestCase(idx, { isHidden: e.target.checked })} />
-              hidden
-            </label>
-            <button type="button" className="btn btn-ghost btn-icon" onClick={() => removeTestCase(idx)} disabled={testCases.length === 1}>×</button>
+          <div className="field-group-label">Test cases</div>
+          <div className="testcase-list">
+            {testCases.map((tc, idx) => (
+              <div className="testcase-row" key={idx}>
+                <input placeholder="stdin (optional)" value={tc.input} onChange={(e) => updateTestCase(idx, { input: e.target.value })} />
+                <input placeholder="expected output" value={tc.expectedOutput} onChange={(e) => updateTestCase(idx, { expectedOutput: e.target.value })} required />
+                <label className="testcase-hidden-toggle">
+                  <input type="checkbox" checked={tc.isHidden} onChange={(e) => updateTestCase(idx, { isHidden: e.target.checked })} />
+                  hidden
+                </label>
+                <button type="button" className="btn btn-ghost btn-icon" onClick={() => removeTestCase(idx)} disabled={testCases.length === 1}>×</button>
+              </div>
+            ))}
+            <button type="button" className="btn btn-ghost" onClick={addTestCase}>+ Add test case</button>
           </div>
-        ))}
-        <button type="button" className="btn btn-ghost" onClick={addTestCase}>+ Add test case</button>
-      </div>
+        </>
+      )}
+
+      {submissionMode === 'scan' && (
+        <>
+          <div className="field-group-label">Questions</div>
+          <div className="testcase-list">
+            {questions.map((q, idx) => (
+              <div className="testcase-row" key={idx}>
+                <input placeholder={`Question ${idx + 1}`} value={q.prompt} onChange={(e) => updateQuestion(idx, { prompt: e.target.value })} required />
+                <input type="number" min="1" style={{ maxWidth: 90 }} placeholder="marks" value={q.marks} onChange={(e) => updateQuestion(idx, { marks: e.target.value })} required />
+                <button type="button" className="btn btn-ghost btn-icon" onClick={() => removeQuestion(idx)} disabled={questions.length === 1}>×</button>
+              </div>
+            ))}
+            <button type="button" className="btn btn-ghost" onClick={addQuestion}>+ Add question</button>
+          </div>
+        </>
+      )}
 
       {error && (
         <div className="alert" role="alert">

@@ -23,7 +23,7 @@ export default function Home() {
   return (
     <div className="landing-shell">
       <header className="sb-topbar">
-        {/* Deliberately no "AssignMeant" wordmark here — it's the big heading below instead */}
+        {/* Deliberately no "HonorRoll" wordmark here — it's the big heading below instead */}
         <span />
         <div className="sb-actions">
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
@@ -32,7 +32,7 @@ export default function Home() {
 
       <main className="landing-hero">
         <h1 className="landing-brand"><BrandMark /></h1>
-        <h2 className="landing-title">The way assignments are meant to be graded.</h2>
+        <h2 className="landing-title">Where assignments earn their grade.</h2>
         <p className="landing-sub">
           Write your solutions to your assignments, run codes independently, give exams, and get feedback.
         </p>

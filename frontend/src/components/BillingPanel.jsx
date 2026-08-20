@@ -93,7 +93,7 @@ export default function BillingPanel() {
       const rzp = new window.Razorpay({
         key: data.razorpayKeyId,
         subscription_id: data.subscriptionId,
-        name: 'AssignMeant',
+        name: 'HonorRoll',
         description: `${data.planLabel} — ${data.billingCycle}`,
         // A client-side "success" here is only ever a signal to start
         // polling — the real confirmation is a signature-verified webhook

@@ -16,9 +16,15 @@ import '../admin.css';
 const DIFFICULTY_CLASS = { Easy: 'chip-easy', Medium: 'chip-medium', Hard: 'chip-hard' };
 const STATUS_CLASS = { open: 'chip-easy', upcoming: 'chip-medium', closed: 'chip-hard' };
 
+// timeZoneName is spelled out (not just dateStyle/timeStyle) so a browser
+// whose effective timezone silently isn't the viewer's own (a stale
+// DevTools Sensors override, a misconfigured OS) shows up as visibly wrong
+// ("... UTC") instead of a quietly-mis-converted number that looks plausible.
 function formatDate(iso) {
   if (!iso) return '—';
-  return new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+  return new Date(iso).toLocaleString(undefined, {
+    year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+  });
 }
 
 // Turns accumulated time-on-task seconds into a compact "2h 14m" / "45m" /
@@ -140,6 +146,7 @@ export default function AdminDashboard() {
             <IntegrationsPanel />
             <TagVisibilityPanel />
             <GradeBandsPanel />
+            {user?.role === 'admin' && <ScanPlagiarismThresholdPanel />}
           </>
         )}
       </section>
@@ -203,21 +210,82 @@ function NonSubmittersPanel() {
 // STUDENT DETAIL PANEL
 // ============================================================================
 function StudentDetailPanel({ studentId, onBack }) {
+  const { user } = useAuth();
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
   const [expandedProblemId, setExpandedProblemId] = useState(null);
+
+  // Admin-only edit — teachers never see this toggle at all (requireAdmin
+  // on the backend route enforces the same boundary, this is just the UI
+  // side of it). Pre-filled from `data` once it loads, so the fields
+  // aren't editable before the real values are known.
+  const [editing, setEditing] = useState(false);
+  const [editName, setEditName] = useState('');
+  const [editUnitId, setEditUnitId] = useState('');
+  const [editRoll, setEditRoll] = useState('');
+  const [units, setUnits] = useState([]);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState('');
 
   useEffect(() => {
     const fetchStudent = async () => {
       try {
         const res = await axios.get(`${API}/api/admin/students/${studentId}`, { withCredentials: true });
         setData(res.data);
-      } catch (err) {
+      } catch {
         setError('Failed to load student details.');
       }
     };
     fetchStudent();
   }, [studentId]);
+
+  // Separate from the mount-effect fetch above (rather than a single
+  // useCallback shared by both) — feeding a hoisted, dependency-tracked
+  // callback back into a useEffect's own dependency array is exactly the
+  // shape react-hooks/set-state-in-effect flags as a potential cascading-
+  // render risk. This copy is only ever called imperatively from an event
+  // handler (after a save), never from an effect, so that rule doesn't apply.
+  const refetchStudent = async () => {
+    try {
+      const res = await axios.get(`${API}/api/admin/students/${studentId}`, { withCredentials: true });
+      setData(res.data);
+    } catch {
+      setError('Failed to load student details.');
+    }
+  };
+
+  useEffect(() => {
+    if (user?.role !== 'admin') return;
+    axios.get(`${API}/api/admin/org-units`, { withCredentials: true })
+      .then((res) => setUnits(res.data.units.map((u) => ({ ...u, level: res.data.levels.find((l) => l.id === u.level_def_id) }))))
+      .catch(() => {});
+  }, [user]);
+
+  const startEditing = () => {
+    setEditName(data.student.name || '');
+    setEditUnitId(data.student.org_unit_id != null ? String(data.student.org_unit_id) : '');
+    setEditRoll(data.student.roll_number || '');
+    setSaveError('');
+    setEditing(true);
+  };
+
+  const saveEdits = async () => {
+    setSaving(true);
+    setSaveError('');
+    try {
+      await axios.put(`${API}/api/admin/students/${studentId}`, {
+        name: editName.trim() || null,
+        orgUnitId: editUnitId || null,
+        rollNumber: editRoll.trim() || null,
+      }, { withCredentials: true });
+      setEditing(false);
+      await refetchStudent();
+    } catch (err) {
+      setSaveError(err.response?.data?.error || 'Failed to save changes.');
+    } finally {
+      setSaving(false);
+    }
+  };
 
   if (error) return <div className="alert"><span className="alert-icon">!</span><span>{error}</span></div>;
   if (!data) return <p className="sb-loading">Loading student history…</p>;
@@ -233,30 +301,71 @@ function StudentDetailPanel({ studentId, onBack }) {
       </div>
 
       <div className="panel" style={{ padding: '24px', marginBottom: '24px' }}>
-        <h2>{data.student.name || data.student.email}</h2>
-        {data.student.name && <p className="auth-sub" style={{ margin: '4px 0 0' }}>{data.student.email}</p>}
-        <p className="auth-sub" style={{ margin: '8px 0 0' }}>Joined {formatDate(data.student.created_at)}</p>
-        {data.unitPath?.length > 0 ? (
-          <p style={{ margin: '10px 0 0', display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
-            {data.unitPath.map((p, i) => (
-              <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                {i > 0 && <span style={{ color: 'var(--text-dim)' }}>/</span>}
-                <span className="chip chip-easy" title={p.label}><span className="dot" />{p.name}</span>
-              </span>
-            ))}
-          </p>
+        {editing ? (
+          <div style={{ maxWidth: 420 }}>
+            <div className="field" style={{ marginBottom: 10 }}>
+              <label htmlFor="edit-student-name">Name</label>
+              <input id="edit-student-name" value={editName} onChange={(e) => setEditName(e.target.value)} />
+            </div>
+            <div className="field" style={{ marginBottom: 10 }}>
+              <label htmlFor="edit-student-unit">Unit</label>
+              <select id="edit-student-unit" value={editUnitId} onChange={(e) => setEditUnitId(e.target.value)}>
+                <option value="">No unit</option>
+                {units.map((u) => (
+                  <option key={u.id} value={u.id}>{u.name} ({u.level?.label})</option>
+                ))}
+              </select>
+            </div>
+            <div className="field" style={{ marginBottom: 12 }}>
+              <label htmlFor="edit-student-roll">Roll number</label>
+              <input id="edit-student-roll" value={editRoll} onChange={(e) => setEditRoll(e.target.value)} />
+            </div>
+            {saveError && <div className="alert" style={{ marginBottom: 12 }}><span className="alert-icon">!</span><span>{saveError}</span></div>}
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button type="button" className="btn btn-primary btn-sm" disabled={saving} onClick={saveEdits}>
+                {saving ? 'Saving…' : 'Save'}
+              </button>
+              <button type="button" className="btn btn-ghost btn-sm" disabled={saving} onClick={() => setEditing(false)}>Cancel</button>
+            </div>
+          </div>
         ) : (
-          <p className="auth-sub" style={{ margin: '6px 0 0' }}>Not assigned to a unit in your organization structure.</p>
-        )}
-        {(data.overallExamsPercentileTag || data.overallAssignmentsPercentileTag) && (
-          <p style={{ margin: '10px 0 0', display: 'flex', gap: 8 }}>
-            {data.overallExamsPercentileTag && (
-              <span className="chip chip-neutral"><span className="dot" />Overall (exams): {data.overallExamsPercentileTag}</span>
+          <>
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 }}>
+              <div>
+                <h2 style={{ margin: 0 }}>{data.student.name || data.student.email}</h2>
+                {data.student.name && <p className="auth-sub" style={{ margin: '4px 0 0' }}>{data.student.email}</p>}
+              </div>
+              {user?.role === 'admin' && (
+                <button type="button" className="btn btn-ghost btn-sm" onClick={startEditing}>Edit</button>
+              )}
+            </div>
+            <p className="auth-sub" style={{ margin: '8px 0 0' }}>Joined {formatDate(data.student.created_at)}</p>
+            {data.student.roll_number && (
+              <p className="auth-sub" style={{ margin: '4px 0 0' }}>Roll number: {data.student.roll_number}</p>
             )}
-            {data.overallAssignmentsPercentileTag && (
-              <span className="chip chip-neutral"><span className="dot" />Overall (assignments): {data.overallAssignmentsPercentileTag}</span>
+            {data.unitPath?.length > 0 ? (
+              <p style={{ margin: '10px 0 0', display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                {data.unitPath.map((p, i) => (
+                  <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                    {i > 0 && <span style={{ color: 'var(--text-dim)' }}>/</span>}
+                    <span className="chip chip-easy" title={p.label}><span className="dot" />{p.name}</span>
+                  </span>
+                ))}
+              </p>
+            ) : (
+              <p className="auth-sub" style={{ margin: '6px 0 0' }}>Not assigned to a unit in your organization structure.</p>
             )}
-          </p>
+            {(data.overallExamsPercentileTag || data.overallAssignmentsPercentileTag) && (
+              <p style={{ margin: '10px 0 0', display: 'flex', gap: 8 }}>
+                {data.overallExamsPercentileTag && (
+                  <span className="chip chip-neutral"><span className="dot" />Overall (exams): {data.overallExamsPercentileTag}</span>
+                )}
+                {data.overallAssignmentsPercentileTag && (
+                  <span className="chip chip-neutral"><span className="dot" />Overall (assignments): {data.overallAssignmentsPercentileTag}</span>
+                )}
+              </p>
+            )}
+          </>
         )}
       </div>
 
@@ -869,7 +978,7 @@ function AssignmentsPanel() {
                           ) : (
                             <>
                               <button type="button" className="btn btn-ghost btn-sm" onClick={() => setExpandedAttemptsProblemId(expandedAttemptsProblemId === p.id ? null : p.id)}>
-                                {expandedAttemptsProblemId === p.id ? 'Hide attempts' : 'Attempts'}
+                                {expandedAttemptsProblemId === p.id ? 'Hide' : (p.submission_mode === 'scan' ? 'Submissions' : 'Attempts')}
                               </button>
                               <button type="button" className="btn btn-ghost btn-sm" onClick={() => startFullEdit(p)}>Edit</button>
                               <button type="button" className="btn btn-ghost btn-sm" onClick={() => startEditWindow(p)}>Deadline</button>
@@ -883,7 +992,9 @@ function AssignmentsPanel() {
                   {expandedAttemptsProblemId === p.id && (
                     <tr>
                       <td colSpan={6} style={{ background: 'var(--surface-2)' }}>
-                        <AssignmentAttemptsPanel problemId={p.id} />
+                        {p.submission_mode === 'scan'
+                          ? <ScanSubmissionsPanel problemId={p.id} />
+                          : <AssignmentAttemptsPanel problemId={p.id} />}
                       </td>
                     </tr>
                   )}
@@ -942,6 +1053,67 @@ function AssignmentAttemptsPanel({ problemId }) {
             <td>{a.gradeTag ? <span className="chip chip-neutral"><span className="dot" />{a.gradeTag}</span> : '—'}</td>
             <td>{a.percentileTag ? <span className="chip chip-neutral"><span className="dot" />{a.percentileTag}</span> : '—'}</td>
             <td>{formatDate(a.lastSubmittedAt)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+// Every student's scan submission for one scan-mode assignment — at most
+// one row per student (a resubmission replaces the previous one outright,
+// see POST /api/problems/:id/scan-submit), so unlike AssignmentAttemptsPanel
+// above there's no "best of several" to pick, just each student's final
+// upload. No OCR/grading columns yet since that pipeline hasn't been built.
+function ScanSubmissionsPanel({ problemId }) {
+  const navigate = useNavigate();
+  const [submissions, setSubmissions] = useState(null);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    axios.get(`${API}/api/admin/problems/${problemId}/scan-submissions`, { withCredentials: true })
+      .then((res) => { if (!cancelled) setSubmissions(res.data.submissions); })
+      .catch(() => { if (!cancelled) setError('Failed to load submissions.'); });
+    return () => { cancelled = true; };
+  }, [problemId]);
+
+  if (error) return <div className="alert" style={{ margin: '12px 0' }}><span className="alert-icon">!</span><span>{error}</span></div>;
+  if (!submissions) return <p className="sb-loading" style={{ margin: '16px 0' }}>Loading submissions…</p>;
+  if (submissions.length === 0) return <p className="sb-loading" style={{ margin: '16px 0' }}>No submissions yet.</p>;
+
+  return (
+    <table className="admin-table">
+      <thead>
+        <tr>
+          <th>Student</th>
+          <th>Status</th>
+          <th>Marks</th>
+          <th>Submitted</th>
+          <th aria-label="Actions" />
+        </tr>
+      </thead>
+      <tbody>
+        {submissions.map((s) => (
+          <tr key={s.id}>
+            <td className="admin-cell-strong">
+              {s.name || s.email}
+              {s.name && <div style={{ color: 'var(--text-dim)', fontSize: '12px', fontWeight: 400 }}>{s.email}</div>}
+            </td>
+            <td>
+              <span className={`chip ${s.status === 'ocr_done' ? 'chip-easy' : s.status === 'ocr_failed' ? 'chip-hard' : 'chip-medium'}`}>
+                <span className="dot" />{s.status}
+              </span>
+              {s.penalized && <span className="chip chip-hard" style={{ marginLeft: 6 }}>penalized</span>}
+            </td>
+            <td>{s.fullyGraded ? `${s.awardedMarks}/${s.totalMarks}` : `—/${s.totalMarks}`}</td>
+            <td>{formatDate(s.createdAt)}</td>
+            <td className="admin-cell-actions">
+              {s.viewUrl && <a className="btn btn-ghost btn-sm" href={s.viewUrl} target="_blank" rel="noreferrer">View PDF</a>}
+              {s.status === 'ocr_done' && (
+                <button type="button" className="btn btn-primary btn-sm" onClick={() => navigate(`/admin/scan-submissions/${s.id}`)}>Review</button>
+              )}
+            </td>
           </tr>
         ))}
       </tbody>
@@ -1403,6 +1575,62 @@ function TagVisibilityPanel() {
             <input type="checkbox" checked={settings.showGradeTag} disabled={saving} onChange={() => toggle('showGradeTag')} />
             Individual score tag (Excellent / Pass / etc., from the grade scale below)
           </label>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Per-org cutoff the text-plagiarism comparator (deadline sweep, see
+// backend/index.js) uses to decide which submission pairs get flagged for
+// teacher review — a Jaccard-similarity score from 0 (nothing alike) to 1
+// (identical). Deliberately admin-only, same as grade bands / tag
+// visibility above: it's an org-wide policy call, not a per-assignment one.
+function ScanPlagiarismThresholdPanel() {
+  const [threshold, setThreshold] = useState(null);
+  const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [saveMessage, setSaveMessage] = useState('');
+
+  useEffect(() => {
+    axios.get(`${API}/api/admin/settings/scan-plagiarism-threshold`, { withCredentials: true })
+      .then((res) => setThreshold(res.data.threshold))
+      .catch(() => setError('Failed to load the plagiarism threshold.'));
+  }, []);
+
+  const save = async () => {
+    setSaving(true);
+    setSaveMessage('');
+    setError('');
+    try {
+      await axios.put(`${API}/api/admin/settings/scan-plagiarism-threshold`, { threshold: Number(threshold) }, { withCredentials: true });
+      setSaveMessage('Saved.');
+    } catch {
+      setError('Failed to save the threshold.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="panel" style={{ padding: '20px', marginBottom: '24px' }}>
+      <h3 style={{ margin: '0 0 4px' }}>Scanned-assignment plagiarism threshold</h3>
+      <p className="auth-sub" style={{ margin: '0 0 14px' }}>
+        How similar two scanned answer sheets' recognized text has to be before they're flagged for your review (0 = never flags, 1 = only exact duplicates). Confirming a flag zeroes both submissions' marks until you re-grade them.
+      </p>
+      {error && <div className="alert" style={{ marginBottom: '12px' }}><span className="alert-icon">!</span><span>{error}</span></div>}
+      {threshold !== null && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <input
+            type="number" min="0" max="1" step="0.05"
+            style={{ maxWidth: 100 }}
+            value={threshold}
+            onChange={(e) => setThreshold(e.target.value)}
+          />
+          <button type="button" className="btn btn-primary btn-sm" onClick={save} disabled={saving}>
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+          {saveMessage && <span className="auth-sub">{saveMessage}</span>}
         </div>
       )}
     </div>

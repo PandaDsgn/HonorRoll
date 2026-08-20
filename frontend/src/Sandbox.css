@@ -45,11 +45,8 @@
    defined; if that's a different stylesheet than this one, add this rule
    there instead so it inherits the same --surface-2 / --border tokens. */
 .chip-neutral {
-  background: var(--surface-2);
   color: var(--text-dim);
-  border: 1px solid var(--border);
 }
-.chip-neutral .dot { background: var(--text-dim); }
 
 /* Serial number prefix on each assignment card in the list, e.g. "3. Two Sum".
    Same caveat as .chip-neutral above: add this next to wherever

@@ -1,0 +1,9 @@
+gradio>=5.20,<6
+spaces
+easyocr==1.7.2
+torch==2.11.0
+transformers==4.44.2
+pymupdf==1.24.10
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+pillow==10.4.0

@@ -118,17 +118,22 @@ export default function Problems() {
           <div className="problem-cards">
             {problems.map((p, idx) => {
               const timeLeft = p.status === 'open' ? formatTimeLeft(p.closes_at, now) : null;
-              const sub = submissionChip(p.submission);
+              const isScan = p.submission_mode === 'scan';
+              const sub = isScan
+                ? (p.scanSubmitted ? { label: 'Submitted', className: 'chip-easy' } : { label: 'Not submitted', className: 'chip-neutral' })
+                : submissionChip(p.submission);
               // Result tags only make sense once the deadline has passed (or
               // there was never one) and the student has actually submitted
-              // — matches the same gate GET /api/problems/:id/result enforces.
-              const resultEligible = !!p.submission && (!p.closes_at || new Date(p.closes_at) <= new Date(now));
+              // — matches the same gate GET /api/problems/:id/result (code
+              // mode) / GET /api/me/scan-submission (scan mode) enforces.
+              const hasSubmitted = isScan ? !!p.scanSubmitted : !!p.submission;
+              const resultEligible = hasSubmitted && (!p.closes_at || new Date(p.closes_at) <= new Date(now));
               return (
                 <div key={p.id}>
                   <button
                     type="button"
                     className="problem-card"
-                    onClick={() => navigate(`/assignments/${p.id}`)}
+                    onClick={() => navigate(p.submission_mode === 'scan' ? `/assignments/${p.id}/scan` : `/assignments/${p.id}`)}
                   >
                     <span className="problem-card-title">
                       <span className="problem-card-index">{idx + 1}.</span> {p.title}

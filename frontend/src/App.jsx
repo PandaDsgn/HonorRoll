@@ -11,11 +11,13 @@ import ResetPassword from './pages/ResetPassword';
 import Problems from './pages/Problems';
 import AssignmentResult from './pages/AssignmentResult';
 import Sandbox from './pages/Sandbox';
+import ScanCapture from './pages/ScanCapture';
 import Playground from './pages/Playground';
 import Exams from './pages/Exams';
 import ExamAttempt from './pages/ExamAttempt';
 import ExamResult from './pages/ExamResult';
 import AdminDashboard from './pages/AdminDashboard';
+import ScanReview from './pages/ScanReview';
 import SuperadminDashboard from './pages/SuperadminDashboard';
 
 function App() {
@@ -33,6 +35,7 @@ function App() {
 
           <Route path="/assignments" element={<ProtectedRoute><Problems /></ProtectedRoute>} />
           <Route path="/assignments/:id" element={<ProtectedRoute><Sandbox /></ProtectedRoute>} />
+          <Route path="/assignments/:id/scan" element={<ProtectedRoute><ScanCapture /></ProtectedRoute>} />
           <Route path="/assignments/:id/result" element={<ProtectedRoute><AssignmentResult /></ProtectedRoute>} />
 
           <Route path="/ide" element={<ProtectedRoute><Playground /></ProtectedRoute>} />
@@ -46,6 +49,15 @@ function App() {
             element={
               <ProtectedRoute roles={['admin', 'teacher']}>
                 <AdminDashboard />
+              </ProtectedRoute>
+            }
+          />
+
+          <Route
+            path="/admin/scan-submissions/:id"
+            element={
+              <ProtectedRoute roles={['admin']}>
+                <ScanReview />
               </ProtectedRoute>
             }
           />

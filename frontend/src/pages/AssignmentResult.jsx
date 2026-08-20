@@ -6,6 +6,8 @@ import '../Exam.css';
 
 const PENDING_COPY = {
   deadline: 'Your tags will be visible once this assignment\'s deadline passes.',
+  notGraded: 'Your teacher hasn\'t graded this submission yet.',
+  ocrFailed: 'We couldn\'t read your scanned submission — check with your teacher.',
 };
 
 // Student's own result for one assignment — mirrors ExamResult.jsx, see
@@ -20,11 +22,34 @@ export default function AssignmentResult() {
   const [errorMessage, setErrorMessage] = useState('');
   const [pendingReason, setPendingReason] = useState(null);
   const [result, setResult] = useState({});
+  const [scanGrade, setScanGrade] = useState(null); // scan-mode only — see below
 
   useEffect(() => {
     let cancelled = false;
-    axios.get(`${API}/api/problems/${id}/result`, { withCredentials: true })
-      .then((res) => {
+
+    (async () => {
+      try {
+        // submission_mode decides which result shape this assignment even
+        // has — code mode's percentile/grade tags (GET .../result) don't
+        // exist for a scanned submission, which is graded per-question
+        // instead (GET /api/me/scan-submission's `grade` field).
+        const problemRes = await axios.get(`${API}/api/problems/${id}`, { withCredentials: true });
+        if (cancelled) return;
+
+        if (problemRes.data.problem.submission_mode === 'scan') {
+          const subRes = await axios.get(`${API}/api/me/scan-submission`, { params: { problemId: id }, withCredentials: true });
+          if (cancelled) return;
+          if (!subRes.data.submission || !subRes.data.submission.grade) {
+            setPendingReason(subRes.data.submission?.status === 'ocr_failed' ? 'ocrFailed' : 'notGraded');
+            setPhase('pending');
+          } else {
+            setScanGrade(subRes.data.submission.grade);
+            setPhase('graded');
+          }
+          return;
+        }
+
+        const res = await axios.get(`${API}/api/problems/${id}/result`, { withCredentials: true });
         if (cancelled) return;
         if (res.data.status === 'pending') {
           setPendingReason(res.data.reason);
@@ -33,19 +58,20 @@ export default function AssignmentResult() {
           setResult(res.data);
           setPhase('graded');
         }
-      })
-      .catch((err) => {
+      } catch (err) {
         if (cancelled) return;
         setErrorMessage(err.response?.data?.error || 'Could not load your result.');
         setPhase('error');
-      });
+      }
+    })();
+
     return () => { cancelled = true; };
   }, [id]);
 
   const showPercentile = result.percentileTag !== undefined;
   const showOverall = result.overallAssignmentsPercentileTag !== undefined;
   const showGrade = result.gradeTag !== undefined;
-  const noTagsEnabled = phase === 'graded' && !showPercentile && !showOverall && !showGrade;
+  const noTagsEnabled = phase === 'graded' && !scanGrade && !showPercentile && !showOverall && !showGrade;
 
   return (
     <div className="sb-shell exam-message-shell">
@@ -60,7 +86,24 @@ export default function AssignmentResult() {
 
         {noTagsEnabled && <p>Your teacher hasn't enabled result tags yet.</p>}
 
-        {phase === 'graded' && !noTagsEnabled && (
+        {phase === 'graded' && scanGrade && (
+          <>
+            <div className="exam-mcq-option" style={{ cursor: 'default', marginBottom: 12 }}>
+              <span>Total</span>
+              <span className="chip chip-neutral" style={{ marginLeft: 'auto' }}>{scanGrade.awardedMarks}/{scanGrade.totalMarks}</span>
+            </div>
+            <div className="exam-mcq-options">
+              {scanGrade.questions.map((q, i) => (
+                <div key={i} className="exam-mcq-option" style={{ cursor: 'default' }}>
+                  <span>{q.prompt}</span>
+                  <span className="chip chip-neutral" style={{ marginLeft: 'auto' }}>{q.marksAwarded}/{q.maxMarks}</span>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+
+        {phase === 'graded' && !noTagsEnabled && !scanGrade && (
           <>
             <p>
               Percentile reflects how you did relative to other students, grouped into five bands

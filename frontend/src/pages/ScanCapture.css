@@ -1,0 +1,156 @@
+.scan-capture-panel {
+  padding: 24px;
+  max-width: 640px;
+  margin: 0 auto;
+}
+
+.scan-capture-video-wrap {
+  position: relative;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #000;
+  border: 1px solid var(--border);
+  aspect-ratio: 3 / 4;
+}
+
+/* The raw video feed is never meant to be SEEN directly — the live-
+   highlighted canvas jscanify draws each frame into (see ScanCapture.jsx's
+   rAF loop) sits on top of it at the same size and covers it completely.
+   It's given a real, full-size rendered footprint rather than hidden via
+   1px sizing/display:none — some mobile browsers (notably iOS Safari)
+   throttle or stall decoding on a video element that's effectively
+   invisible by size, which starves cv.imread(video) of real frames and
+   was the actual cause of a black preview + failed captures during phone
+   testing. Full-size + covered by the canvas achieves the same "user only
+   sees the highlighted version" result without that risk. */
+.scan-capture-video-hidden {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  pointer-events: none;
+}
+
+.scan-capture-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.scan-capture-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 16px;
+  flex-wrap: wrap;
+}
+
+/* Corner editor — draggable-quad crop confirmation for one captured page */
+.scan-corner-editor-frame {
+  position: relative;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #000;
+  border: 1px solid var(--border);
+  /* touch-action: none is required — without it, mobile browsers intercept
+     the drag gesture as a page-scroll/pinch-zoom before pointermove ever
+     fires on the handle. */
+  touch-action: none;
+}
+
+.scan-corner-editor-img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.scan-corner-editor-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.scan-corner-editor-svg polygon {
+  fill: rgba(255, 149, 0, 0.18);
+  stroke: orange;
+  stroke-width: 3;
+}
+
+.scan-corner-handle {
+  position: absolute;
+  /* Bigger than it looks strictly necessary to be — a small precise dot is
+     much harder to grab accurately with a thumb than it is with a mouse
+     cursor, and imprecise corner placement is exactly what let real
+     background bleed into a submitted page during phone testing. */
+  width: 40px;
+  height: 40px;
+  margin-left: -20px;
+  margin-top: -20px;
+  border-radius: 50%;
+  background: orange;
+  border: 3px solid #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+  touch-action: none;
+  cursor: grab;
+}
+
+/* Review screen — full-size pages before the actual upload */
+.scan-review-pages {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.scan-review-page img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+.scan-review-page-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 6px;
+}
+
+/* Pre-scan questions screen — read before the camera opens */
+.scan-question-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0 0 16px;
+  padding: 0;
+  list-style: none;
+  counter-reset: scan-question;
+}
+
+.scan-question-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  counter-increment: scan-question;
+}
+
+.scan-question-item span:first-child::before {
+  content: counter(scan-question) ". ";
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.scan-question-item .chip {
+  flex-shrink: 0;
+}
