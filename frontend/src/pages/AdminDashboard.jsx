@@ -1060,6 +1060,36 @@ function AssignmentAttemptsPanel({ problemId }) {
   );
 }
 
+// Lazily fetches one submission's OCR'd pages and renders the plain
+// recognized text — a quick "what did OCR actually read" check, separate
+// from ScanReview's full grading view. Concatenates pages in order rather
+// than showing per-page confidence scores (ScanReview already covers that
+// detail); a teacher opening this just wants to read the text.
+function ScanExtractedText({ submissionId }) {
+  const [pages, setPages] = useState(null);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    axios.get(`${API}/api/admin/scan-submissions/${submissionId}`, { withCredentials: true })
+      .then((res) => { if (!cancelled) setPages(res.data.pages); })
+      .catch(() => { if (!cancelled) setError('Failed to load extracted text.'); });
+    return () => { cancelled = true; };
+  }, [submissionId]);
+
+  if (error) return <div className="alert" style={{ margin: '12px 0' }}><span className="alert-icon">!</span><span>{error}</span></div>;
+  if (!pages) return <p className="sb-loading" style={{ margin: '12px 0' }}>Loading extracted text…</p>;
+
+  const combinedText = pages.map((p) => p.text || '').join('\n\n').trim();
+  if (!combinedText) {
+    return <p className="auth-sub" style={{ margin: '12px 0' }}>No text recognised. Please refer to the scanned pdf.</p>;
+  }
+
+  return (
+    <pre style={{ whiteSpace: 'pre-wrap', margin: '12px 0', fontFamily: 'var(--font-sans)' }}>{combinedText}</pre>
+  );
+}
+
 // Every student's scan submission for one scan-mode assignment — at most
 // one row per student (a resubmission replaces the previous one outright,
 // see POST /api/problems/:id/scan-submit), so unlike AssignmentAttemptsPanel
@@ -1069,6 +1099,7 @@ function ScanSubmissionsPanel({ problemId }) {
   const navigate = useNavigate();
   const [submissions, setSubmissions] = useState(null);
   const [error, setError] = useState('');
+  const [expandedTextId, setExpandedTextId] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -1095,26 +1126,40 @@ function ScanSubmissionsPanel({ problemId }) {
       </thead>
       <tbody>
         {submissions.map((s) => (
-          <tr key={s.id}>
-            <td className="admin-cell-strong">
-              {s.name || s.email}
-              {s.name && <div style={{ color: 'var(--text-dim)', fontSize: '12px', fontWeight: 400 }}>{s.email}</div>}
-            </td>
-            <td>
-              <span className={`chip ${s.status === 'ocr_done' ? 'chip-easy' : s.status === 'ocr_failed' ? 'chip-hard' : 'chip-medium'}`}>
-                <span className="dot" />{s.status}
-              </span>
-              {s.penalized && <span className="chip chip-hard" style={{ marginLeft: 6 }}>penalized</span>}
-            </td>
-            <td>{s.fullyGraded ? `${s.awardedMarks}/${s.totalMarks}` : `—/${s.totalMarks}`}</td>
-            <td>{formatDate(s.createdAt)}</td>
-            <td className="admin-cell-actions">
-              {s.viewUrl && <a className="btn btn-ghost btn-sm" href={s.viewUrl} target="_blank" rel="noreferrer">View PDF</a>}
-              {s.status === 'ocr_done' && (
-                <button type="button" className="btn btn-primary btn-sm" onClick={() => navigate(`/admin/scan-submissions/${s.id}`)}>Review</button>
-              )}
-            </td>
-          </tr>
+          <Fragment key={s.id}>
+            <tr>
+              <td className="admin-cell-strong">
+                {s.name || s.email}
+                {s.name && <div style={{ color: 'var(--text-dim)', fontSize: '12px', fontWeight: 400 }}>{s.email}</div>}
+              </td>
+              <td>
+                <span className={`chip ${s.status === 'ocr_done' ? 'chip-easy' : s.status === 'ocr_failed' ? 'chip-hard' : 'chip-medium'}`}>
+                  <span className="dot" />{s.status}
+                </span>
+                {s.penalized && <span className="chip chip-hard" style={{ marginLeft: 6 }}>penalized</span>}
+              </td>
+              <td>{s.fullyGraded ? `${s.awardedMarks}/${s.totalMarks}` : `—/${s.totalMarks}`}</td>
+              <td>{formatDate(s.createdAt)}</td>
+              <td className="admin-cell-actions">
+                {s.viewUrl && <a className="btn btn-ghost btn-sm" href={s.viewUrl} target="_blank" rel="noreferrer">View PDF</a>}
+                {s.status === 'ocr_done' && (
+                  <button type="button" className="btn btn-ghost btn-sm" onClick={() => setExpandedTextId(expandedTextId === s.id ? null : s.id)}>
+                    {expandedTextId === s.id ? 'Hide text' : 'View text'}
+                  </button>
+                )}
+                {s.status === 'ocr_done' && (
+                  <button type="button" className="btn btn-primary btn-sm" onClick={() => navigate(`/admin/scan-submissions/${s.id}`)}>Review</button>
+                )}
+              </td>
+            </tr>
+            {expandedTextId === s.id && (
+              <tr>
+                <td colSpan={5} style={{ background: 'var(--surface-2)' }}>
+                  <ScanExtractedText submissionId={s.id} />
+                </td>
+              </tr>
+            )}
+          </Fragment>
         ))}
       </tbody>
     </table>
