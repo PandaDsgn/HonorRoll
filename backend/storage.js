@@ -45,6 +45,13 @@ function scanObjectKey(organizationId, problemId, submissionId) {
   return `scans/${organizationId}/${problemId}/${submissionId}.pdf`;
 }
 
+// Same idea as scanObjectKey, separate top-level prefix so an exam's and a
+// problem's own id sequences can never collide on the same bucket path —
+// see exam_items' 'scan' type / exam_attempts.scan_storage_key in index.js.
+function examScanObjectKey(organizationId, examId, attemptId) {
+  return `exam-scans/${organizationId}/${examId}/${attemptId}.pdf`;
+}
+
 async function uploadScanPdf(objectKey, buffer) {
   const client = getB2Client();
   if (!client) throw new Error('B2 is not configured');
@@ -86,4 +93,4 @@ async function deleteScanPdf(objectKey) {
   await client.send(new DeleteObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: objectKey }));
 }
 
-module.exports = { isB2Configured, scanObjectKey, uploadScanPdf, getScanPdfUrl, downloadScanPdf, deleteScanPdf };
+module.exports = { isB2Configured, scanObjectKey, examScanObjectKey, uploadScanPdf, getScanPdfUrl, downloadScanPdf, deleteScanPdf };

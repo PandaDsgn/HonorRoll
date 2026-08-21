@@ -7,6 +7,7 @@ const ITEM_TYPES = [
   { id: 'short', label: 'Short answer' },
   { id: 'long', label: 'Long answer' },
   { id: 'coding', label: 'Coding' },
+  { id: 'scan', label: 'Scanned (handwritten)' },
 ];
 
 function toIsoOrNull(localValue) {
@@ -203,7 +204,7 @@ export default function ExamForm({ initialData, onSubmit, onCancel }) {
           setError(`${label}: select which option is correct.`);
           return;
         }
-      } else if (it.type === 'short' || it.type === 'long') {
+      } else if (it.type === 'short' || it.type === 'long' || it.type === 'scan') {
         if (!it.prompt.trim()) { setError(`${label}: question text is required.`); return; }
       } else if (it.type === 'coding') {
         if (it.codingMode === 'reuse') {
@@ -350,7 +351,7 @@ export default function ExamForm({ initialData, onSubmit, onCancel }) {
               </button>
             </div>
 
-            {(it.type === 'mcq' || it.type === 'short' || it.type === 'long' || (it.type === 'coding' && it.codingMode === 'custom')) && (
+            {(it.type === 'mcq' || it.type === 'short' || it.type === 'long' || it.type === 'scan' || (it.type === 'coding' && it.codingMode === 'custom')) && (
               <div className="field">
                 <label>Question text</label>
                 <textarea
@@ -359,6 +360,10 @@ export default function ExamForm({ initialData, onSubmit, onCancel }) {
                   onChange={(e) => updateItem(it.key, { prompt: e.target.value })}
                 />
               </div>
+            )}
+
+            {it.type === 'scan' && (
+              <p className="exam-item-hint">Answered on paper — the student scans it in with their camera, and every scanned item in the exam is combined into one PDF for you to grade.</p>
             )}
 
             {it.type === 'mcq' && (

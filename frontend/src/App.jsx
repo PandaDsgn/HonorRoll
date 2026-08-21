@@ -13,6 +13,7 @@ import AssignmentResult from './pages/AssignmentResult';
 import Sandbox from './pages/Sandbox';
 import ScanCapture from './pages/ScanCapture';
 import IDE from './pages/IDE';
+import CustomQuoteRequest from './pages/CustomQuoteRequest';
 import Exams from './pages/Exams';
 import ExamAttempt from './pages/ExamAttempt';
 import ExamResult from './pages/ExamResult';
@@ -39,6 +40,7 @@ function App() {
           <Route path="/assignments/:id/result" element={<ProtectedRoute><AssignmentResult /></ProtectedRoute>} />
 
           <Route path="/ide" element={<ProtectedRoute><IDE /></ProtectedRoute>} />
+          <Route path="/admin/billing/custom-quote" element={<ProtectedRoute roles={['admin']}><CustomQuoteRequest /></ProtectedRoute>} />
 
           <Route path="/exams" element={<ProtectedRoute><Exams /></ProtectedRoute>} />
           <Route path="/exams/:id" element={<ProtectedRoute><ExamAttempt /></ProtectedRoute>} />

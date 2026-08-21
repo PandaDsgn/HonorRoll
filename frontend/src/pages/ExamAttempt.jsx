@@ -8,6 +8,7 @@ import { java } from '@codemirror/lang-java';
 import { useTheme } from '../hooks/useTheme';
 import { useExamLockdown } from '../hooks/useExamLockdown';
 import { useProctoring } from '../hooks/useProctoring';
+import ExamScanCapture from '../components/ExamScanCapture';
 import { API } from '../config';
 import '../Exam.css';
 
@@ -54,7 +55,10 @@ export default function ExamAttempt() {
   const { id } = useParams();
   const { theme } = useTheme();
 
-  // loading -> intro -> active -> ended, or blocked/error at any point before active
+  // loading -> intro -> active -> [scanning, only if the exam has any
+  // scan-type items] -> ended, or blocked/error at any point before active.
+  // 'scanning' hands off to ExamScanCapture — see handleSubmitClick below
+  // for why that's a distinct phase rather than folded into forceEnd.
   const [phase, setPhase] = useState('loading');
   const [examMeta, setExamMeta] = useState(null);
   const [blockedMessage, setBlockedMessage] = useState('');
@@ -177,9 +181,12 @@ export default function ExamAttempt() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase, lockdown.exitFullscreen]);
 
-  // Countdown tick, active only while the attempt is actually running.
+  // Countdown tick — active through 'scanning' too, not just 'active': a
+  // student who reaches the scan step is functionally done, but their
+  // deadline hasn't stopped, and this is the only thing standing between
+  // a stalled scan phase and an exam that never actually ends.
   useEffect(() => {
-    if (phase !== 'active' || !deadlineAt) return undefined;
+    if ((phase !== 'active' && phase !== 'scanning') || !deadlineAt) return undefined;
     const tick = () => {
       const rem = deadlineAt - Date.now();
       setRemainingMs(rem);
@@ -189,6 +196,45 @@ export default function ExamAttempt() {
     const interval = setInterval(tick, 1000);
     return () => clearInterval(interval);
   }, [phase, deadlineAt, forceEnd]);
+
+  const hasScanItems = items.some((it) => it.type === 'scan');
+
+  // The manual Submit button's real handler — routed through the
+  // interactive scan phase first when the exam has any scan-type items,
+  // since forceEnd (also the beacon/timeout/violation path) can't
+  // realistically carry a multi-page camera capture through an unload
+  // event. Disarms the lockdown/proctoring the same way forceEnd itself
+  // does before exiting fullscreen — requesting a NEW camera stream here
+  // (a different device than proctoring's, on most phones, but the SAME
+  // device on a single-camera laptop) must never register as a blur/
+  // visibility violation just because the permission prompt appeared.
+  const handleSubmitClick = () => {
+    if (!hasScanItems) {
+      forceEnd('manual');
+      return;
+    }
+    setArmed(false);
+    setProctoringEnabled(false);
+    setPhase('scanning');
+  };
+
+  // Called once ExamScanCapture finishes — either with a compiled PDF, or
+  // null if the student chose to skip scanning entirely. Uploads first,
+  // then actually ends the attempt via the normal forceEnd path. Left to
+  // throw on failure rather than caught here — ExamScanCapture's own
+  // handleSubmit awaits this and drops back to its review screen on
+  // rejection, same "try, catch, let them retry" shape ScanCapture.jsx's
+  // own handleUpload uses.
+  const handleScanDone = async (pdfBlob) => {
+    if (!pdfBlob) {
+      forceEnd('manual');
+      return;
+    }
+    const formData = new FormData();
+    formData.append('file', pdfBlob, 'scan.pdf');
+    await axios.post(`${API}/api/exams/${id}/scan-submit`, formData, { withCredentials: true });
+    forceEnd('manual');
+  };
 
   const handleStart = async () => {
     setStarting(true);
@@ -331,6 +377,23 @@ export default function ExamAttempt() {
     );
   }
 
+  if (phase === 'scanning') {
+    return (
+      <div className="sb-shell">
+        <header className="sb-topbar exam-take-topbar">
+          <span className="brand">{examMeta?.title}</span>
+          <span className="sb-timer exam-countdown" title="Time remaining">{formatTimer(remainingMs)}</span>
+        </header>
+        <section className="admin-shell">
+          <ExamScanCapture
+            items={items.filter((it) => it.type === 'scan')}
+            onDone={handleScanDone}
+          />
+        </section>
+      </div>
+    );
+  }
+
   // phase === 'active'
   return (
     <div className="sb-shell">
@@ -338,7 +401,7 @@ export default function ExamAttempt() {
         <span className="brand">{examMeta?.title}</span>
         <div className="sb-actions">
           <span className="sb-timer exam-countdown" title="Time remaining">{formatTimer(remainingMs)}</span>
-          <button type="button" className="btn btn-primary" onClick={() => forceEnd('manual')}>Submit Exam</button>
+          <button type="button" className="btn btn-primary" onClick={handleSubmitClick}>Submit Exam</button>
         </div>
       </header>
 
@@ -383,6 +446,10 @@ export default function ExamAttempt() {
                     </span>
                   )}
                 </div>
+              )}
+
+              {item.type === 'scan' && (
+                <p className="auth-sub">Answer this on paper — you'll scan it in with your camera after submitting.</p>
               )}
 
               {item.type === 'coding' && (

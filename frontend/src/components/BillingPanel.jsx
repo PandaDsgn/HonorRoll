@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { API } from '../config';
 
@@ -27,10 +28,13 @@ function formatRupees(paise) {
 
 // Plan display order — Free first, then ascending by price. Doesn't need
 // to match PLAN_CATALOG's own key order since that's driven by the
-// backend, not display concerns.
-const PLAN_ORDER = ['free', 'starter', 'growth', 'institution'];
+// backend, not display concerns. 'custom' isn't a real PLAN_CATALOG entry
+// (see the card rendering below) — it's a static card linking to the
+// custom-quote request page instead of a Razorpay checkout.
+const PLAN_ORDER = ['free', 'starter', 'growth', 'institution', 'scale', 'custom'];
 
 export default function BillingPanel() {
+  const navigate = useNavigate();
   const [plans, setPlans] = useState(null);
   const [status, setStatus] = useState(null);
   const [billingCycle, setBillingCycle] = useState('monthly');
@@ -183,13 +187,29 @@ export default function BillingPanel() {
 
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 14 }}>
           {PLAN_ORDER.map((planKey) => {
+            // 'custom' isn't backed by PLAN_CATALOG at all — a static card
+            // for anything past 'scale' (10,000 students), pointing at the
+            // lead-capture request page instead of a Razorpay checkout.
+            if (planKey === 'custom') {
+              return (
+                <div key="custom" className="panel" style={{ padding: 16 }}>
+                  <div className="admin-cell-strong" style={{ fontSize: 15, marginBottom: 4 }}>Custom</div>
+                  <div style={{ fontSize: 13, color: 'var(--text-dim)', marginBottom: 10 }}>10,000+ students</div>
+                  <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 12 }}>Contact us</div>
+                  <button type="button" className="btn btn-primary btn-sm" onClick={() => navigate('/admin/billing/custom-quote')}>
+                    Request Invoice
+                  </button>
+                </div>
+              );
+            }
+
             const plan = plans[planKey];
             const price = billingCycle === 'monthly' ? plan.monthlyPaise : plan.annualPaise;
             const isCurrent = status.effectivePlanKey === planKey;
             return (
               <div key={planKey} className="panel" style={{ padding: 16, borderColor: isCurrent ? 'var(--accent)' : undefined }}>
                 <div className="admin-cell-strong" style={{ fontSize: 15, marginBottom: 4 }}>{plan.label}</div>
-                <div style={{ fontSize: 13, color: 'var(--text-dim)', marginBottom: 10 }}>up to {plan.studentCap} students</div>
+                <div style={{ fontSize: 13, color: 'var(--text-dim)', marginBottom: 10 }}>up to {plan.studentCap.toLocaleString('en-IN')} students</div>
                 <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 12 }}>
                   {price === 0 ? 'Free' : (
                     <>{formatRupees(price)}<span style={{ fontSize: 12, fontWeight: 400, color: 'var(--text-dim)' }}>/{billingCycle === 'monthly' ? 'mo' : 'yr'}</span></>
@@ -206,7 +226,7 @@ export default function BillingPanel() {
                     disabled={!status.razorpayConfigured || checkingOut === planKey || confirming}
                     onClick={() => upgrade(planKey)}
                   >
-                    {checkingOut === planKey ? 'Starting…' : confirming ? 'Confirming…' : 'Upgrade'}
+                    {checkingOut === planKey ? 'Starting…' : confirming ? 'Confirming…' : 'Choose Plan'}
                   </button>
                 )}
               </div>

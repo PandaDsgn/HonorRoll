@@ -1149,7 +1149,11 @@ function ScanExtractedText({ submissionId }) {
 
   const combinedText = (detail.pages || []).map((p) => p.text || '').join('\n\n').trim();
   if (!combinedText) {
-    return <p className="auth-sub" style={{ margin: '12px 0' }}>No text recognised. Please refer to the scanned pdf.</p>;
+    return (
+      <p className="auth-sub" style={{ margin: '12px 0' }}>
+        {detail.viewUrl ? 'No text recognised. Please refer to the scanned pdf.' : 'This assignment has no scanned questions — nothing to OCR.'}
+      </p>
+    );
   }
 
   return (
@@ -1385,13 +1389,20 @@ function ProctorFlagTimeline({ attemptId }) {
 // score/%/tags columns update immediately after a save, not on next reload.
 function GradingForm({ attemptId, onGraded }) {
   const [answers, setAnswers] = useState(null);
+  const [scanAnswers, setScanAnswers] = useState([]);
+  const [attemptScan, setAttemptScan] = useState(null);
   const [error, setError] = useState('');
   const [drafts, setDrafts] = useState({}); // answerId -> in-progress input value
   const [savingId, setSavingId] = useState(null);
+  const [processingScan, setProcessingScan] = useState(false);
 
   const load = useCallback(() => {
     axios.get(`${API}/api/admin/exam-attempts/${attemptId}/answers`, { withCredentials: true })
-      .then((res) => setAnswers(res.data.answers))
+      .then((res) => {
+        setAnswers(res.data.answers);
+        setScanAnswers(res.data.scanAnswers || []);
+        setAttemptScan(res.data.attemptScan || null);
+      })
       .catch(() => setError('Failed to load answers.'));
   }, [attemptId]);
 
@@ -1399,12 +1410,15 @@ function GradingForm({ attemptId, onGraded }) {
 
   const gradable = (answers || []).filter((a) => a.type === 'short' || a.type === 'long');
 
-  const saveGrade = async (answerId) => {
+  // Shared by both the short/long route and the scan-answer route — same
+  // shape response ({ score, fullyGraded }), just a different URL per kind.
+  const saveGrade = async (kind, answerId) => {
     setSavingId(answerId);
     try {
-      await axios.put(`${API}/api/admin/exam-answers/${answerId}/grade`, {
-        marksAwarded: Number(drafts[answerId]),
-      }, { withCredentials: true });
+      const url = kind === 'scan'
+        ? `${API}/api/admin/exam-scan-answers/${answerId}/grade`
+        : `${API}/api/admin/exam-answers/${answerId}/grade`;
+      await axios.put(url, { marksAwarded: Number(drafts[answerId]) }, { withCredentials: true });
       load();
       onGraded();
     } catch (err) {
@@ -1414,9 +1428,48 @@ function GradingForm({ attemptId, onGraded }) {
     }
   };
 
+  const processScanNow = async () => {
+    setProcessingScan(true);
+    setError('');
+    try {
+      await axios.post(`${API}/api/admin/exam-attempts/${attemptId}/process-scan`, {}, { withCredentials: true });
+      load();
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to start OCR.');
+    } finally {
+      setProcessingScan(false);
+    }
+  };
+
   if (error) return <div className="alert" style={{ margin: '12px 0' }}><span className="alert-icon">!</span><span>{error}</span></div>;
   if (!answers) return <p className="sb-loading" style={{ margin: '12px 0' }}>Loading answers…</p>;
-  if (gradable.length === 0) return <p className="sb-loading" style={{ margin: '12px 0' }}>Nothing to manually grade on this attempt — every item is auto-graded.</p>;
+  if (gradable.length === 0 && scanAnswers.length === 0) {
+    return <p className="sb-loading" style={{ margin: '12px 0' }}>Nothing to manually grade on this attempt — every item is auto-graded.</p>;
+  }
+
+  const gradeInput = (kind, a) => (
+    <div className="testcase-row" style={{ marginTop: '10px' }}>
+      <input
+        type="number"
+        min="0"
+        max={a.marks}
+        placeholder={a.marks_awarded != null ? String(a.marks_awarded) : 'marks'}
+        value={drafts[a.answer_id] ?? (a.marks_awarded != null ? String(a.marks_awarded) : '')}
+        onChange={(e) => setDrafts((prev) => ({ ...prev, [a.answer_id]: e.target.value }))}
+        style={{ maxWidth: '100px' }}
+      />
+      <button
+        type="button"
+        className="btn btn-primary btn-sm"
+        disabled={savingId === a.answer_id || drafts[a.answer_id] === undefined || drafts[a.answer_id] === ''}
+        onClick={() => saveGrade(kind, a.answer_id)}
+      >
+        {savingId === a.answer_id && <span className="spinner" />}
+        {a.marks_awarded != null ? 'Update' : 'Save'}
+      </button>
+      {a.marks_awarded != null && <span className="chip chip-easy"><span className="dot" />Graded</span>}
+    </div>
+  );
 
   return (
     <div className="submission-history">
@@ -1427,27 +1480,62 @@ function GradingForm({ attemptId, onGraded }) {
             <span className="chip chip-neutral"><span className="dot" />{a.marks} marks</span>
           </div>
           <pre className="submission-code">{a.text_answer || '(no answer given)'}</pre>
-          <div className="testcase-row" style={{ marginTop: '10px' }}>
-            <input
-              type="number"
-              min="0"
-              max={a.marks}
-              placeholder={a.marks_awarded != null ? String(a.marks_awarded) : 'marks'}
-              value={drafts[a.answer_id] ?? (a.marks_awarded != null ? String(a.marks_awarded) : '')}
-              onChange={(e) => setDrafts((prev) => ({ ...prev, [a.answer_id]: e.target.value }))}
-              style={{ maxWidth: '100px' }}
-            />
-            <button
-              type="button"
-              className="btn btn-primary btn-sm"
-              disabled={savingId === a.answer_id || drafts[a.answer_id] === undefined || drafts[a.answer_id] === ''}
-              onClick={() => saveGrade(a.answer_id)}
-            >
-              {savingId === a.answer_id && <span className="spinner" />}
-              {a.marks_awarded != null ? 'Update' : 'Save'}
-            </button>
-            {a.marks_awarded != null && <span className="chip chip-easy"><span className="dot" />Graded</span>}
+          {gradeInput('short-long', a)}
+        </div>
+      ))}
+
+      {scanAnswers.length > 0 && (
+        <div className="submission-card">
+          <div className="submission-card-head">
+            <span>Scanned answers</span>
+            {attemptScan?.status && (
+              <span className={`chip ${attemptScan.status === 'ocr_done' ? 'chip-easy' : attemptScan.status === 'ocr_failed' ? 'chip-hard' : 'chip-medium'}`}>
+                <span className="dot" />{formatScanStatus(attemptScan.status)}
+              </span>
+            )}
           </div>
+          {!attemptScan?.status && (
+            <p className="auth-sub" style={{ margin: '8px 0' }}>The student didn't submit any scanned pages for this attempt.</p>
+          )}
+          {attemptScan?.status && (
+            <>
+              <div className="scan-capture-actions" style={{ margin: '10px 0' }}>
+                {attemptScan.viewUrl && (
+                  <a className="btn btn-ghost btn-sm" href={attemptScan.viewUrl} target="_blank" rel="noreferrer">View scanned PDF</a>
+                )}
+                {(attemptScan.status === 'pending' || attemptScan.status === 'ocr_failed') && (
+                  <button type="button" className="btn btn-ghost btn-sm" disabled={processingScan} onClick={processScanNow}>
+                    {processingScan && <span className="spinner" />}
+                    Run OCR now
+                  </button>
+                )}
+              </div>
+              {attemptScan.status === 'ocr_failed' && (
+                <p className="auth-sub" style={{ color: 'var(--danger)' }}>OCR failed{attemptScan.ocrError ? `: ${attemptScan.ocrError}` : '.'}</p>
+              )}
+              {Array.isArray(attemptScan.ocrPages) && attemptScan.ocrPages.length > 0 ? (
+                attemptScan.ocrPages.map((p) => (
+                  <div key={p.page} className="panel" style={{ padding: 14, marginTop: 10 }}>
+                    <p className="auth-sub" style={{ margin: '0 0 6px' }}>Page {p.page} — confidence {Math.round((p.confidence || 0) * 100)}%</p>
+                    <pre style={{ whiteSpace: 'pre-wrap', margin: 0, fontFamily: 'var(--font-sans)' }}>{p.text || '(no text recognized)'}</pre>
+                  </div>
+                ))
+              ) : attemptScan.status === 'pending' && (
+                <p className="auth-sub" style={{ margin: '10px 0 0' }}>OCR hasn't run yet — use "Run OCR now" above.</p>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {scanAnswers.map((a) => (
+        <div className="submission-card" key={`scan-${a.answer_id}`}>
+          <div className="submission-card-head">
+            <span>{a.prompt}</span>
+            <span className="chip chip-neutral"><span className="dot" />{a.marks} marks</span>
+          </div>
+          {a.ai_assessment && <p className="auth-sub" style={{ margin: '8px 0' }}>AI assessment (aid only): {a.ai_assessment}</p>}
+          {gradeInput('scan', a)}
         </div>
       ))}
     </div>

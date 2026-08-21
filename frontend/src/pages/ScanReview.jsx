@@ -208,26 +208,60 @@ export default function ScanReview() {
 
               <div className="field-group-label">Questions</div>
               <div className="testcase-list" style={{ marginBottom: 20 }}>
-                {submission.questions.map((q) => (
-                  <div key={q.questionId} className="panel" style={{ padding: 14, marginBottom: 10 }}>
-                    <p style={{ margin: '0 0 6px', fontWeight: 600 }}>{q.prompt} <span className="auth-sub">({q.maxMarks} marks)</span></p>
-                    {q.aiAssessment && (
-                      <p className="auth-sub" style={{ margin: '0 0 8px' }}>AI assessment (not authoritative): {q.aiAssessment}</p>
-                    )}
-                    <label htmlFor={`marks-${q.questionId}`} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      Marks awarded:
-                      <input
-                        id={`marks-${q.questionId}`}
-                        type="number"
-                        min="0"
-                        max={q.maxMarks}
-                        style={{ maxWidth: 90 }}
-                        value={marks[q.questionId] ?? ''}
-                        onChange={(e) => setMarks((prev) => ({ ...prev, [q.questionId]: e.target.value }))}
-                      />
-                    </label>
-                  </div>
-                ))}
+                {submission.questions.map((q) => {
+                  // mcq/coding are auto-graded at submit time (see
+                  // finalizeScanSubmissionDigitalAnswers) — no manual marks
+                  // input for those, same "not overridable in this pass"
+                  // posture the exam-side grading UI takes. scan/short/long
+                  // are the only ones a teacher actually enters marks for.
+                  const manuallyGraded = q.type === 'scan' || q.type === 'short' || q.type === 'long';
+                  return (
+                    <div key={q.questionId} className="panel" style={{ padding: 14, marginBottom: 10 }}>
+                      <p style={{ margin: '0 0 6px', fontWeight: 600 }}>{q.prompt} <span className="auth-sub">({q.maxMarks} marks)</span></p>
+
+                      {q.type === 'mcq' && (
+                        <p className="auth-sub" style={{ margin: '0 0 8px' }}>
+                          Selected: {q.options?.find((o) => o.id === q.selectedOptionId)?.text || '(no answer given)'}
+                          {' — '}
+                          <span className={q.isCorrect ? 'chip chip-easy' : 'chip chip-hard'} style={{ display: 'inline-flex' }}>
+                            <span className="dot" />{q.isCorrect ? 'Correct' : 'Incorrect'}
+                          </span>
+                          {' — '}{q.marksAwarded ?? 0}/{q.maxMarks} marks
+                        </p>
+                      )}
+
+                      {(q.type === 'short' || q.type === 'long') && (
+                        <pre className="submission-code" style={{ margin: '0 0 8px' }}>{q.textAnswer || '(no answer given)'}</pre>
+                      )}
+
+                      {q.type === 'coding' && (
+                        <>
+                          <p className="auth-sub" style={{ margin: '0 0 4px' }}>{q.language || 'No language selected'} — {q.passedCount ?? 0}/{q.totalCount ?? 0} sample cases passed — {q.marksAwarded ?? 0}/{q.maxMarks} marks</p>
+                          <pre className="submission-code" style={{ margin: '0 0 8px' }}>{q.code || '(no code submitted)'}</pre>
+                        </>
+                      )}
+
+                      {q.aiAssessment && (
+                        <p className="auth-sub" style={{ margin: '0 0 8px' }}>AI assessment (not authoritative): {q.aiAssessment}</p>
+                      )}
+
+                      {manuallyGraded && (
+                        <label htmlFor={`marks-${q.questionId}`} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          Marks awarded:
+                          <input
+                            id={`marks-${q.questionId}`}
+                            type="number"
+                            min="0"
+                            max={q.maxMarks}
+                            style={{ maxWidth: 90 }}
+                            value={marks[q.questionId] ?? ''}
+                            onChange={(e) => setMarks((prev) => ({ ...prev, [q.questionId]: e.target.value }))}
+                          />
+                        </label>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
 
               <div className="field-group-label">OCR'd text</div>

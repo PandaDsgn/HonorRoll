@@ -15,7 +15,7 @@ const { sendEmail } = require('./mailer');
 const { exec } = require('child_process');
 const path = require('path');
 const multer = require('multer');
-const { isB2Configured, scanObjectKey, uploadScanPdf, deleteScanPdf, getScanPdfUrl, downloadScanPdf } = require('./storage');
+const { isB2Configured, scanObjectKey, examScanObjectKey, uploadScanPdf, deleteScanPdf, getScanPdfUrl, downloadScanPdf } = require('./storage');
 const { isOcrConfigured, runOcr } = require('./ocrClient');
 const { isGroqConfigured, assessAnswers } = require('./aiGrading');
 const { parse: parseCsv } = require('csv-parse/sync');
@@ -218,7 +218,7 @@ async function ensureExamSchemaImpl() {
       CREATE TABLE IF NOT EXISTS exam_items (
         id SERIAL PRIMARY KEY,
         exam_id INTEGER NOT NULL REFERENCES exams(id) ON DELETE CASCADE,
-        type TEXT NOT NULL CHECK (type IN ('mcq', 'short', 'long', 'coding')),
+        type TEXT NOT NULL CHECK (type IN ('mcq', 'short', 'long', 'coding', 'scan')),
         position INTEGER NOT NULL DEFAULT 0,
         marks INTEGER NOT NULL DEFAULT 1,
         -- NULL = no per-item sub-limit; the item is only bounded by the
@@ -245,6 +245,11 @@ async function ensureExamSchemaImpl() {
     // this — CREATE TABLE IF NOT EXISTS wouldn't retroactively add columns.
     await pool.query('ALTER TABLE exam_items ADD COLUMN IF NOT EXISTS starter_code JSONB');
     await pool.query('ALTER TABLE exam_items ADD COLUMN IF NOT EXISTS test_cases JSONB');
+    // Widens the type CHECK for exam_items tables that already existed
+    // before 'scan' was added — same DROP/re-ADD pattern as
+    // ensureExamProctoringSchema's end_reason constraint further down.
+    await pool.query('ALTER TABLE exam_items DROP CONSTRAINT IF EXISTS exam_items_type_check');
+    await pool.query(`ALTER TABLE exam_items ADD CONSTRAINT exam_items_type_check CHECK (type IN ('mcq', 'short', 'long', 'coding', 'scan'))`);
   }
 }
 ensureExamSchema();
@@ -290,6 +295,36 @@ async function ensureExamSubmissionSchema() {
         total_count INTEGER,
         marks_awarded INTEGER,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (attempt_id, item_id)
+      )
+    `);
+
+    // scan-type items don't get their own per-item answer row the way
+    // mcq/short/long/coding do — every scan item in one attempt is
+    // answered on paper and captured together into ONE compiled PDF (see
+    // POST /api/exams/:id/submit), same "one PDF per submission" shape as
+    // scan_submissions for assignments. These columns hold that PDF and
+    // its OCR result at the ATTEMPT level, not per-item.
+    await pool.query('ALTER TABLE exam_attempts ADD COLUMN IF NOT EXISTS scan_storage_key TEXT');
+    await pool.query('ALTER TABLE exam_attempts ADD COLUMN IF NOT EXISTS scan_status TEXT');
+    await pool.query('ALTER TABLE exam_attempts DROP CONSTRAINT IF EXISTS exam_attempts_scan_status_check');
+    await pool.query(`ALTER TABLE exam_attempts ADD CONSTRAINT exam_attempts_scan_status_check CHECK (scan_status IN ('pending', 'processing', 'ocr_done', 'ocr_failed'))`);
+    await pool.query('ALTER TABLE exam_attempts ADD COLUMN IF NOT EXISTS scan_ocr_text TEXT');
+    await pool.query('ALTER TABLE exam_attempts ADD COLUMN IF NOT EXISTS scan_ocr_pages JSONB');
+    await pool.query('ALTER TABLE exam_attempts ADD COLUMN IF NOT EXISTS scan_ocr_error TEXT');
+    await pool.query('ALTER TABLE exam_attempts ADD COLUMN IF NOT EXISTS scan_ocr_completed_at TIMESTAMPTZ');
+
+    // One row per (attempt, scan item) — where a teacher's marks_awarded
+    // and the AI's aid-only assessment for that specific item live, since
+    // the OCR text itself is one blob per attempt (scan_ocr_text above),
+    // not split per item. Directly mirrors scan_submission_answers.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS exam_scan_answers (
+        id SERIAL PRIMARY KEY,
+        attempt_id INTEGER NOT NULL REFERENCES exam_attempts(id) ON DELETE CASCADE,
+        item_id INTEGER NOT NULL REFERENCES exam_items(id) ON DELETE CASCADE,
+        ai_assessment TEXT,
+        marks_awarded INTEGER,
         UNIQUE (attempt_id, item_id)
       )
     `);
@@ -677,9 +712,16 @@ ensureScanHandwritingFlagsSchema();
 
 // Questions a scan assignment actually asks — students see these before the
 // camera opens (see GET /api/me/scan-context), teachers author them in
-// AssignmentForm same as exam_items' prompt/marks/position, just without the
-// mcq/short/long/coding type branching exam_items needs (a scan answer is
-// always "written on paper").
+// AssignmentForm. Started out scan-only (a scan answer is always "written
+// on paper"), same prompt/marks/position shape as exam_items; now mirrors
+// exam_items' full mcq/short/long/coding/scan typing so a scan-mode
+// assignment can mix digitally-answered items alongside scanned ones —
+// every scan-type question's captured pages still compile into ONE PDF per
+// submission (see scan_submissions), the digital ones just skip that
+// entirely. No problem_id "reuse an existing assignment" mode the way
+// exam_items' coding type has — a coding sub-item here is always inline
+// (its own starter_code/test_cases), since nesting one assignment inside
+// another has no clear meaning.
 let scanAssignmentQuestionsSchemaPromise = null;
 function ensureScanAssignmentQuestionsSchema() {
   if (!scanAssignmentQuestionsSchemaPromise) {
@@ -693,18 +735,32 @@ function ensureScanAssignmentQuestionsSchema() {
       )
     `).then(async () => {
       await pool.query('CREATE INDEX IF NOT EXISTS scan_assignment_questions_problem_idx ON scan_assignment_questions(problem_id)');
+      await pool.query(`ALTER TABLE scan_assignment_questions ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'scan'`);
+      await pool.query('ALTER TABLE scan_assignment_questions DROP CONSTRAINT IF EXISTS scan_assignment_questions_type_check');
+      await pool.query(`ALTER TABLE scan_assignment_questions ADD CONSTRAINT scan_assignment_questions_type_check CHECK (type IN ('mcq', 'short', 'long', 'coding', 'scan'))`);
+      await pool.query('ALTER TABLE scan_assignment_questions ADD COLUMN IF NOT EXISTS options JSONB'); // mcq only: [{ id, text }, ...]
+      await pool.query('ALTER TABLE scan_assignment_questions ADD COLUMN IF NOT EXISTS correct_option_id TEXT'); // mcq only
+      await pool.query('ALTER TABLE scan_assignment_questions ADD COLUMN IF NOT EXISTS word_limit INTEGER'); // short/long only
+      await pool.query('ALTER TABLE scan_assignment_questions ADD COLUMN IF NOT EXISTS starter_code JSONB'); // coding only
+      await pool.query('ALTER TABLE scan_assignment_questions ADD COLUMN IF NOT EXISTS test_cases JSONB'); // coding only
     }).catch((err) => console.error('Failed to ensure scan_assignment_questions schema:', err));
   }
   return scanAssignmentQuestionsSchemaPromise;
 }
 ensureScanAssignmentQuestionsSchema();
 
-// One row per (submission, question) — populated by the OCR pipeline once a
-// submission's assignment deadline passes (ai_assessment filled in by
-// aiGrading.js's Groq call), marks_awarded stays NULL until a teacher
-// grades it in ScanReview. Never overwritten by re-running OCR since a
-// resubmission deletes the old scan_submissions row outright (see
-// POST /api/problems/:id/scan-submit) and CASCADEs these away with it.
+// One row per (submission, question) — for scan-type questions, populated
+// by the OCR pipeline once a submission's assignment deadline passes
+// (ai_assessment filled in by aiGrading.js's Groq call), marks_awarded
+// stays NULL until a teacher grades it in ScanReview. Never overwritten by
+// re-running OCR since a resubmission deletes the old scan_submissions row
+// outright (see POST /api/problems/:id/scan-submit) and CASCADEs these
+// away with it.
+//
+// mcq/short/long/coding columns mirror exam_answers exactly — for those
+// question types this row is populated at submit time instead (mcq/coding
+// auto-graded immediately, short/long left for manual grading), the same
+// digital-answer split exam_items/exam_answers already has.
 let scanSubmissionAnswersSchemaPromise = null;
 function ensureScanSubmissionAnswersSchema() {
   if (!scanSubmissionAnswersSchemaPromise) {
@@ -719,6 +775,13 @@ function ensureScanSubmissionAnswersSchema() {
         )
       `);
       await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS scan_submission_answers_pair_idx ON scan_submission_answers(submission_id, question_id)');
+      await pool.query('ALTER TABLE scan_submission_answers ADD COLUMN IF NOT EXISTS selected_option_id TEXT');
+      await pool.query('ALTER TABLE scan_submission_answers ADD COLUMN IF NOT EXISTS text_answer TEXT');
+      await pool.query('ALTER TABLE scan_submission_answers ADD COLUMN IF NOT EXISTS is_correct BOOLEAN');
+      await pool.query('ALTER TABLE scan_submission_answers ADD COLUMN IF NOT EXISTS language TEXT');
+      await pool.query('ALTER TABLE scan_submission_answers ADD COLUMN IF NOT EXISTS code TEXT');
+      await pool.query('ALTER TABLE scan_submission_answers ADD COLUMN IF NOT EXISTS passed_count INTEGER');
+      await pool.query('ALTER TABLE scan_submission_answers ADD COLUMN IF NOT EXISTS total_count INTEGER');
     }).catch((err) => console.error('Failed to ensure scan_submission_answers schema:', err));
   }
   return scanSubmissionAnswersSchemaPromise;
@@ -782,18 +845,20 @@ ensureScanSubmissionProcessingStartedColumn();
 // constant rather than a table. Amounts in paise (Razorpay's own unit),
 // not rupees, to avoid a float-rupee conversion bug at the one place it'd
 // matter most.
-// TEMPORARY test-mode pricing — knocked down to a few rupees so live
-// checkout testing doesn't need real money riding on it. Real prices
-// (commented below each line) go back in before this ever takes live
-// payments — restoring them is a one-line-per-tier edit, nothing else
-// in the billing system depends on the actual amounts.
+// Real INR pricing — annualPaise is a flat 10x monthlyPaise (two months
+// free) across every tier, same discount shape for all of them. Per-student
+// cost declines with tier size (₹6.66 → ₹6.00 → ₹4.00 → ₹3.00 per student/
+// month), the usual SaaS volume curve. Anything past 'scale' isn't a
+// self-serve checkout at all — see the custom-quote route further down,
+// which is what the frontend's "Custom" card actually links to.
 const PLAN_CATALOG = {
-  free:        { label: 'Free',        studentCap: 30,   monthlyPaise: 0,   annualPaise: 0   },
-  starter:     { label: 'Starter',     studentCap: 150,  monthlyPaise: 100, annualPaise: 200  }, // real: 99900 / 999000
-  growth:      { label: 'Growth',      studentCap: 500,  monthlyPaise: 200, annualPaise: 400  }, // real: 299900 / 2999000
-  institution: { label: 'Institution', studentCap: 2000, monthlyPaise: 300, annualPaise: 600  }, // real: 799900 / 7999000
+  free:        { label: 'Free',        studentCap: 30,    monthlyPaise: 0,       annualPaise: 0        },
+  starter:     { label: 'Starter',     studentCap: 150,   monthlyPaise: 99900,   annualPaise: 999000   },
+  growth:      { label: 'Growth',      studentCap: 500,   monthlyPaise: 299900,  annualPaise: 2999000  },
+  institution: { label: 'Institution', studentCap: 2000,  monthlyPaise: 799900,  annualPaise: 7999000  },
+  scale:       { label: 'Scale',       studentCap: 10000, monthlyPaise: 2999900, annualPaise: 29999000 },
 };
-const PAID_PLAN_KEYS = ['starter', 'growth', 'institution'];
+const PAID_PLAN_KEYS = ['starter', 'growth', 'institution', 'scale'];
 const BILLING_CYCLES = ['monthly', 'annual'];
 
 // Global (not per-org) cache mapping this app's (plan_key, billing_cycle)
@@ -806,16 +871,23 @@ const BILLING_CYCLES = ['monthly', 'annual'];
 let razorpayPlansSchemaPromise = null;
 function ensureRazorpayPlansSchema() {
   if (!razorpayPlansSchemaPromise) {
-    razorpayPlansSchemaPromise = pool.query(`
-      CREATE TABLE IF NOT EXISTS razorpay_plans (
-        id SERIAL PRIMARY KEY,
-        plan_key TEXT NOT NULL CHECK (plan_key IN ('starter', 'growth', 'institution')),
-        billing_cycle TEXT NOT NULL CHECK (billing_cycle IN ('monthly', 'annual')),
-        razorpay_plan_id TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        UNIQUE (plan_key, billing_cycle)
-      )
-    `).catch((err) => console.error('Failed to ensure razorpay_plans schema:', err));
+    razorpayPlansSchemaPromise = (async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS razorpay_plans (
+          id SERIAL PRIMARY KEY,
+          plan_key TEXT NOT NULL CHECK (plan_key IN ('starter', 'growth', 'institution', 'scale')),
+          billing_cycle TEXT NOT NULL CHECK (billing_cycle IN ('monthly', 'annual')),
+          razorpay_plan_id TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          UNIQUE (plan_key, billing_cycle)
+        )
+      `);
+      // Widens the CHECK for tables that already existed before 'scale' was
+      // added as a paid tier — same DROP/re-ADD pattern as
+      // ensureExamProctoringSchema's end_reason constraint above.
+      await pool.query('ALTER TABLE razorpay_plans DROP CONSTRAINT IF EXISTS razorpay_plans_plan_key_check');
+      await pool.query(`ALTER TABLE razorpay_plans ADD CONSTRAINT razorpay_plans_plan_key_check CHECK (plan_key IN ('starter', 'growth', 'institution', 'scale'))`);
+    })().catch((err) => console.error('Failed to ensure razorpay_plans schema:', err));
   }
   return razorpayPlansSchemaPromise;
 }
@@ -839,20 +911,28 @@ function ensureSubscriptionsSchema() {
       CREATE TABLE IF NOT EXISTS subscriptions (
         id SERIAL PRIMARY KEY,
         organization_id INTEGER NOT NULL UNIQUE REFERENCES organizations(id) ON DELETE CASCADE,
-        plan_key TEXT NOT NULL DEFAULT 'free' CHECK (plan_key IN ('free', 'starter', 'growth', 'institution')),
+        plan_key TEXT NOT NULL DEFAULT 'free' CHECK (plan_key IN ('free', 'starter', 'growth', 'institution', 'scale')),
         billing_cycle TEXT CHECK (billing_cycle IN ('monthly', 'annual')),
         status TEXT NOT NULL DEFAULT 'free' CHECK (status IN
           ('free', 'created', 'authenticated', 'active', 'pending', 'halted', 'cancelled', 'completed', 'expired')),
         razorpay_subscription_id TEXT UNIQUE,
         razorpay_plan_id TEXT,
         current_period_end TIMESTAMPTZ,
-        pending_plan_key TEXT CHECK (pending_plan_key IN ('starter', 'growth', 'institution')),
+        pending_plan_key TEXT CHECK (pending_plan_key IN ('starter', 'growth', 'institution', 'scale')),
         pending_billing_cycle TEXT CHECK (pending_billing_cycle IN ('monthly', 'annual')),
         pending_razorpay_subscription_id TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       )
-    `)).catch((err) => console.error('Failed to ensure subscriptions schema:', err));
+    `)).then(() => Promise.all([
+      // Widens the two CHECKs for tables that already existed before 'scale'
+      // was added as a paid tier — same DROP/re-ADD pattern as
+      // ensureExamProctoringSchema's end_reason constraint.
+      pool.query('ALTER TABLE subscriptions DROP CONSTRAINT IF EXISTS subscriptions_plan_key_check').then(() =>
+        pool.query(`ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_plan_key_check CHECK (plan_key IN ('free', 'starter', 'growth', 'institution', 'scale'))`)),
+      pool.query('ALTER TABLE subscriptions DROP CONSTRAINT IF EXISTS subscriptions_pending_plan_key_check').then(() =>
+        pool.query(`ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_pending_plan_key_check CHECK (pending_plan_key IN ('starter', 'growth', 'institution', 'scale'))`)),
+    ])).catch((err) => console.error('Failed to ensure subscriptions schema:', err));
   }
   return subscriptionsSchemaPromise;
 }
@@ -1082,7 +1162,7 @@ function normalizeTimeLimitSeconds(value) {
   return Math.round(n);
 }
 
-const EXAM_ITEM_TYPES = new Set(['mcq', 'short', 'long', 'coding']);
+const EXAM_ITEM_TYPES = new Set(['mcq', 'short', 'long', 'coding', 'scan']);
 
 // Validates + normalizes one item from the exam builder's payload, returning
 // a clean object ready to insert. Throws a message naming the offending item
@@ -1092,7 +1172,7 @@ const EXAM_ITEM_TYPES = new Set(['mcq', 'short', 'long', 'coding']);
 function normalizeExamItem(raw, index) {
   const label = `Item ${index + 1}`;
   if (!raw || !EXAM_ITEM_TYPES.has(raw.type)) {
-    throw new Error(`${label}: type must be one of mcq, short, long, coding`);
+    throw new Error(`${label}: type must be one of mcq, short, long, coding, scan`);
   }
 
   const marks = Number(raw.marks);
@@ -1143,6 +1223,12 @@ function normalizeExamItem(raw, index) {
     return { ...base, prompt, options: null, correctOptionId: null, wordLimit, problemId: null, starterCode: null, testCases: null };
   }
 
+  if (raw.type === 'scan') {
+    const prompt = String(raw.prompt || '').trim();
+    if (!prompt) throw new Error(`${label}: question text is required`);
+    return { ...base, prompt, options: null, correctOptionId: null, wordLimit: null, problemId: null, starterCode: null, testCases: null };
+  }
+
   // coding — either "reuse" (problemId points at an existing assignment,
   // its problems/test_cases/starter_code rows are used as-is) or "custom"
   // (authored inline here: its own prompt/starterCode/testCases, no
@@ -1184,6 +1270,21 @@ function normalizeExamItem(raw, index) {
     ...base, prompt, options: null, correctOptionId: null, wordLimit: null,
     problemId: null, starterCode, testCases,
   };
+}
+
+// Scan-mode assignments reuse normalizeExamItem's validation wholesale
+// (same mcq/short/long/coding/scan shape as exam_items) but never allow
+// coding's "reuse an existing assignment" mode — nesting one assignment
+// inside another has no clear meaning, and scan_assignment_questions has
+// no problem_id column to hold that reference even if it did. Also drops
+// timeLimitSeconds, which scan assignments don't have a per-question slot
+// for (only the whole assignment's own time_limit_seconds applies).
+function normalizeScanAssignmentQuestion(raw, index) {
+  const item = normalizeExamItem(raw, index);
+  if (item.type === 'coding' && item.problemId != null) {
+    throw new Error(`Item ${index + 1}: coding questions in assignments must be written inline, not reused from an existing assignment`);
+  }
+  return item;
 }
 
 // ============================================================================
@@ -1708,14 +1809,17 @@ async function gradeCodingAnswer(testCases, language, code) {
 // path in /start, so grading logic never forks between the two callers.
 // mcq is graded exactly (full marks or zero); coding gets proportional
 // partial credit; short/long are stored raw with marks_awarded left NULL —
-// grading those is a manual-review feature that doesn't exist yet.
+// grading those is a manual-review feature that doesn't exist yet. scan
+// items never appear in `answers` at all (they're answered on paper, not
+// through the on-screen form) — POST /api/exams/:id/submit handles those
+// separately via the compiled PDF and exam_scan_answers, not here.
 async function finalizeExamAttempt(attemptId, examItems, answers) {
   const itemsById = new Map(examItems.map((it) => [it.id, it]));
   let score = 0;
 
   for (const ans of answers || []) {
     const item = itemsById.get(Number(ans.itemId));
-    if (!item) continue; // ignore ids that don't belong to this exam
+    if (!item || item.type === 'scan') continue; // ignore ids that don't belong to this exam, and scan items (see above)
 
     let row = {
       selected_option_id: null, text_answer: null, language: null, code: null,
@@ -1767,17 +1871,38 @@ async function finalizeExamAttempt(attemptId, examItems, answers) {
   return score;
 }
 
-// An attempt is "fully graded" once every short/long answer has a
-// non-NULL marks_awarded — mcq and coding are always auto-graded at submit
-// time, so an exam with no short/long items is fully graded the instant it's
-// submitted, no admin action ever needed. Used to gate percentage/grade/
-// percentile tags, which are meaningless while any item is still ungraded.
+// Recomputes and saves an attempt's total score from scratch — marks_awarded
+// summed across BOTH exam_answers (mcq/coding auto-graded, short/long once
+// manually graded) and exam_scan_answers (scan items, always manually
+// graded). Called after any manual grade so a teacher grading a scan item
+// doesn't leave the attempt's score stale by only ever having summed
+// exam_answers, the way a single-table SUM would.
+async function recomputeExamAttemptScore(attemptId) {
+  const res = await pool.query(
+    `SELECT
+       COALESCE((SELECT SUM(marks_awarded) FROM exam_answers WHERE attempt_id = $1), 0) +
+       COALESCE((SELECT SUM(marks_awarded) FROM exam_scan_answers WHERE attempt_id = $1), 0) AS score`,
+    [attemptId]
+  );
+  const score = res.rows[0].score;
+  await pool.query('UPDATE exam_attempts SET score = $1 WHERE id = $2', [score, attemptId]);
+  return score;
+}
+
+// An attempt is "fully graded" once every short/long answer AND every scan
+// item has a non-NULL marks_awarded — mcq and coding are always auto-graded
+// at submit time, so an exam with none of those manually-graded types is
+// fully graded the instant it's submitted, no admin action ever needed.
+// Used to gate percentage/grade/percentile tags, which are meaningless
+// while any item is still ungraded.
 async function isAttemptFullyGraded(attemptId) {
   const res = await pool.query(
     `SELECT NOT EXISTS (
        SELECT 1 FROM exam_answers ea
        JOIN exam_items ei ON ei.id = ea.item_id
        WHERE ea.attempt_id = $1 AND ei.type IN ('short', 'long') AND ea.marks_awarded IS NULL
+     ) AND NOT EXISTS (
+       SELECT 1 FROM exam_scan_answers esa WHERE esa.attempt_id = $1 AND esa.marks_awarded IS NULL
      ) AS fully_graded`,
     [attemptId]
   );
@@ -2374,6 +2499,55 @@ app.post('/api/admin/billing/cancel', authenticateToken, requireAdmin, async (re
   }
 });
 
+// Above 'scale' (10,000 students) isn't a self-serve checkout at all — too
+// large a deployment to price with a fixed card, and this account's
+// Razorpay Subscriptions product doesn't even cover it. This is a plain
+// lead-capture form instead: mails the request to the platform owner, who
+// follows up and issues a real invoice out-of-band. No Razorpay involved,
+// no DB row created — same "best-effort email, nothing else depends on it"
+// posture as sendBillingEmail below.
+app.post('/api/admin/billing/custom-quote', authenticateToken, requireAdmin, async (req, res) => {
+  const studentCount = String(req.body.studentCount || '').trim();
+  const contactPhone = String(req.body.contactPhone || '').trim();
+  const notes = String(req.body.notes || '').trim();
+  if (!studentCount) return res.status(400).json({ error: 'Approximate student count is required' });
+
+  try {
+    const result = await pool.query(
+      `SELECT u.name, u.email, o.name AS organization_name
+       FROM users u JOIN organizations o ON o.id = $2
+       WHERE u.id = $1`,
+      [req.user.userId, req.user.organizationId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Account not found' });
+    const { name, email, organization_name: organizationName } = result.rows[0];
+
+    const { error: emailError } = await sendEmail({
+      to: 'honorroll.admin@gmail.com',
+      subject: `Custom plan request — ${organizationName}`,
+      text: `New custom-plan quote request:\n\nInstitution: ${organizationName}\nContact: ${name || 'Not given'} <${email}>\nPhone: ${contactPhone || 'Not given'}\nApprox. student count: ${studentCount}\n\nNotes:\n${notes || '(none)'}`,
+    });
+    if (emailError) {
+      console.error('Custom-quote email failed to send:', emailError);
+      return res.status(502).json({ error: 'Failed to send your request — please try again or email honorroll.admin@gmail.com directly.' });
+    }
+
+    // Best-effort ack to the requester — a failure here shouldn't turn an
+    // already-successfully-sent lead into an error response.
+    const { error: ackError } = await sendEmail({
+      to: email,
+      subject: 'We received your HonorRoll custom plan request',
+      text: `Hi ${name || 'there'},\n\nThanks for reaching out about a custom plan for ${organizationName} (~${studentCount} students). Our team will follow up shortly with a quote and invoice.\n\n— HonorRoll`,
+    });
+    if (ackError) console.error('Custom-quote ack email failed to send:', ackError);
+
+    res.status(200).json({ message: 'Request sent — our team will follow up by email shortly.' });
+  } catch (err) {
+    console.error('Custom-quote request error:', err);
+    res.status(500).json({ error: 'Failed to send your request' });
+  }
+});
+
 // ============================================================================
 // ORG STRUCTURE: the tier shape (org_level_defs) and the actual tree nodes
 // built against it (org_units). A big college might define 7-8 tiers
@@ -2878,6 +3052,9 @@ app.get('/api/admin/students/:id', authenticateToken, requireAdmin, async (req, 
          AND NOT EXISTS (
            SELECT 1 FROM exam_answers ea JOIN exam_items ei ON ei.id = ea.item_id
            WHERE ea.attempt_id = a.id AND ei.type IN ('short', 'long') AND ea.marks_awarded IS NULL
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM exam_scan_answers esa WHERE esa.attempt_id = a.id AND esa.marks_awarded IS NULL
          )
        GROUP BY a.user_id`,
       [req.user.organizationId]
@@ -4162,10 +4339,17 @@ app.post('/api/admin/problems', authenticateToken, requireAdminOrTeacher, async 
   // Scan-mode questions: what a student actually needs to answer, shown
   // before the camera opens (see GET /api/me/scan-context). Required same
   // as test cases are for code mode — a scan assignment with no questions
-  // would just be a bare upload box with no idea what's being asked.
-  const questions = submissionMode === 'scan' && Array.isArray(req.body.questions)
-    ? req.body.questions.filter((q) => q && String(q.prompt || '').trim())
-    : [];
+  // would just be a bare upload box with no idea what's being asked. Each
+  // one can be mcq/short/long/coding/scan — see normalizeScanAssignmentQuestion.
+  let questions = [];
+  if (submissionMode === 'scan') {
+    const rawQuestions = Array.isArray(req.body.questions) ? req.body.questions : [];
+    try {
+      questions = rawQuestions.map((q, i) => normalizeScanAssignmentQuestion(q, i));
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+  }
 
   if (!title || !difficulty || !description) {
     return res.status(400).json({ error: 'Title, difficulty, and description are required' });
@@ -4217,9 +4401,13 @@ app.post('/api/admin/problems', authenticateToken, requireAdminOrTeacher, async 
       }
     } else {
       for (let i = 0; i < questions.length; i++) {
+        const q = questions[i];
         await client.query(
-          `INSERT INTO scan_assignment_questions (problem_id, position, prompt, marks) VALUES ($1, $2, $3, $4)`,
-          [problemId, i, String(questions[i].prompt).trim(), Number(questions[i].marks) > 0 ? Number(questions[i].marks) : 1]
+          `INSERT INTO scan_assignment_questions (problem_id, position, prompt, marks, type, options, correct_option_id, word_limit, starter_code, test_cases)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          [problemId, i, q.prompt, q.marks, q.type,
+            q.options ? JSON.stringify(q.options) : null, q.correctOptionId, q.wordLimit,
+            q.starterCode ? JSON.stringify(q.starterCode) : null, q.testCases ? JSON.stringify(q.testCases) : null]
         );
       }
     }
@@ -4255,10 +4443,15 @@ app.get('/api/admin/problems/:id', authenticateToken, requireAdminOrTeacher, asy
     let questions = [];
     if (problem.submission_mode === 'scan') {
       const questionsRes = await pool.query(
-        'SELECT prompt, marks FROM scan_assignment_questions WHERE problem_id = $1 ORDER BY position ASC',
+        `SELECT prompt, marks, type, options, correct_option_id, word_limit, starter_code, test_cases
+         FROM scan_assignment_questions WHERE problem_id = $1 ORDER BY position ASC`,
         [problemId]
       );
-      questions = questionsRes.rows.map((q) => ({ prompt: q.prompt, marks: q.marks }));
+      questions = questionsRes.rows.map((q) => ({
+        prompt: q.prompt, marks: q.marks, type: q.type,
+        options: q.options, correctOptionId: q.correct_option_id, wordLimit: q.word_limit,
+        starterCode: q.starter_code, testCases: q.test_cases,
+      }));
     } else {
       const codeRes = await pool.query(
         'SELECT language, code FROM starter_code WHERE problem_id = $1',
@@ -4307,13 +4500,18 @@ app.put('/api/admin/problems/:id', authenticateToken, requireAdminOrTeacher, asy
   const problemId = req.params.id;
   const { title, difficulty, description, starterCode = {}, testCases = [], opensAt = null, closesAt = null } = req.body;
   const subjectId = req.body.subjectId != null ? Number(req.body.subjectId) : null;
-  const questions = Array.isArray(req.body.questions)
-    ? req.body.questions.filter((q) => q && String(q.prompt || '').trim())
-    : [];
   const assignmentNo = String(req.body.assignmentNo || '').trim() || null;
 
   if (!title || !difficulty || !description) {
     return res.status(400).json({ error: 'Title, difficulty, and description are required' });
+  }
+
+  let questions = [];
+  try {
+    const rawQuestions = Array.isArray(req.body.questions) ? req.body.questions : [];
+    questions = rawQuestions.map((q, i) => normalizeScanAssignmentQuestion(q, i));
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
   }
 
   const client = await pool.connect();
@@ -4360,9 +4558,13 @@ app.put('/api/admin/problems/:id', authenticateToken, requireAdminOrTeacher, asy
       // AssignmentForm sends its payload (the whole question set at once).
       await client.query('DELETE FROM scan_assignment_questions WHERE problem_id = $1', [problemId]);
       for (let i = 0; i < questions.length; i++) {
+        const q = questions[i];
         await client.query(
-          `INSERT INTO scan_assignment_questions (problem_id, position, prompt, marks) VALUES ($1, $2, $3, $4)`,
-          [problemId, i, String(questions[i].prompt).trim(), Number(questions[i].marks) > 0 ? Number(questions[i].marks) : 1]
+          `INSERT INTO scan_assignment_questions (problem_id, position, prompt, marks, type, options, correct_option_id, word_limit, starter_code, test_cases)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          [problemId, i, q.prompt, q.marks, q.type,
+            q.options ? JSON.stringify(q.options) : null, q.correctOptionId, q.wordLimit,
+            q.starterCode ? JSON.stringify(q.starterCode) : null, q.testCases ? JSON.stringify(q.testCases) : null]
         );
       }
       await client.query('COMMIT');
@@ -5138,6 +5340,60 @@ const EXAM_END_REASONS = new Set([
 // event that ended the exam, not just the bare end_reason string.
 const PROCTOR_END_REASONS = new Set(['violation_proctor_absence', 'violation_proctor_phone']);
 
+// Uploads the ONE compiled PDF covering every scan-type item's captured
+// pages for this attempt — a separate route from POST /submit below
+// (rather than folding the file into that one) because /submit is also
+// what the pagehide/beforeunload keepalive beacon hits, and a beacon can't
+// realistically carry a multi-page scan through an interactive camera
+// flow. The frontend calls this first, while the attempt is still
+// in_progress (right after the on-screen items are answered but before
+// the real ending submit), then calls /submit as normal straight after.
+app.post('/api/exams/:id/scan-submit', authenticateToken, scanUpload.single('file'), async (req, res) => {
+  const examId = req.params.id;
+  if (!req.file) return res.status(400).json({ error: 'A PDF file is required' });
+  if (!isB2Configured()) return res.status(503).json({ error: 'Scanned-assignment storage is not configured yet' });
+
+  try {
+    const attemptRes = await pool.query(
+      `SELECT id FROM exam_attempts WHERE exam_id = $1 AND user_id = $2 AND status = 'in_progress'`,
+      [examId, req.user.userId]
+    );
+    if (attemptRes.rows.length === 0) return res.status(404).json({ error: 'No in-progress attempt found for this exam' });
+    const attemptId = attemptRes.rows[0].id;
+
+    const scanItemsRes = await pool.query(`SELECT id FROM exam_items WHERE exam_id = $1 AND type = 'scan'`, [examId]);
+    if (scanItemsRes.rows.length === 0) return res.status(400).json({ error: 'This exam has no scanned items' });
+
+    const objectKey = examScanObjectKey(req.user.organizationId, examId, attemptId);
+    await uploadScanPdf(objectKey, req.file.buffer);
+    await pool.query(
+      `UPDATE exam_attempts SET scan_storage_key = $1, scan_status = 'pending' WHERE id = $2`,
+      [objectKey, attemptId]
+    );
+
+    // Pre-create the placeholder rows now (ai_assessment/marks NULL) so
+    // grading UI has something to show immediately, same as the /submit
+    // route's own belt-and-braces insert for whoever skips scanning
+    // entirely — ON CONFLICT DO NOTHING makes the two safe to overlap.
+    for (const item of scanItemsRes.rows) {
+      await pool.query(
+        `INSERT INTO exam_scan_answers (attempt_id, item_id) VALUES ($1, $2) ON CONFLICT (attempt_id, item_id) DO NOTHING`,
+        [attemptId, item.id]
+      );
+    }
+
+    if (isOcrConfigured() && !examScanOcrInFlight.has(attemptId)) {
+      examScanOcrInFlight.add(attemptId);
+      ocrLimit(() => processOneExamScanAttempt(attemptId)).finally(() => examScanOcrInFlight.delete(attemptId));
+    }
+
+    res.status(201).json({ status: 'pending' });
+  } catch (err) {
+    console.error('Exam scan submit error:', err);
+    res.status(500).json({ error: 'Failed to upload scanned pages' });
+  }
+});
+
 app.post('/api/exams/:id/submit', authenticateToken, async (req, res) => {
   const examId = req.params.id;
   const { reason, answers = [], detail = null } = req.body;
@@ -5159,6 +5415,20 @@ app.post('/api/exams/:id/submit', authenticateToken, async (req, res) => {
     const itemsRes = await pool.query('SELECT * FROM exam_items WHERE exam_id = $1', [examId]);
     const score = await finalizeExamAttempt(attemptId, itemsRes.rows, answers);
     await pool.query('UPDATE exam_attempts SET score = $1 WHERE id = $2', [score, attemptId]);
+
+    // Guarantees every scan-type item has an exam_scan_answers row (marks
+    // NULL until a teacher grades it) even if the student never actually
+    // scanned anything — see POST /api/exams/:id/scan-submit, called
+    // separately (and earlier, while still in_progress) for the actual PDF
+    // upload. ON CONFLICT DO NOTHING so a row that upload already created
+    // (with its ai_assessment already set) is never clobbered here.
+    const scanItems = itemsRes.rows.filter((it) => it.type === 'scan');
+    for (const item of scanItems) {
+      await pool.query(
+        `INSERT INTO exam_scan_answers (attempt_id, item_id) VALUES ($1, $2) ON CONFLICT (attempt_id, item_id) DO NOTHING`,
+        [attemptId, item.id]
+      );
+    }
 
     if (PROCTOR_END_REASONS.has(reason)) {
       const flagType = reason === 'violation_proctor_absence' ? 'face_absent' : 'phone_detected';
@@ -5220,6 +5490,8 @@ app.get('/api/exams/:id/result', authenticateToken, async (req, res) => {
               NOT EXISTS (
                 SELECT 1 FROM exam_answers ea JOIN exam_items ei ON ei.id = ea.item_id
                 WHERE ea.attempt_id = a.id AND ei.type IN ('short', 'long') AND ea.marks_awarded IS NULL
+              ) AND NOT EXISTS (
+                SELECT 1 FROM exam_scan_answers esa WHERE esa.attempt_id = a.id AND esa.marks_awarded IS NULL
               ) AS fully_graded
        FROM exam_attempts a WHERE a.exam_id = $1 AND a.status = 'submitted'`,
       [examId]
@@ -5242,6 +5514,9 @@ app.get('/api/exams/:id/result', authenticateToken, async (req, res) => {
          AND NOT EXISTS (
            SELECT 1 FROM exam_answers ea JOIN exam_items ei ON ei.id = ea.item_id
            WHERE ea.attempt_id = a.id AND ei.type IN ('short', 'long') AND ea.marks_awarded IS NULL
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM exam_scan_answers esa WHERE esa.attempt_id = a.id AND esa.marks_awarded IS NULL
          )
        GROUP BY a.user_id`,
       [req.user.organizationId]
@@ -5316,6 +5591,8 @@ app.get('/api/admin/exams/:id/attempts', authenticateToken, requireAdmin, async 
               NOT EXISTS (
                 SELECT 1 FROM exam_answers ea JOIN exam_items ei ON ei.id = ea.item_id
                 WHERE ea.attempt_id = a.id AND ei.type IN ('short', 'long') AND ea.marks_awarded IS NULL
+              ) AND NOT EXISTS (
+                SELECT 1 FROM exam_scan_answers esa WHERE esa.attempt_id = a.id AND esa.marks_awarded IS NULL
               ) AS fully_graded
        FROM exam_attempts a
        JOIN users u ON u.id = a.user_id
@@ -5395,7 +5672,42 @@ app.get('/api/admin/exam-attempts/:attemptId/answers', authenticateToken, requir
        ORDER BY ei.position ASC`,
       [req.params.attemptId, req.user.organizationId]
     );
-    res.status(200).json({ answers: result.rows });
+
+    // scan items live in a separate table (see exam_scan_answers' own
+    // comment) — folded into the same response so the grading UI doesn't
+    // need a second round trip. attemptScan is null for an attempt with no
+    // scan-type items at all (the common case — most exams have none).
+    const scanAnswersRes = await pool.query(
+      `SELECT esa.id AS answer_id, ei.id AS item_id, ei.type, ei.prompt, ei.marks,
+              esa.marks_awarded, esa.ai_assessment
+       FROM exam_scan_answers esa
+       JOIN exam_items ei ON ei.id = esa.item_id
+       JOIN exam_attempts a ON a.id = esa.attempt_id
+       JOIN exams e ON e.id = a.exam_id
+       WHERE esa.attempt_id = $1 AND e.organization_id = $2
+       ORDER BY ei.position ASC`,
+      [req.params.attemptId, req.user.organizationId]
+    );
+
+    let attemptScan = null;
+    if (scanAnswersRes.rows.length > 0) {
+      const attemptRes = await pool.query(
+        `SELECT a.scan_storage_key, a.scan_status, a.scan_ocr_text, a.scan_ocr_pages, a.scan_ocr_error
+         FROM exam_attempts a JOIN exams e ON e.id = a.exam_id
+         WHERE a.id = $1 AND e.organization_id = $2`,
+        [req.params.attemptId, req.user.organizationId]
+      );
+      const row = attemptRes.rows[0];
+      attemptScan = row && {
+        status: row.scan_storage_key ? (row.scan_status || 'pending') : null,
+        ocrText: row.scan_ocr_text,
+        ocrPages: row.scan_ocr_pages,
+        ocrError: row.scan_ocr_error,
+        viewUrl: row.scan_storage_key && isB2Configured() ? await getScanPdfUrl(row.scan_storage_key) : null,
+      };
+    }
+
+    res.status(200).json({ answers: result.rows, scanAnswers: scanAnswersRes.rows, attemptScan });
   } catch (err) {
     console.error('List exam answers error:', err);
     res.status(500).json({ error: 'Failed to load answers' });
@@ -5429,18 +5741,75 @@ app.put('/api/admin/exam-answers/:answerId/grade', authenticateToken, requireAdm
 
     await pool.query('UPDATE exam_answers SET marks_awarded = $1 WHERE id = $2', [Math.round(marksAwarded), answer.id]);
 
-    const scoreRes = await pool.query(
-      'SELECT COALESCE(SUM(marks_awarded), 0) AS score FROM exam_answers WHERE attempt_id = $1',
-      [answer.attempt_id]
-    );
-    const score = scoreRes.rows[0].score;
-    await pool.query('UPDATE exam_attempts SET score = $1 WHERE id = $2', [score, answer.attempt_id]);
-
+    const score = await recomputeExamAttemptScore(answer.attempt_id);
     const fullyGraded = await isAttemptFullyGraded(answer.attempt_id);
     res.status(200).json({ score, fullyGraded });
   } catch (err) {
     console.error('Grade exam answer error:', err);
     res.status(500).json({ error: 'Failed to save grade' });
+  }
+});
+
+// Admin: manually award marks for one scan item's answer. Every row in
+// exam_scan_answers is inherently a scan-type item by construction (see
+// POST /api/exams/:id/submit / scan-submit), so there's no type check to
+// make here the way the short/long route above needs one.
+app.put('/api/admin/exam-scan-answers/:answerId/grade', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const answerRes = await pool.query(
+      `SELECT esa.id, esa.attempt_id, ei.marks
+       FROM exam_scan_answers esa
+       JOIN exam_items ei ON ei.id = esa.item_id
+       JOIN exam_attempts a ON a.id = esa.attempt_id
+       JOIN exams e ON e.id = a.exam_id
+       WHERE esa.id = $1 AND e.organization_id = $2`,
+      [req.params.answerId, req.user.organizationId]
+    );
+    if (answerRes.rows.length === 0) return res.status(404).json({ error: 'Answer not found' });
+
+    const answer = answerRes.rows[0];
+    const marksAwarded = Number(req.body.marksAwarded);
+    if (!Number.isFinite(marksAwarded) || marksAwarded < 0 || marksAwarded > answer.marks) {
+      return res.status(400).json({ error: `Marks must be between 0 and ${answer.marks}` });
+    }
+
+    await pool.query('UPDATE exam_scan_answers SET marks_awarded = $1 WHERE id = $2', [Math.round(marksAwarded), answer.id]);
+
+    const score = await recomputeExamAttemptScore(answer.attempt_id);
+    const fullyGraded = await isAttemptFullyGraded(answer.attempt_id);
+    res.status(200).json({ score, fullyGraded });
+  } catch (err) {
+    console.error('Grade exam scan answer error:', err);
+    res.status(500).json({ error: 'Failed to save grade' });
+  }
+});
+
+// Manually triggers OCR for one exam attempt's scanned pages right now,
+// instead of waiting — mirrors POST /api/admin/scan-submissions/:id/process
+// for assignments. Exams have no shared deadline sweep to wait on in the
+// first place (see processOneExamScanAttempt's own comment), so this is
+// really just for retrying an ocr_failed attempt.
+app.post('/api/admin/exam-attempts/:attemptId/process-scan', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const attemptRes = await pool.query(
+      `SELECT a.id, a.scan_storage_key FROM exam_attempts a JOIN exams e ON e.id = a.exam_id
+       WHERE a.id = $1 AND e.organization_id = $2`,
+      [req.params.attemptId, req.user.organizationId]
+    );
+    if (attemptRes.rows.length === 0) return res.status(404).json({ error: 'Attempt not found' });
+    if (!attemptRes.rows[0].scan_storage_key) return res.status(400).json({ error: 'No scanned pages were submitted for this attempt' });
+    if (!isB2Configured()) return res.status(503).json({ error: 'Scanned-assignment storage is not configured yet' });
+    if (!isOcrConfigured()) return res.status(503).json({ error: 'OCR is not configured yet' });
+
+    const attemptId = attemptRes.rows[0].id;
+    if (examScanOcrInFlight.has(attemptId)) return res.status(409).json({ error: 'Already processing' });
+
+    examScanOcrInFlight.add(attemptId);
+    ocrLimit(() => processOneExamScanAttempt(attemptId)).finally(() => examScanOcrInFlight.delete(attemptId));
+    res.status(202).json({ status: 'processing' });
+  } catch (err) {
+    console.error('Manual exam scan OCR trigger error:', err);
+    res.status(500).json({ error: 'Failed to start OCR' });
   }
 });
 
@@ -5487,10 +5856,27 @@ app.get('/api/me/scan-context', authenticateToken, async (req, res) => {
     // Shown to the student before the camera opens (see ScanCapture.jsx's
     // pre-scan questions screen) — they should know what's being asked
     // before they start scanning, not find out by re-reading a paper copy.
+    // Also what actually drives the on-screen answer form for mcq/short/
+    // long/coding items — same sanitization posture as exam_items' own
+    // GET /api/exams/:id/start (hidden test cases and correct_option_id
+    // never leave the server).
     const questionsRes = await pool.query(
-      'SELECT prompt, marks FROM scan_assignment_questions WHERE problem_id = $1 ORDER BY position ASC',
+      `SELECT id, prompt, marks, type, options, word_limit, starter_code, test_cases
+       FROM scan_assignment_questions WHERE problem_id = $1 ORDER BY position ASC`,
       [problemId]
     );
+    const questions = questionsRes.rows.map((q) => {
+      const base = { id: q.id, type: q.type, marks: q.marks, prompt: q.prompt };
+      if (q.type === 'mcq') return { ...base, options: q.options };
+      if (q.type === 'short' || q.type === 'long') return { ...base, wordLimit: q.word_limit };
+      if (q.type === 'coding') {
+        const samples = Array.isArray(q.test_cases)
+          ? q.test_cases.filter((tc) => !tc.isHidden).map((tc) => ({ input: tc.input, expected_output: tc.expectedOutput }))
+          : [];
+        return { ...base, starterCode: q.starter_code || {}, samples };
+      }
+      return base; // scan
+    });
 
     res.status(200).json({
       studentName: name || null,
@@ -5498,7 +5884,7 @@ app.get('/api/me/scan-context', authenticateToken, async (req, res) => {
       rollNumber: rollNumber || null,
       assignmentNo: problemRes.rows[0].assignment_no,
       subjectName: problemRes.rows[0].subject_name || null,
-      questions: questionsRes.rows.map((q) => ({ prompt: q.prompt, marks: q.marks })),
+      questions,
     });
   } catch (err) {
     console.error('Scan context error:', err);
@@ -5517,9 +5903,68 @@ app.get('/api/me/scan-context', authenticateToken, async (req, res) => {
 // work. Responds as soon as the upload completes; the frontend can poll
 // GET /api/scan-submissions/:id/status, which for now will just always
 // read back 'pending' — accurate given nothing progresses it yet.
+// Grades every digital (mcq/short/long/coding) answer against a scan-mode
+// assignment's questions, upserting one scan_submission_answers row per
+// question — the scan-mode counterpart to finalizeExamAttempt, same
+// mcq-exact/coding-partial-credit/short-long-manual split. scan-type
+// questions are never touched here (see the OCR pipeline instead — every
+// scan item in the assignment shares the ONE compiled PDF this route
+// stores, not a per-item row this function would create).
+async function finalizeScanSubmissionDigitalAnswers(submissionId, questions, answers) {
+  const questionsById = new Map(questions.map((q) => [q.id, q]));
+
+  for (const ans of answers || []) {
+    const q = questionsById.get(Number(ans.questionId));
+    if (!q || q.type === 'scan') continue;
+
+    let row = {
+      selected_option_id: null, text_answer: null, language: null, code: null,
+      is_correct: null, passed_count: null, total_count: null, marks_awarded: null,
+    };
+
+    if (q.type === 'mcq') {
+      const selected = ans.selectedOptionId != null ? String(ans.selectedOptionId) : null;
+      const correct = selected != null && selected === q.correct_option_id;
+      row.selected_option_id = selected;
+      row.is_correct = correct;
+      row.marks_awarded = correct ? q.marks : 0;
+    } else if (q.type === 'short' || q.type === 'long') {
+      row.text_answer = ans.textAnswer != null ? String(ans.textAnswer) : null;
+    } else if (q.type === 'coding') {
+      const language = ans.language || null;
+      const code = ans.code != null ? String(ans.code) : '';
+      let passedCount = 0;
+      let totalCount = 0;
+      try {
+        const testCases = Array.isArray(q.test_cases)
+          ? q.test_cases.map((tc) => ({ input: tc.input, expected_output: tc.expectedOutput }))
+          : [];
+        ({ passedCount, totalCount } = await gradeCodingAnswer(testCases, language, code));
+      } catch (err) {
+        console.error('Scan assignment coding answer grading error:', err);
+      }
+      row.language = language;
+      row.code = code;
+      row.passed_count = passedCount;
+      row.total_count = totalCount;
+      row.marks_awarded = totalCount > 0 ? Math.round((q.marks * passedCount) / totalCount) : 0;
+    }
+
+    await pool.query(
+      `INSERT INTO scan_submission_answers (submission_id, question_id, selected_option_id, text_answer, language, code, is_correct, passed_count, total_count, marks_awarded)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       ON CONFLICT (submission_id, question_id) DO UPDATE SET
+         selected_option_id = EXCLUDED.selected_option_id, text_answer = EXCLUDED.text_answer,
+         language = EXCLUDED.language, code = EXCLUDED.code, is_correct = EXCLUDED.is_correct,
+         passed_count = EXCLUDED.passed_count, total_count = EXCLUDED.total_count, marks_awarded = EXCLUDED.marks_awarded`,
+      [submissionId, q.id, row.selected_option_id, row.text_answer, row.language, row.code,
+        row.is_correct, row.passed_count, row.total_count, row.marks_awarded]
+    );
+  }
+}
+
 app.post('/api/problems/:id/scan-submit', authenticateToken, scanUpload.single('file'), async (req, res) => {
   const problemId = req.params.id;
-  if (!req.file) return res.status(400).json({ error: 'A PDF file is required' });
   if (!isB2Configured()) return res.status(503).json({ error: 'Scanned-assignment storage is not configured yet' });
 
   try {
@@ -5534,6 +5979,24 @@ app.post('/api/problems/:id/scan-submit', authenticateToken, scanUpload.single('
     const status = getProblemStatus(problemRes.rows[0]);
     if (status !== 'open' && req.user.role !== 'admin') {
       return res.status(403).json({ error: status === 'upcoming' ? 'This assignment is not open yet' : 'This assignment is closed' });
+    }
+
+    const questionsRes = await pool.query(
+      'SELECT * FROM scan_assignment_questions WHERE problem_id = $1 ORDER BY position ASC',
+      [problemId]
+    );
+    const questions = questionsRes.rows;
+    const hasScanQuestions = questions.some((q) => q.type === 'scan');
+    if (hasScanQuestions && !req.file) return res.status(400).json({ error: 'A PDF file is required' });
+
+    let answers = [];
+    if (req.body.answers) {
+      try {
+        answers = JSON.parse(req.body.answers);
+        if (!Array.isArray(answers)) answers = [];
+      } catch {
+        return res.status(400).json({ error: 'Invalid answers payload' });
+      }
     }
 
     // A student can resubmit as many times as they like before the
@@ -5559,18 +6022,27 @@ app.post('/api/problems/:id/scan-submit', authenticateToken, scanUpload.single('
     }
 
     const filename = String(req.body.filename || 'scan.pdf').trim();
+    // No scan-type questions at all -> nothing ever needs OCR, so this
+    // starts (and stays) 'ocr_done' rather than 'pending' — otherwise the
+    // deadline sweep would try to download/OCR a storage_key that was
+    // never actually uploaded.
+    const initialStatus = hasScanQuestions ? 'pending' : 'ocr_done';
     const insertRes = await pool.query(
       `INSERT INTO scan_submissions (problem_id, user_id, storage_key, original_filename, status)
-       VALUES ($1, $2, '', $3, 'pending') RETURNING id`,
-      [problemId, req.user.userId, filename]
+       VALUES ($1, $2, '', $3, $4) RETURNING id`,
+      [problemId, req.user.userId, filename, initialStatus]
     );
     const submissionId = insertRes.rows[0].id;
-    const objectKey = scanObjectKey(req.user.organizationId, problemId, submissionId);
 
-    await uploadScanPdf(objectKey, req.file.buffer);
-    await pool.query('UPDATE scan_submissions SET storage_key = $1 WHERE id = $2', [objectKey, submissionId]);
+    if (req.file) {
+      const objectKey = scanObjectKey(req.user.organizationId, problemId, submissionId);
+      await uploadScanPdf(objectKey, req.file.buffer);
+      await pool.query('UPDATE scan_submissions SET storage_key = $1 WHERE id = $2', [objectKey, submissionId]);
+    }
 
-    res.status(201).json({ submissionId, status: 'pending' });
+    await finalizeScanSubmissionDigitalAnswers(submissionId, questions, answers);
+
+    res.status(201).json({ submissionId, status: initialStatus });
   } catch (err) {
     console.error('Scan submit error:', err);
     res.status(500).json({ error: 'Failed to upload scanned submission' });
@@ -5612,12 +6084,14 @@ app.get('/api/me/scan-submission', authenticateToken, async (req, res) => {
     if (result.rows.length === 0) return res.status(200).json({ submission: null });
 
     const row = result.rows[0];
-    const viewUrl = isB2Configured() ? await getScanPdfUrl(row.storage_key) : null;
+    const viewUrl = row.storage_key && isB2Configured() ? await getScanPdfUrl(row.storage_key) : null;
 
     // Only shown once every question has actually been graded — a partial
-    // grade-in-progress isn't a result yet, and marks_awarded IS NULL for
-    // every question until a teacher enters something (see
-    // PUT /api/admin/scan-submissions/:id/grade).
+    // grade-in-progress isn't a result yet. mcq/coding questions get their
+    // marks_awarded set automatically at submit time (see
+    // finalizeScanSubmissionDigitalAnswers); scan/short/long stay NULL
+    // until a teacher enters something via PUT
+    // /api/admin/scan-submissions/:id/grade.
     const answersRes = await pool.query(
       `SELECT q.prompt, q.marks AS max_marks, sa.marks_awarded
        FROM scan_assignment_questions q
@@ -5689,7 +6163,7 @@ app.get('/api/admin/problems/:id/scan-submissions', authenticateToken, requireAd
       totalMarks,
       awardedMarks: row.penalized ? 0 : Number(row.awarded_marks),
       fullyGraded: Number(row.graded_count) === Number(row.question_count) && Number(row.question_count) > 0,
-      viewUrl: configured ? await getScanPdfUrl(row.storage_key) : null,
+      viewUrl: configured && row.storage_key ? await getScanPdfUrl(row.storage_key) : null,
     })));
 
     res.status(200).json({ submissions });
@@ -5824,8 +6298,12 @@ async function processOneScanSubmission(submissionId) {
     const { pages, handwriting_features: handwritingFeatures } = await runOcr(pdfBuffer);
     const ocrText = pages.map((p) => p.text).join('\n\n');
 
+    // Only scan-type questions — mcq/short/long/coding ones are already
+    // graded (or left for manual short/long grading) at submit time by
+    // finalizeScanSubmissionDigitalAnswers, and OCR/AI-assessing them
+    // would be nonsensical.
     const questionsRes = await client.query(
-      'SELECT id, prompt, marks FROM scan_assignment_questions WHERE problem_id = $1 ORDER BY position ASC',
+      `SELECT id, prompt, marks FROM scan_assignment_questions WHERE problem_id = $1 AND type = 'scan' ORDER BY position ASC`,
       [submission.problem_id]
     );
     const questions = questionsRes.rows;
@@ -5865,12 +6343,74 @@ async function processOneScanSubmission(submissionId) {
   }
 }
 
+// Exam-side counterpart to processOneScanSubmission above — same shape,
+// except there's no shared deadline sweep to wait on: each student's own
+// submit is what ends their attempt, so this runs immediately from
+// POST /api/exams/:id/submit rather than a periodic sweep. Doesn't run the
+// cross-submission plagiarism/handwriting comparators scan_submissions
+// gets — those compare many students against each other on the SAME
+// assignment/deadline, a feature this exam-scan path deliberately doesn't
+// take on; OCR + teacher grading is the whole scope here.
+async function processOneExamScanAttempt(attemptId) {
+  const client = await pool.connect();
+  try {
+    await client.query(`UPDATE exam_attempts SET scan_status = 'processing' WHERE id = $1`, [attemptId]);
+
+    const attemptRes = await client.query('SELECT id, exam_id, scan_storage_key FROM exam_attempts WHERE id = $1', [attemptId]);
+    if (attemptRes.rows.length === 0) return;
+    const attempt = attemptRes.rows[0];
+
+    if (!isB2Configured()) throw new Error('B2 storage is not configured');
+    if (!isOcrConfigured()) throw new Error('OCR is not configured');
+
+    const pdfBuffer = await downloadScanPdf(attempt.scan_storage_key);
+    const { pages } = await runOcr(pdfBuffer);
+    const ocrText = pages.map((p) => p.text).join('\n\n');
+
+    const itemsRes = await client.query(
+      `SELECT id, prompt, marks FROM exam_items WHERE exam_id = $1 AND type = 'scan' ORDER BY position ASC`,
+      [attempt.exam_id]
+    );
+    const items = itemsRes.rows;
+
+    // Best-effort — an AI-assessment hiccup shouldn't block OCR text from
+    // being saved and the attempt from becoming teacher-gradable.
+    const assessments = isGroqConfigured()
+      ? await assessAnswers(items.map((it) => ({ prompt: it.prompt, marks: it.marks })), ocrText)
+      : items.map(() => 'AI assessment unavailable (Groq not configured).');
+
+    for (let i = 0; i < items.length; i++) {
+      await client.query(
+        `INSERT INTO exam_scan_answers (attempt_id, item_id, ai_assessment)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (attempt_id, item_id) DO UPDATE SET ai_assessment = EXCLUDED.ai_assessment`,
+        [attemptId, items[i].id, assessments[i] || null]
+      );
+    }
+
+    await client.query(
+      `UPDATE exam_attempts SET scan_ocr_text = $1, scan_ocr_pages = $2,
+         scan_status = 'ocr_done', scan_ocr_completed_at = now(), scan_ocr_error = NULL WHERE id = $3`,
+      [ocrText, JSON.stringify(pages), attemptId]
+    );
+  } catch (err) {
+    console.error(`Exam scan OCR pipeline failed for attempt ${attemptId}:`, err);
+    await client.query(
+      `UPDATE exam_attempts SET scan_status = 'ocr_failed', scan_ocr_error = $1 WHERE id = $2`,
+      [String(err.message || err).slice(0, 500), attemptId]
+    ).catch(() => {});
+  } finally {
+    client.release();
+  }
+}
+
 // Runs at most OCR_CONCURRENCY submissions at once, modest by default so a
 // deadline shared by many students doesn't hammer the free OCR Space all at
 // once — same pLimit pattern as sandboxLimit above, just a separate limiter
 // since these are unrelated resource pools.
 const ocrLimit = pLimit(Number(process.env.OCR_CONCURRENCY || 2));
 const scanOcrInFlight = new Set();
+const examScanOcrInFlight = new Set();
 
 async function sweepScanSubmissions() {
   try {
@@ -5917,7 +6457,9 @@ app.get('/api/admin/scan-submissions/:id', authenticateToken, requireAdmin, asyn
     const submission = subRes.rows[0];
 
     const answersRes = await pool.query(
-      `SELECT q.id AS question_id, q.position, q.prompt, q.marks AS max_marks, sa.ai_assessment, sa.marks_awarded
+      `SELECT q.id AS question_id, q.position, q.prompt, q.marks AS max_marks, q.type, q.options,
+              sa.ai_assessment, sa.marks_awarded, sa.selected_option_id, sa.text_answer,
+              sa.is_correct, sa.language, sa.code, sa.passed_count, sa.total_count
        FROM scan_assignment_questions q
        LEFT JOIN scan_submission_answers sa ON sa.question_id = q.id AND sa.submission_id = $1
        WHERE q.problem_id = $2
@@ -5944,13 +6486,22 @@ app.get('/api/admin/scan-submissions/:id', authenticateToken, requireAdmin, asyn
       penalized: submission.penalized,
       createdAt: submission.created_at,
       pages: submission.ocr_pages || [],
-      viewUrl: configured ? await getScanPdfUrl(submission.storage_key) : null,
+      viewUrl: configured && submission.storage_key ? await getScanPdfUrl(submission.storage_key) : null,
       questions: answersRes.rows.map((r) => ({
         questionId: r.question_id,
         prompt: r.prompt,
         maxMarks: r.max_marks,
+        type: r.type,
+        options: r.options,
         aiAssessment: r.ai_assessment,
         marksAwarded: r.marks_awarded,
+        selectedOptionId: r.selected_option_id,
+        textAnswer: r.text_answer,
+        isCorrect: r.is_correct,
+        language: r.language,
+        code: r.code,
+        passedCount: r.passed_count,
+        totalCount: r.total_count,
       })),
       flags: flagsRes.rows.map((f) => ({
         id: f.id,
@@ -6084,16 +6635,37 @@ app.put('/api/admin/scan-submissions/:id/grade', authenticateToken, requireAdmin
 
   try {
     const subRes = await pool.query(
-      `SELECT ss.id FROM scan_submissions ss JOIN problems p ON p.id = ss.problem_id
+      `SELECT ss.id, ss.problem_id FROM scan_submissions ss JOIN problems p ON p.id = ss.problem_id
        WHERE ss.id = $1 AND p.organization_id = $2`,
       [req.params.id, req.user.organizationId]
     );
     if (subRes.rows.length === 0) return res.status(404).json({ error: 'Submission not found' });
 
+    // Max marks per question — validated against below so a teacher can't
+    // award more than a question is actually worth (previously unchecked
+    // entirely; only the exam-side grading routes enforced this).
+    const questionsRes = await pool.query(
+      'SELECT id, marks FROM scan_assignment_questions WHERE problem_id = $1',
+      [subRes.rows[0].problem_id]
+    );
+    const maxMarksById = new Map(questionsRes.rows.map((q) => [q.id, q.marks]));
+
+    const updates = [];
     for (const entry of marks) {
       const questionId = Number(entry.questionId);
       const marksAwarded = entry.marksAwarded === null || entry.marksAwarded === '' ? null : Number(entry.marksAwarded);
       if (!questionId || Number.isNaN(marksAwarded)) continue;
+      if (marksAwarded !== null) {
+        const maxMarks = maxMarksById.get(questionId);
+        if (maxMarks === undefined) return res.status(400).json({ error: `Question ${questionId} does not belong to this assignment` });
+        if (marksAwarded < 0 || marksAwarded > maxMarks) {
+          return res.status(400).json({ error: `Marks for "${questionId}" must be between 0 and ${maxMarks}` });
+        }
+      }
+      updates.push({ questionId, marksAwarded });
+    }
+
+    for (const { questionId, marksAwarded } of updates) {
       await pool.query(
         `INSERT INTO scan_submission_answers (submission_id, question_id, marks_awarded)
          VALUES ($1, $2, $3)

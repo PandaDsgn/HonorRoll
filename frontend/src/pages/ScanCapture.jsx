@@ -2,48 +2,33 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import axios from 'axios';
 import jscanify from 'jscanify/client';
-import { jsPDF } from 'jspdf';
+import CodeMirror from '@uiw/react-codemirror';
+import { python } from '@codemirror/lang-python';
+import { cpp } from '@codemirror/lang-cpp';
+import { java } from '@codemirror/lang-java';
 import { useTheme } from '../hooks/useTheme';
 import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
+import {
+  PAGE_WIDTH, PAGE_HEIGHT, loadOpenCv, buildPdfBlob, fallbackCorners,
+  detectCorners, detectCornersForPreview, applyScanFilter,
+} from '../lib/scanCaptureCore';
+import { CornerEditor, ReviewScreen } from '../components/ScanCaptureShared';
 import { API } from '../config';
 import './ScanCapture.css';
+import '../Exam.css';
 
-// A4 at ~150dpi — a reasonable balance between OCR-legible resolution and
-// file size for a multi-page scanned answer sheet.
-const PAGE_WIDTH = 1240;
-const PAGE_HEIGHT = 1754;
-
-const CORNER_KEYS = ['topLeftCorner', 'topRightCorner', 'bottomRightCorner', 'bottomLeftCorner'];
-
-// jscanify needs opencv.js's global `cv` before any of its methods run.
-// opencv.js itself (~9MB, WASM) is deliberately NOT bundled — loaded from
-// CDN on demand, same pattern as loadRazorpayScript in BillingPanel.jsx.
-// Unlike a plain script load, `cv` existing after script.onload doesn't
-// mean it's ready — the WASM binary is still compiling asynchronously at
-// that point, so this also waits on cv.onRuntimeInitialized before resolving.
-const OPENCV_SRC = 'https://docs.opencv.org/4.7.0/opencv.js';
-function loadOpenCv() {
-  return new Promise((resolve, reject) => {
-    if (window.cv?.Mat) return resolve();
-    const onScriptLoaded = () => {
-      if (window.cv?.Mat) return resolve();
-      window.cv['onRuntimeInitialized'] = resolve;
-    };
-    const existing = document.querySelector(`script[src="${OPENCV_SRC}"]`);
-    if (existing) {
-      if (window.cv) onScriptLoaded();
-      else existing.addEventListener('load', onScriptLoaded);
-      existing.addEventListener('error', () => reject(new Error('Failed to load the scanner engine')));
-      return;
-    }
-    const script = document.createElement('script');
-    script.src = OPENCV_SRC;
-    script.async = true;
-    script.onload = onScriptLoaded;
-    script.onerror = () => reject(new Error('Failed to load the scanner engine'));
-    document.body.appendChild(script);
-  });
+const CODING_LANGUAGES = [
+  { id: 'python', label: 'Python' },
+  { id: 'c', label: 'C' },
+  { id: 'cpp', label: 'C++' },
+  { id: 'java', label: 'Java' },
+];
+function getLanguageExtension(language) {
+  if (language === 'python') return [python()];
+  if (language === 'c' || language === 'cpp') return [cpp()];
+  if (language === 'java') return [java()];
+  return [];
 }
 
 function formatScanDate(iso) {
@@ -68,272 +53,6 @@ function buildFilename(ctx) {
   return `${parts.join('_')}.pdf`;
 }
 
-function buildPdfBlob(pageDataUrls) {
-  const doc = new jsPDF({ unit: 'px', format: [PAGE_WIDTH, PAGE_HEIGHT] });
-  pageDataUrls.forEach((dataUrl, i) => {
-    if (i > 0) doc.addPage([PAGE_WIDTH, PAGE_HEIGHT]);
-    doc.addImage(dataUrl, 'JPEG', 0, 0, PAGE_WIDTH, PAGE_HEIGHT);
-  });
-  return doc.output('blob');
-}
-
-function fallbackCorners(width, height) {
-  return {
-    topLeftCorner: { x: 0, y: 0 },
-    topRightCorner: { x: width, y: 0 },
-    bottomLeftCorner: { x: 0, y: height },
-    bottomRightCorner: { x: width, y: height },
-  };
-}
-
-// Runs jscanify's own contour detection standalone (not via
-// highlightPaper/extractPaper, which do this internally but don't expose
-// the result). Manages opencv.js Mat memory manually (.delete()) since
-// these are WASM-backed objects the JS garbage collector doesn't know
-// about — a real detection pipeline that leaks Mats will exhaust WASM heap
-// after enough captures.
-//
-// No area/plausibility filtering here — this raw result is what seeds the
-// corner editor after a capture, and ANY detected quad (even an uncertain,
-// smaller-than-ideal one) is a far better starting point for a quick manual
-// nudge than forcing the student to drag all four corners in from the
-// extreme frame edges. An earlier version filtered out small detections
-// here too (reusing the same gate as the live-preview highlight, see
-// detectCornersForPreview below) and that's what caused real background
-// to end up in a submitted page — the filter rejected a valid-but-modest
-// detection, fell back to full-frame corners, and the resulting "drag from
-// scratch" task was too imprecise to do reliably on a phone screen.
-function detectCorners(scanner, canvas) {
-  const img = window.cv.imread(canvas);
-  try {
-    const contour = scanner.findPaperContour(img);
-    if (!contour) return null;
-    const corners = scanner.getCornerPoints(contour);
-    contour.delete();
-    const { topLeftCorner, topRightCorner, bottomLeftCorner, bottomRightCorner } = corners;
-    if (!topLeftCorner || !topRightCorner || !bottomLeftCorner || !bottomRightCorner) return null;
-    return corners;
-  } finally {
-    img.delete();
-  }
-}
-
-// Shoelace formula — polygon area from the 4 corner points directly, so the
-// live-preview area gate below doesn't need to keep the opencv contour
-// object alive just to call cv.contourArea() on it.
-function quadArea(corners) {
-  const pts = [corners.topLeftCorner, corners.topRightCorner, corners.bottomRightCorner, corners.bottomLeftCorner];
-  let area = 0;
-  for (let i = 0; i < 4; i++) {
-    const p1 = pts[i];
-    const p2 = pts[(i + 1) % 4];
-    area += p1.x * p2.y - p2.x * p1.y;
-  }
-  return Math.abs(area / 2);
-}
-
-// jscanify's findPaperContour() just picks the single LARGEST contour by
-// area with no other sanity check — a strong specular highlight/reflection
-// on glossy paper, or a graphic/text block with sharp internal edges, can
-// register as a "stronger" contour than the actual page-vs-background
-// boundary, especially against a plain light-colored desk. This gate is
-// ONLY applied to the live-preview highlight (where confidently drawing a
-// box around noise is worse than showing nothing) — NOT to the capture-seed
-// path above, which needs a starting guess even when it's an uncertain one.
-const MIN_PAPER_AREA_RATIO = 0.2;
-function detectCornersForPreview(scanner, canvas) {
-  const corners = detectCorners(scanner, canvas);
-  if (!corners) return null;
-  const frameArea = canvas.width * canvas.height;
-  return quadArea(corners) >= frameArea * MIN_PAPER_AREA_RATIO ? corners : null;
-}
-
-// Turns a perspective-corrected color photo into the flat, bright-white-
-// background/vivid-ink look real scanner apps (Adobe Scan's "Color" mode)
-// produce — CLAHE alone (an earlier version of this function) only sharpens
-// LOCAL contrast, it never actually drives the page background toward true
-// white, so the result still reads as "a photo of paper," just a punchier
-// one. This is the standard technique for that: estimate the page's own
-// lighting via a heavy blur (large enough to smooth over both gradual
-// falloff and any localized glare/reflection, far larger than a line of
-// text), then divide the image by that estimate so every pixel gets
-// rescaled toward how it would look under perfectly even lighting — the
-// background converges on TARGET regardless of how unevenly it was
-// actually lit, and ink darkens by comparison. The SAME per-pixel
-// correction factor is applied to R, G, and B alike, which is what keeps
-// color/hue intact (only brightness is being normalized) rather than
-// draining it out the way full grayscale+threshold binarization did.
-function applyScanFilter(canvas) {
-  const cv = window.cv;
-  const TARGET = 248; // near-pure-white target for the normalized background
-  const src = cv.imread(canvas);
-  const rgb = new cv.Mat();
-  const gray = new cv.Mat();
-  const background = new cv.Mat();
-  const bgFloat = new cv.Mat();
-  const targetMat = new cv.Mat(canvas.height, canvas.width, cv.CV_32F, new cv.Scalar(TARGET));
-  const factor = new cv.Mat();
-  const factorChannels = new cv.MatVector();
-  const factorMerged = new cv.Mat();
-  const rgbFloat = new cv.Mat();
-  const correctedFloat = new cv.Mat();
-  const corrected8u = new cv.Mat();
-  try {
-    cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB);
-    cv.cvtColor(rgb, gray, cv.COLOR_RGB2GRAY);
-
-    let kSize = Math.round(Math.min(rgb.cols, rgb.rows) / 8);
-    if (kSize % 2 === 0) kSize += 1;
-    if (kSize < 3) kSize = 3;
-    cv.GaussianBlur(gray, background, new cv.Size(kSize, kSize), 0, 0, cv.BORDER_DEFAULT);
-
-    background.convertTo(bgFloat, cv.CV_32F);
-    cv.divide(targetMat, bgFloat, factor); // factor = TARGET / local background
-    factorChannels.push_back(factor);
-    factorChannels.push_back(factor);
-    factorChannels.push_back(factor);
-    cv.merge(factorChannels, factorMerged);
-
-    rgb.convertTo(rgbFloat, cv.CV_32FC3);
-    cv.multiply(rgbFloat, factorMerged, correctedFloat);
-    // convertTo down to 8-bit saturate-casts automatically — out-of-range
-    // values clamp to [0,255] with no separate clamping step needed.
-    correctedFloat.convertTo(corrected8u, cv.CV_8UC3);
-    cv.imshow(canvas, corrected8u);
-  } finally {
-    src.delete();
-    rgb.delete();
-    gray.delete();
-    background.delete();
-    bgFloat.delete();
-    targetMat.delete();
-    factor.delete();
-    factorChannels.delete();
-    factorMerged.delete();
-    rgbFloat.delete();
-    correctedFloat.delete();
-    corrected8u.delete();
-  }
-  return canvas;
-}
-
-// Draggable-corner crop editor for one just-captured raw frame. Detection
-// is "hardly 6/10" in practice (a fixed Canny/threshold pipeline can't
-// adapt to every lighting/paper/background combination), so every capture
-// goes through this instead of trusting the auto-detected quadrilateral
-// outright — the same corners jscanify's own extractPaper would have used
-// are shown as draggable handles, pre-positioned at its best guess, and the
-// student can nudge them before the actual perspective-warp crop happens.
-function CornerEditor({ rawFrameUrl, initialCorners, onConfirm, onRetake }) {
-  const [corners, setCorners] = useState(initialCorners);
-  // Rendered container width + the image's native resolution — tracked as
-  // state (not read from refs during render, which React's rules forbid as
-  // an impure render) and used to derive `scale`, the ratio between the
-  // native pixel coordinates corner points are stored in and the CSS pixels
-  // the image is actually displayed at.
-  const [containerWidth, setContainerWidth] = useState(0);
-  const [naturalSize, setNaturalSize] = useState({ width: 0, height: 0 });
-  const imgRef = useRef(null);
-  const containerRef = useRef(null);
-  const draggingRef = useRef(null);
-
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return undefined;
-    const observer = new ResizeObserver((entries) => setContainerWidth(entries[0].contentRect.width));
-    observer.observe(container);
-    return () => observer.disconnect();
-  }, []);
-
-  useEffect(() => {
-    const handleMove = (e) => {
-      const key = draggingRef.current;
-      const container = containerRef.current;
-      if (!key || !container || !naturalSize.width) return;
-      const rect = container.getBoundingClientRect();
-      const scale = rect.width / naturalSize.width;
-      const point = 'touches' in e ? e.touches[0] : e;
-      const x = Math.max(0, Math.min(naturalSize.width, (point.clientX - rect.left) / scale));
-      const y = Math.max(0, Math.min(naturalSize.height, (point.clientY - rect.top) / scale));
-      setCorners((prev) => ({ ...prev, [key]: { x, y } }));
-    };
-    const handleUp = () => { draggingRef.current = null; };
-    window.addEventListener('pointermove', handleMove);
-    window.addEventListener('pointerup', handleUp);
-    return () => {
-      window.removeEventListener('pointermove', handleMove);
-      window.removeEventListener('pointerup', handleUp);
-    };
-  }, [naturalSize]);
-
-  const scale = containerWidth && naturalSize.width ? containerWidth / naturalSize.width : 0;
-
-  return (
-    <div className="scan-corner-editor">
-      <p className="auth-sub" style={{ margin: '0 0 12px' }}>Drag the corners to match the page edges, then confirm.</p>
-      <div className="scan-corner-editor-frame" ref={containerRef}>
-        <img
-          ref={imgRef}
-          src={rawFrameUrl}
-          alt="Captured page, awaiting crop"
-          className="scan-corner-editor-img"
-          onLoad={(e) => setNaturalSize({ width: e.target.naturalWidth, height: e.target.naturalHeight })}
-        />
-        {scale > 0 && (
-          <svg className="scan-corner-editor-svg">
-            <polygon
-              points={CORNER_KEYS.map((k) => `${corners[k].x * scale},${corners[k].y * scale}`).join(' ')}
-            />
-          </svg>
-        )}
-        {scale > 0 && CORNER_KEYS.map((key) => (
-          <div
-            key={key}
-            className="scan-corner-handle"
-            style={{ left: corners[key].x * scale, top: corners[key].y * scale }}
-            onPointerDown={(e) => { e.preventDefault(); draggingRef.current = key; }}
-          />
-        ))}
-      </div>
-      <div className="scan-capture-actions">
-        <button type="button" className="btn btn-ghost" onClick={onRetake}>Retake</button>
-        <button type="button" className="btn btn-primary" onClick={() => onConfirm(corners)}>Use this page</button>
-      </div>
-    </div>
-  );
-}
-
-// Full-size review of every captured page before the actual upload — a
-// student should be able to see legibility/framing clearly, not just judge
-// from a thumbnail strip, before committing to submit.
-function ReviewScreen({ pages, onRemove, onAddMore, onSubmit, submitting }) {
-  return (
-    <div>
-      <p className="auth-sub" style={{ margin: '0 0 12px' }}>
-        Review every page before submitting — tap "Retake" on anything that's hard to read.
-      </p>
-      <div className="scan-review-pages">
-        {pages.map((dataUrl, idx) => (
-          <div className="scan-review-page" key={idx}>
-            <img src={dataUrl} alt={`Page ${idx + 1}`} />
-            <div className="scan-review-page-footer">
-              <span className="chip chip-neutral"><span className="dot" />Page {idx + 1}</span>
-              <button type="button" className="btn btn-ghost btn-sm" onClick={() => onRemove(idx)} disabled={submitting}>Remove</button>
-            </div>
-          </div>
-        ))}
-      </div>
-      <div className="scan-capture-actions">
-        <button type="button" className="btn btn-ghost" onClick={onAddMore} disabled={submitting}>+ Add another page</button>
-        <button type="button" className="btn btn-primary" onClick={onSubmit} disabled={pages.length === 0 || submitting}>
-          {submitting && <span className="spinner" />}
-          {submitting ? 'Submitting…' : `Submit ${pages.length} page${pages.length === 1 ? '' : 's'}`}
-        </button>
-      </div>
-    </div>
-  );
-}
-
 // Live camera scanner: detects and highlights a document's edges in the
 // video feed in real time (jscanify, wrapping opencv.js), lets a student
 // capture multiple pages — each confirmed via a draggable-corner crop
@@ -347,11 +66,12 @@ export default function ScanCapture() {
 
   // 'loading' -> 'already-submitted' (if a submission already exists — no
   // camera requested at all until the student explicitly chooses to
-  // replace it) OR 'questions' (read what's being asked, then choose
-  // camera-scan or PDF-upload) -> EITHER 'scanning' -> 'editing' (per-capture
-  // crop) -> 'scanning' (repeat) -> 'reviewing' -> 'uploading' OR
-  // 'upload-review' (a PDF picked from elsewhere, awaiting confirm) ->
-  // 'upload-submitting' -> 'done', or 'error' at any point
+  // replace it) OR 'questions' (answer any mcq/short/long/coding questions
+  // right here, then either scan/upload a PDF for the scan-type ones, or —
+  // if there aren't any — submit directly) -> EITHER 'scanning' ->
+  // 'editing' (per-capture crop) -> 'scanning' (repeat) -> 'reviewing' ->
+  // 'uploading' OR 'upload-review' (a PDF picked from elsewhere, awaiting
+  // confirm) -> 'upload-submitting' -> 'done', or 'error' at any point
   const [phase, setPhase] = useState('loading');
   const [error, setError] = useState('');
   const [scanContext, setScanContext] = useState(null);
@@ -363,6 +83,38 @@ export default function ScanCapture() {
   const [uploadedFile, setUploadedFile] = useState(null); // File chosen via the "upload a PDF" path
   const [uploadFileError, setUploadFileError] = useState('');
   const fileInputRef = useRef(null);
+
+  // Answers for mcq/short/long/coding questions — keyed by question id,
+  // same shape ExamAttempt.jsx uses. scan-type questions never appear here
+  // at all (they're answered on paper, not through this form).
+  const [answers, setAnswers] = useState({});
+  const [runResults, setRunResults] = useState({});
+  const digitalQuestions = (scanContext?.questions || []).filter((q) => q.type !== 'scan');
+  const scanQuestions = (scanContext?.questions || []).filter((q) => q.type === 'scan');
+
+  const updateAnswer = (questionId, patch) => {
+    setAnswers((prev) => ({ ...prev, [questionId]: { ...prev[questionId], ...patch } }));
+  };
+
+  const buildAnswersArray = () => digitalQuestions.map((q) => ({ questionId: q.id, ...answers[q.id] }));
+
+  const runCodingQuestion = async (q) => {
+    const ans = answers[q.id];
+    if (!ans?.code || runResults[q.id]?.status === 'running') return;
+    setRunResults((prev) => ({ ...prev, [q.id]: { status: 'running', results: [] } }));
+    const results = [];
+    for (const sample of q.samples || []) {
+      try {
+        const res = await axios.post(`${API}/api/execute/${ans.language}`, { code: ans.code, stdin: sample.input }, { withCredentials: true });
+        const out = (res.data.output || '').trim().replace(/\r\n/g, '\n');
+        const exp = (sample.expected_output || '').trim().replace(/\r\n/g, '\n');
+        results.push({ input: sample.input, expected: sample.expected_output, actual: res.data.output, pass: out === exp });
+      } catch (err) {
+        results.push({ input: sample.input, expected: sample.expected_output, actual: err.response?.data?.error || 'Execution failed', pass: false });
+      }
+    }
+    setRunResults((prev) => ({ ...prev, [q.id]: { status: 'done', results } }));
+  };
   // Surfaces what the live-highlight loop is actually seeing — readyState,
   // frame dimensions, last error — since there's no way to reach a phone's
   // devtools console mid-test. Safe to remove once the camera pipeline is
@@ -427,6 +179,18 @@ export default function ScanCapture() {
         setScanContext(ctxRes.data);
         scannerRef.current = new jscanify();
 
+        const initialAnswers = {};
+        (ctxRes.data.questions || []).forEach((q) => {
+          if (q.type === 'mcq') initialAnswers[q.id] = { selectedOptionId: null };
+          else if (q.type === 'coding') {
+            const firstLang = Object.keys(q.starterCode || {})[0] || 'python';
+            initialAnswers[q.id] = { language: firstLang, code: q.starterCode?.[firstLang] || '' };
+          } else if (q.type === 'short' || q.type === 'long') {
+            initialAnswers[q.id] = { textAnswer: '' };
+          }
+        });
+        setAnswers(initialAnswers);
+
         if (subRes.data.submission) {
           setExistingSubmission(subRes.data.submission);
           setPhase('already-submitted');
@@ -486,6 +250,7 @@ export default function ScanCapture() {
       const formData = new FormData();
       formData.append('file', uploadedFile, buildFilename(scanContext));
       formData.append('filename', buildFilename(scanContext));
+      formData.append('answers', JSON.stringify(buildAnswersArray()));
       const res = await axios.post(`${API}/api/problems/${id}/scan-submit`, formData, { withCredentials: true });
       setUploadResult(res.data);
       setPhase('done');
@@ -649,12 +414,33 @@ export default function ScanCapture() {
       const formData = new FormData();
       formData.append('file', blob, filename);
       formData.append('filename', filename);
+      formData.append('answers', JSON.stringify(buildAnswersArray()));
       const res = await axios.post(`${API}/api/problems/${id}/scan-submit`, formData, { withCredentials: true });
       setUploadResult(res.data);
       setPhase('done');
     } catch (err) {
       setError(err.response?.data?.error || 'Failed to upload your scanned submission.');
       setPhase('reviewing');
+    }
+  };
+
+  // For a scan-mode assignment with NO scan-type questions at all (every
+  // question is mcq/short/long/coding) — no PDF ever needed, just the
+  // answers. No 'file' field in the FormData at all; the backend only
+  // requires one when the assignment actually has scan-type questions.
+  const handleSubmitDigitalOnly = async () => {
+    if (!scanContext) return;
+    setPhase('upload-submitting');
+    setError('');
+    try {
+      const formData = new FormData();
+      formData.append('answers', JSON.stringify(buildAnswersArray()));
+      const res = await axios.post(`${API}/api/problems/${id}/scan-submit`, formData, { withCredentials: true });
+      setUploadResult(res.data);
+      setPhase('done');
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to submit.');
+      setPhase('questions');
     }
   };
 
@@ -712,25 +498,125 @@ export default function ScanCapture() {
           {phase === 'questions' && scanContext && (
             <div>
               <p className="auth-sub" style={{ margin: '0 0 12px' }}>
-                Read through what's being asked before you start scanning — you won't be able to see this list again while the camera is open.
+                {scanQuestions.length > 0
+                  ? "Answer anything below that isn't on paper first — you won't be able to see this again once the camera opens."
+                  : 'Answer every question below, then submit.'}
               </p>
-              <ol className="scan-question-list">
-                {(scanContext.questions || []).map((q, idx) => (
-                  <li key={idx} className="scan-question-item">
-                    <span>{q.prompt}</span>
-                    <span className="chip chip-neutral">{q.marks} marks</span>
-                  </li>
-                ))}
-              </ol>
+
+              {(scanContext.questions || []).map((q, idx) => {
+                const ans = answers[q.id] || {};
+                return (
+                  <div className="panel exam-take-item" key={q.id} style={{ marginBottom: 14 }}>
+                    <div className="exam-take-item-head">
+                      <span className="exam-item-index">Question {idx + 1}</span>
+                      <span className="chip chip-neutral"><span className="dot" />{q.marks} marks</span>
+                    </div>
+
+                    {q.prompt && <p className="exam-take-prompt">{q.prompt}</p>}
+
+                    {q.type === 'scan' && (
+                      <p className="auth-sub">Answer this on paper — you'll scan it in below.</p>
+                    )}
+
+                    {q.type === 'mcq' && (
+                      <div className="exam-mcq-options">
+                        {(q.options || []).map((o) => (
+                          <label className="exam-mcq-option" key={o.id}>
+                            <input
+                              type="radio"
+                              name={`scan-q-${q.id}`}
+                              checked={ans.selectedOptionId === o.id}
+                              onChange={() => updateAnswer(q.id, { selectedOptionId: o.id })}
+                            />
+                            <span>{o.text}</span>
+                          </label>
+                        ))}
+                      </div>
+                    )}
+
+                    {(q.type === 'short' || q.type === 'long') && (
+                      <div className="field">
+                        <textarea
+                          rows={q.type === 'long' ? 6 : 3}
+                          value={ans.textAnswer || ''}
+                          onChange={(e) => updateAnswer(q.id, { textAnswer: e.target.value })}
+                        />
+                        {q.wordLimit && (
+                          <span className="exam-word-count">
+                            {(ans.textAnswer || '').trim().split(/\s+/).filter(Boolean).length} / {q.wordLimit} words
+                          </span>
+                        )}
+                      </div>
+                    )}
+
+                    {q.type === 'coding' && (
+                      <div className="exam-coding-item">
+                        <div className="segmented" role="tablist">
+                          {CODING_LANGUAGES.map((l) => (
+                            <button
+                              key={l.id}
+                              type="button"
+                              className={ans.language === l.id ? 'active' : ''}
+                              onClick={() => updateAnswer(q.id, { language: l.id, code: q.starterCode?.[l.id] || '' })}
+                            >
+                              {l.label}
+                            </button>
+                          ))}
+                        </div>
+
+                        <div className="editor-panel lc-editor exam-editor">
+                          <CodeMirror
+                            value={ans.code || ''}
+                            height="220px"
+                            theme={theme === 'light' ? 'light' : 'dark'}
+                            extensions={getLanguageExtension(ans.language)}
+                            onChange={(val) => updateAnswer(q.id, { code: val })}
+                          />
+                        </div>
+
+                        <button type="button" className="btn btn-ghost btn-sm" onClick={() => runCodingQuestion(q)} disabled={runResults[q.id]?.status === 'running'}>
+                          {runResults[q.id]?.status === 'running' ? <span className="spinner" /> : null} Run against samples
+                        </button>
+
+                        {runResults[q.id]?.status === 'done' && (
+                          <div className="exam-run-results">
+                            {runResults[q.id].results.map((r, i) => (
+                              <div key={i} className={`exam-run-case ${r.pass ? 'pass' : 'fail'}`}>
+                                <span className="chip chip-neutral">Sample {i + 1}: {r.pass ? 'Passed' : 'Failed'}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+
               {uploadFileError && (
                 <div className="alert" role="alert" style={{ marginBottom: 12 }}>
                   <span className="alert-icon">!</span>
                   <span>{uploadFileError}</span>
                 </div>
               )}
+              {error && (
+                <div className="alert" role="alert" style={{ marginBottom: 12 }}>
+                  <span className="alert-icon">!</span>
+                  <span>{error}</span>
+                </div>
+              )}
+
               <div className="scan-capture-actions">
-                <button type="button" className="btn btn-primary" onClick={handleStartScanning}>Scan with camera</button>
-                <button type="button" className="btn btn-ghost" onClick={handleChooseFile}>Upload a scanned PDF</button>
+                {scanQuestions.length > 0 ? (
+                  <>
+                    <button type="button" className="btn btn-primary" onClick={handleStartScanning}>Scan with camera</button>
+                    <button type="button" className="btn btn-ghost" onClick={handleChooseFile}>Upload a scanned PDF</button>
+                  </>
+                ) : (
+                  <button type="button" className="btn btn-primary" onClick={handleSubmitDigitalOnly}>
+                    Submit
+                  </button>
+                )}
               </div>
             </div>
           )}
