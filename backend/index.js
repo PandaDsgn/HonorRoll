@@ -755,6 +755,22 @@ async function ensureOrganizationsPlagiarismThresholdColumn() {
 }
 ensureOrganizationsPlagiarismThresholdColumn();
 
+// Timestamp for when a submission actually entered 'processing' (set in
+// processOneScanSubmission below) — distinct from created_at, which is
+// upload time and can sit hours/days before OCR ever starts on the normal
+// deadline-gated path. The frontend's progress ring needs the real start
+// time to mean anything; created_at would make it read as already-almost-
+// done the instant a long-pending row finally starts.
+async function ensureScanSubmissionProcessingStartedColumn() {
+  await ensureScanSubmissionsSchema();
+  try {
+    await pool.query('ALTER TABLE scan_submissions ADD COLUMN IF NOT EXISTS processing_started_at TIMESTAMPTZ');
+  } catch (err) {
+    console.error('Failed to ensure scan_submissions.processing_started_at:', err);
+  }
+}
+ensureScanSubmissionProcessingStartedColumn();
+
 // ============================================================================
 // BILLING — subscription plans by student headcount, via Razorpay.
 // ============================================================================
@@ -3342,12 +3358,28 @@ async function sendBillingEmail(organizationId, subject, text) {
 // unauthenticated by necessity — this IS how an org's first account gets made.
 // ============================================================================
 app.post('/api/organizations/signup', async (req, res) => {
-  const { organizationName, email, password } = req.body;
+  const { organizationName, email, password, name, accessCode } = req.body;
   if (!organizationName || !String(organizationName).trim()) {
     return res.status(400).json({ error: 'Organization name is required' });
   }
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required' });
+  }
+  // Only admins/superadmins self-register through this route — teachers and
+  // students are always created BY an admin (see the create-student/
+  // create-teacher routes), whose own forms already collect a name, so this
+  // is the one signup path that actually needs to ask for it itself.
+  if (!name || !String(name).trim()) {
+    return res.status(400).json({ error: 'Your name is required' });
+  }
+  // Gates institution creation up front instead of the old flow (create as
+  // 'pending', wait for a platform owner to separately hit POST
+  // /api/platform/organizations/:id/approve) — that route still exists for
+  // any leftover pending rows, but nothing new gets left in that state.
+  // Fails closed if the secret was never configured, same posture as
+  // requirePlatformSecret above.
+  if (!process.env.PLATFORM_OWNER_SECRET || accessCode !== process.env.PLATFORM_OWNER_SECRET) {
+    return res.status(403).json({ error: "Invalid or missing access code. If you don't have one, the highest authority at your institution must contact honorroll.admin@gmail.com to request one." });
   }
 
   const emailDomain = String(email).split('@')[1]?.toLowerCase() || '';
@@ -3361,7 +3393,7 @@ app.post('/api/organizations/signup', async (req, res) => {
     // student somewhere else already) — that's fine, they can still found
     // their own organization with it, as long as they prove they own that
     // password. Only a genuinely wrong password blocks signup.
-    const existing = await client.query('SELECT id, password_hash FROM users WHERE email = $1', [email]);
+    const existing = await client.query('SELECT id, password_hash, name FROM users WHERE email = $1', [email]);
     if (existing.rows.length > 0) {
       const isMatch = await bcrypt.compare(password, existing.rows[0].password_hash);
       if (!isMatch) {
@@ -3371,31 +3403,40 @@ app.post('/api/organizations/signup', async (req, res) => {
 
     await client.query('BEGIN');
 
-    // Two independent gates before this org can provision students: they
-    // must click the confirmation link sent to their institutional address
-    // (email_verified_at), AND a platform owner must separately approve the
-    // organization (status) — see requirePlatformSecret's routes below.
-    // Raw token goes out in the email; only its hash is ever stored, same
-    // pattern as the password-reset flow further down this file.
+    // The access code above already proves institutional legitimacy, so
+    // this org starts life 'approved' rather than 'pending' — email
+    // verification (email_verified_at) is the one remaining gate, just
+    // confirming they actually own the address they typed. Raw token goes
+    // out in the email; only its hash is ever stored, same pattern as the
+    // password-reset flow further down this file.
     const verificationToken = crypto.randomBytes(32).toString('hex');
     const verificationTokenHash = crypto.createHash('sha256').update(verificationToken).digest('hex');
 
     const webhookSecret = crypto.randomBytes(16).toString('hex');
     const orgRes = await client.query(
       `INSERT INTO organizations (name, webhook_secret, status, email_domain, verification_token_hash, verification_token_expiry)
-       VALUES ($1, $2, 'pending', $3, $4, now() + interval '24 hours') RETURNING id, name`,
+       VALUES ($1, $2, 'approved', $3, $4, now() + interval '24 hours') RETURNING id, name`,
       [organizationName.trim(), webhookSecret, emailDomain, verificationTokenHash]
     );
     const org = orgRes.rows[0];
 
     // Reuses the matched existing identity's password untouched if one
     // exists; only hashes+stores the supplied password for a brand-new one.
-    const userId = existing.rows.length > 0
-      ? existing.rows[0].id
-      : (await client.query(
-          'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id',
-          [email, await bcrypt.hash(password, 10)]
-        )).rows[0].id;
+    // COALESCE on the update so a pre-existing name (e.g. they're already a
+    // student elsewhere) is never clobbered by this signup's name field.
+    let userId;
+    let effectiveName;
+    if (existing.rows.length > 0) {
+      userId = existing.rows[0].id;
+      effectiveName = existing.rows[0].name || name.trim();
+      await client.query('UPDATE users SET name = COALESCE(name, $1) WHERE id = $2', [name.trim(), userId]);
+    } else {
+      effectiveName = name.trim();
+      userId = (await client.query(
+        'INSERT INTO users (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id',
+        [email, await bcrypt.hash(password, 10), name.trim()]
+      )).rows[0].id;
+    }
 
     await client.query(
       `INSERT INTO memberships (user_id, organization_id, role) VALUES ($1, $2, 'admin')`,
@@ -3433,9 +3474,9 @@ app.post('/api/organizations/signup', async (req, res) => {
     );
 
     res.status(201).json({
-      message: 'Organization created — check your email to confirm it, and an administrator will review it before you can add students.',
+      message: 'Organization created and approved — you can start adding students right away. Check your email when you get a chance to confirm your address.',
       token,
-      user: { id: userId, email, role: 'admin', organization_name: org.name },
+      user: { id: userId, email, role: 'admin', name: effectiveName, organization_name: org.name },
     });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -3447,8 +3488,10 @@ app.post('/api/organizations/signup', async (req, res) => {
 });
 
 // Public confirmation-link target from the signup email above. Advances
-// only email_verified_at — never status, which stays gated behind the
-// separate platform-owner approval routes further down.
+// only email_verified_at — status is already 'approved' by the time this
+// runs (see the access-code gate on signup above); this route and the
+// separate platform-owner approval routes further down only still matter
+// for whatever pending orgs predate that change.
 app.get('/api/organizations/verify', async (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).json({ error: 'Token required' });
@@ -3612,7 +3655,7 @@ app.post('/api/login', async (req, res) => {
   }
 
   try {
-    const userResult = await pool.query('SELECT id, password_hash FROM users WHERE email = $1', [email]);
+    const userResult = await pool.query('SELECT id, password_hash, name FROM users WHERE email = $1', [email]);
     if (userResult.rows.length === 0) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
@@ -3641,7 +3684,7 @@ app.post('/api/login', async (req, res) => {
         return res.status(200).json({
           message: 'Login successful',
           token,
-          user: { id: user.id, email, role: 'superadmin' },
+          user: { id: user.id, email, role: 'superadmin', name: user.name },
         });
       }
       return res.status(403).json({ error: 'No organization membership found. Contact your administrator.' });
@@ -3656,7 +3699,7 @@ app.post('/api/login', async (req, res) => {
       return res.status(200).json({
         message: 'Login successful',
         token,
-        user: { id: user.id, email, role: m.role, organization_name: m.organization_name },
+        user: { id: user.id, email, role: m.role, name: user.name, organization_name: m.organization_name },
       });
     }
 
@@ -3702,7 +3745,7 @@ app.post('/api/login/select-organization', async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT u.id AS user_id, u.email, m.role, m.organization_id, m.org_unit_id, o.name AS organization_name
+      `SELECT u.id AS user_id, u.email, u.name, m.role, m.organization_id, m.org_unit_id, o.name AS organization_name
        FROM memberships m
        JOIN users u ON u.id = m.user_id
        JOIN organizations o ON o.id = m.organization_id
@@ -3718,7 +3761,7 @@ app.post('/api/login/select-organization', async (req, res) => {
     res.status(200).json({
       message: 'Login successful',
       token,
-      user: { id: m.user_id, email: m.email, role: m.role, organization_name: m.organization_name },
+      user: { id: m.user_id, email: m.email, role: m.role, name: m.name, organization_name: m.organization_name },
     });
   } catch (error) {
     console.error('Select-organization error:', error);
@@ -3735,13 +3778,13 @@ app.get('/api/me', authenticateToken, async (req, res) => {
     // skip the org join entirely rather than have it (correctly) find zero
     // rows and bounce them as if their session were invalid.
     if (req.user.role === 'superadmin') {
-      const userRes = await pool.query('SELECT id, email FROM users WHERE id = $1', [req.user.userId]);
+      const userRes = await pool.query('SELECT id, email, name FROM users WHERE id = $1', [req.user.userId]);
       if (userRes.rows.length === 0) return res.status(401).json({ error: 'Session no longer valid' });
-      return res.status(200).json({ user: { id: userRes.rows[0].id, email: userRes.rows[0].email, role: 'superadmin' } });
+      return res.status(200).json({ user: { id: userRes.rows[0].id, email: userRes.rows[0].email, role: 'superadmin', name: userRes.rows[0].name } });
     }
 
     const result = await pool.query(
-      `SELECT u.id, u.email, m.role, m.org_unit_id, o.name AS organization_name
+      `SELECT u.id, u.email, u.name, m.role, m.org_unit_id, o.name AS organization_name
        FROM users u
        JOIN memberships m ON m.user_id = u.id AND m.organization_id = $2
        JOIN organizations o ON o.id = m.organization_id
@@ -3756,13 +3799,13 @@ app.get('/api/me', authenticateToken, async (req, res) => {
       // an org that really exists) and answer normally instead of bouncing
       // them as if the session had gone stale; any other zero-row case
       // really is a stale/removed membership and stays a 401.
-      const userRes = await pool.query('SELECT email FROM users WHERE id = $1', [req.user.userId]);
+      const userRes = await pool.query('SELECT email, name FROM users WHERE id = $1', [req.user.userId]);
       const email = userRes.rows[0]?.email;
       if (email && getSuperadminEmails().includes(email.toLowerCase())) {
         const orgRes = await pool.query('SELECT name FROM organizations WHERE id = $1', [req.user.organizationId]);
         if (orgRes.rows.length > 0) {
           return res.status(200).json({
-            user: { id: req.user.userId, email, role: req.user.role, org_unit_id: null, organization_name: orgRes.rows[0].name },
+            user: { id: req.user.userId, email, role: req.user.role, name: userRes.rows[0]?.name, org_unit_id: null, organization_name: orgRes.rows[0].name },
           });
         }
       }
@@ -5622,7 +5665,7 @@ app.get('/api/admin/problems/:id/scan-submissions', authenticateToken, requireAd
     const totalMarks = Number(totalMarksRes.rows[0].total);
 
     const result = await pool.query(
-      `SELECT ss.id, ss.status, ss.original_filename, ss.storage_key, ss.created_at, ss.ocr_error, ss.penalized, u.email, u.name,
+      `SELECT ss.id, ss.status, ss.original_filename, ss.storage_key, ss.created_at, ss.ocr_error, ss.penalized, ss.processing_started_at, u.email, u.name,
               (SELECT COALESCE(SUM(sa.marks_awarded), 0) FROM scan_submission_answers sa WHERE sa.submission_id = ss.id) AS awarded_marks,
               (SELECT COUNT(*) FROM scan_submission_answers sa WHERE sa.submission_id = ss.id AND sa.marks_awarded IS NOT NULL) AS graded_count,
               (SELECT COUNT(*) FROM scan_assignment_questions WHERE problem_id = ss.problem_id) AS question_count
@@ -5642,6 +5685,7 @@ app.get('/api/admin/problems/:id/scan-submissions', authenticateToken, requireAd
       createdAt: row.created_at,
       ocrError: row.ocr_error,
       penalized: row.penalized,
+      processingStartedAt: row.processing_started_at,
       totalMarks,
       awardedMarks: row.penalized ? 0 : Number(row.awarded_marks),
       fullyGraded: Number(row.graded_count) === Number(row.question_count) && Number(row.question_count) > 0,
@@ -5767,7 +5811,7 @@ async function runHandwritingComparator(client, submission) {
 async function processOneScanSubmission(submissionId) {
   const client = await pool.connect();
   try {
-    await client.query(`UPDATE scan_submissions SET status = 'processing' WHERE id = $1`, [submissionId]);
+    await client.query(`UPDATE scan_submissions SET status = 'processing', processing_started_at = now() WHERE id = $1`, [submissionId]);
 
     const subRes = await client.query('SELECT id, problem_id, storage_key FROM scan_submissions WHERE id = $1', [submissionId]);
     if (subRes.rows.length === 0) return;
@@ -5919,6 +5963,113 @@ app.get('/api/admin/scan-submissions/:id', authenticateToken, requireAdmin, asyn
   } catch (err) {
     console.error('Scan submission detail error:', err);
     res.status(500).json({ error: 'Failed to load submission' });
+  }
+});
+
+// Lets a teacher force one submission through OCR immediately instead of
+// waiting for the assignment's deadline to pass (see sweepScanSubmissions
+// below for why that's normally deferred — this is the deliberate escape
+// hatch for testing/urgency, not a replacement for the sweep). Shares the
+// sweep's own concurrency limiter and in-flight tracking so a manual
+// trigger can't race the sweep into double-processing the same row, or get
+// silently reset back to 'pending' by the sweep's stuck-row recovery.
+app.post('/api/admin/scan-submissions/:id/process', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const subRes = await pool.query(
+      `SELECT ss.id, ss.status FROM scan_submissions ss JOIN problems p ON p.id = ss.problem_id
+       WHERE ss.id = $1 AND p.organization_id = $2`,
+      [req.params.id, req.user.organizationId]
+    );
+    if (subRes.rows.length === 0) return res.status(404).json({ error: 'Submission not found' });
+    if (!isB2Configured()) return res.status(503).json({ error: 'Scanned-assignment storage is not configured yet' });
+    if (!isOcrConfigured()) return res.status(503).json({ error: 'OCR is not configured yet' });
+
+    const submissionId = subRes.rows[0].id;
+    if (scanOcrInFlight.has(submissionId)) return res.status(409).json({ error: 'Already processing' });
+
+    scanOcrInFlight.add(submissionId);
+    ocrLimit(() => processOneScanSubmission(submissionId)).finally(() => scanOcrInFlight.delete(submissionId));
+    res.status(202).json({ status: 'processing' });
+  } catch (err) {
+    console.error('Manual scan OCR trigger error:', err);
+    res.status(500).json({ error: 'Failed to start OCR' });
+  }
+});
+
+// Lets a teacher upload a PDF on a student's behalf — e.g. a paper answer
+// sheet scanned on some other device/app, never touching ScanCapture.jsx's
+// in-browser camera flow at all. Deliberately not gated on the assignment
+// being 'open' the way the student-facing route is (this is exactly the
+// escape hatch for late/offline submissions an admin is entering after the
+// fact), and shares that route's exact replace-on-resubmit + storage-key
+// logic: whatever the uploaded file's own name is, it's kept only as the
+// display label (original_filename) — the actual object key always follows
+// scanObjectKey()'s <org>/<problem>/<submissionId>.pdf convention, same as
+// every other scan submission, never the incoming filename.
+app.post('/api/admin/problems/:id/scan-submissions', authenticateToken, requireAdmin, scanUpload.single('file'), async (req, res) => {
+  const problemId = req.params.id;
+  const studentEmail = String(req.body.email || '').trim().toLowerCase();
+  if (!req.file) return res.status(400).json({ error: 'A PDF file is required' });
+  if (!studentEmail) return res.status(400).json({ error: "Student's email is required" });
+  if (!isB2Configured()) return res.status(503).json({ error: 'Scanned-assignment storage is not configured yet' });
+
+  try {
+    const problemRes = await pool.query(
+      'SELECT submission_mode FROM problems WHERE id = $1 AND organization_id = $2',
+      [problemId, req.user.organizationId]
+    );
+    if (problemRes.rows.length === 0) return res.status(404).json({ error: 'Assignment not found' });
+    if (problemRes.rows[0].submission_mode !== 'scan') {
+      return res.status(400).json({ error: 'This assignment does not accept scanned submissions' });
+    }
+
+    const studentRes = await pool.query(
+      `SELECT id FROM users WHERE organization_id = $1 AND role = 'student' AND lower(email) = $2`,
+      [req.user.organizationId, studentEmail]
+    );
+    if (studentRes.rows.length === 0) return res.status(404).json({ error: 'No student with that email in this organization' });
+    const studentId = studentRes.rows[0].id;
+
+    const existing = await pool.query(
+      'SELECT id, storage_key FROM scan_submissions WHERE problem_id = $1 AND user_id = $2',
+      [problemId, studentId]
+    );
+    if (existing.rows.length > 0) {
+      const previous = existing.rows[0];
+      await pool.query('DELETE FROM scan_submissions WHERE id = $1', [previous.id]);
+      if (previous.storage_key) {
+        try {
+          await deleteScanPdf(previous.storage_key);
+        } catch (err) {
+          console.error('Failed to delete superseded scan PDF (continuing anyway):', err);
+        }
+      }
+    }
+
+    const filename = String(req.file.originalname || 'scan.pdf').trim();
+    const insertRes = await pool.query(
+      `INSERT INTO scan_submissions (problem_id, user_id, storage_key, original_filename, status)
+       VALUES ($1, $2, '', $3, 'pending') RETURNING id`,
+      [problemId, studentId, filename]
+    );
+    const submissionId = insertRes.rows[0].id;
+    const objectKey = scanObjectKey(req.user.organizationId, problemId, submissionId);
+
+    await uploadScanPdf(objectKey, req.file.buffer);
+    await pool.query('UPDATE scan_submissions SET storage_key = $1 WHERE id = $2', [objectKey, submissionId]);
+
+    // Unlike the student route, this doesn't wait for the assignment
+    // deadline — an admin manually entering an offline submission wants it
+    // graded now, not whenever (or if ever) the deadline sweep gets to it.
+    if (isOcrConfigured() && !scanOcrInFlight.has(submissionId)) {
+      scanOcrInFlight.add(submissionId);
+      ocrLimit(() => processOneScanSubmission(submissionId)).finally(() => scanOcrInFlight.delete(submissionId));
+    }
+
+    res.status(201).json({ submissionId, status: 'pending' });
+  } catch (err) {
+    console.error('Admin scan upload error:', err);
+    res.status(500).json({ error: 'Failed to upload scanned submission' });
   }
 });
 

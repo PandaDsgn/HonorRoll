@@ -13,6 +13,8 @@ import { API } from '../config';
 // behaves exactly like a normal login (same AuthContext.login() call).
 export default function Signup() {
   const [organizationName, setOrganizationName] = useState('');
+  const [accessCode, setAccessCode] = useState('');
+  const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -30,7 +32,7 @@ export default function Signup() {
 
     try {
       const response = await axios.post(`${API}/api/organizations/signup`, {
-        organizationName, email, password,
+        organizationName, accessCode, name, email, password,
       });
       login(response.data.token, response.data.user);
       navigate('/admin', { replace: true });
@@ -63,6 +65,23 @@ export default function Signup() {
 
         <form onSubmit={handleSignup} className="auth-form">
           <div className="field">
+            <label htmlFor="access-code">Access code</label>
+            <input
+              id="access-code"
+              type="text"
+              placeholder="Provided by HonorRoll"
+              value={accessCode}
+              onChange={(e) => setAccessCode(e.target.value)}
+              required
+              autoComplete="off"
+            />
+            <p className="auth-sub" style={{ margin: '6px 0 0' }}>
+              Don't have a code? The highest authority at your institution must contact{' '}
+              <a href="mailto:honorroll.admin@gmail.com" className="auth-link" style={{ display: 'inline' }}>honorroll.admin@gmail.com</a> to request one.
+            </p>
+          </div>
+
+          <div className="field">
             <label htmlFor="org-name">Organization name</label>
             <input
               id="org-name"
@@ -71,6 +90,19 @@ export default function Signup() {
               value={organizationName}
               onChange={(e) => setOrganizationName(e.target.value)}
               required
+            />
+          </div>
+
+          <div className="field">
+            <label htmlFor="name">Your name</label>
+            <input
+              id="name"
+              type="text"
+              placeholder="e.g. Jordan Lee"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              required
+              autoComplete="name"
             />
           </div>
 

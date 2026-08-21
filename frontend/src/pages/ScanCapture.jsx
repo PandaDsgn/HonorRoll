@@ -53,6 +53,11 @@ function formatScanDate(iso) {
   });
 }
 
+const SCAN_STATUS_LABELS = { pending: 'Pending', processing: 'Processing', ocr_done: 'Complete', ocr_failed: 'Failed' };
+function formatScanStatus(status) {
+  return SCAN_STATUS_LABELS[status] || status;
+}
+
 function sanitizeFilenamePart(value) {
   const cleaned = String(value || '').trim().replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '');
   return cleaned || 'NA';
@@ -342,9 +347,11 @@ export default function ScanCapture() {
 
   // 'loading' -> 'already-submitted' (if a submission already exists — no
   // camera requested at all until the student explicitly chooses to
-  // replace it) OR 'questions' (read what's being asked before the camera
-  // ever opens) -> 'scanning' -> 'editing' (per-capture crop) -> 'scanning'
-  // (repeat) -> 'reviewing' -> 'uploading' -> 'done', or 'error' at any point
+  // replace it) OR 'questions' (read what's being asked, then choose
+  // camera-scan or PDF-upload) -> EITHER 'scanning' -> 'editing' (per-capture
+  // crop) -> 'scanning' (repeat) -> 'reviewing' -> 'uploading' OR
+  // 'upload-review' (a PDF picked from elsewhere, awaiting confirm) ->
+  // 'upload-submitting' -> 'done', or 'error' at any point
   const [phase, setPhase] = useState('loading');
   const [error, setError] = useState('');
   const [scanContext, setScanContext] = useState(null);
@@ -353,6 +360,9 @@ export default function ScanCapture() {
   const [captureError, setCaptureError] = useState('');
   const [uploadResult, setUploadResult] = useState(null);
   const [rawCapture, setRawCapture] = useState(null); // { url, corners } — awaiting crop confirmation
+  const [uploadedFile, setUploadedFile] = useState(null); // File chosen via the "upload a PDF" path
+  const [uploadFileError, setUploadFileError] = useState('');
+  const fileInputRef = useRef(null);
   // Surfaces what the live-highlight loop is actually seeing — readyState,
   // frame dimensions, last error — since there's no way to reach a phone's
   // devtools console mid-test. Safe to remove once the camera pipeline is
@@ -442,10 +452,48 @@ export default function ScanCapture() {
   // rather than jumping straight into the camera.
   const handleReplaceSubmission = () => {
     setExistingSubmission(null);
+    setUploadedFile(null);
     setPhase('questions');
   };
 
   const handleStartScanning = () => startCamera(cancelledRef);
+
+  // "Upload a PDF" path — a scan produced elsewhere (a phone scanning app,
+  // a flatbed scanner) rather than HonorRoll's own in-browser camera flow.
+  // Never touches the camera/jscanify pipeline at all; the file goes
+  // straight to review, then straight to the server as-is.
+  const handleChooseFile = () => fileInputRef.current?.click();
+
+  const handleFileSelected = (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = ''; // allow re-selecting the same file after "choose a different file"
+    if (!file) return;
+    if (file.type !== 'application/pdf') {
+      setUploadFileError('That file isn\'t a PDF — please choose a .pdf file.');
+      return;
+    }
+    setUploadFileError('');
+    setError('');
+    setUploadedFile(file);
+    setPhase('upload-review');
+  };
+
+  const handleUploadFile = async () => {
+    if (!uploadedFile || !scanContext) return;
+    setPhase('upload-submitting');
+    setError('');
+    try {
+      const formData = new FormData();
+      formData.append('file', uploadedFile, buildFilename(scanContext));
+      formData.append('filename', buildFilename(scanContext));
+      const res = await axios.post(`${API}/api/problems/${id}/scan-submit`, formData, { withCredentials: true });
+      setUploadResult(res.data);
+      setPhase('done');
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to upload your scanned submission.');
+      setPhase('upload-review');
+    }
+  };
 
   // Snapshots the current video frame onto the hidden intermediate canvas
   // and returns it — the only thing ever passed to jscanify/cv.imread, per
@@ -641,7 +689,7 @@ export default function ScanCapture() {
               <div className="alert alert-success" role="status" style={{ marginBottom: 16 }}>
                 <span className="alert-icon">✓</span>
                 <span>
-                  Submitted {formatScanDate(existingSubmission.createdAt)} — status: {existingSubmission.status}
+                  Submitted {formatScanDate(existingSubmission.createdAt)} — status: {formatScanStatus(existingSubmission.status)}
                   {existingSubmission.ocrError && ` (${existingSubmission.ocrError})`}
                 </span>
               </div>
@@ -674,10 +722,55 @@ export default function ScanCapture() {
                   </li>
                 ))}
               </ol>
+              {uploadFileError && (
+                <div className="alert" role="alert" style={{ marginBottom: 12 }}>
+                  <span className="alert-icon">!</span>
+                  <span>{uploadFileError}</span>
+                </div>
+              )}
               <div className="scan-capture-actions">
-                <button type="button" className="btn btn-primary" onClick={handleStartScanning}>Start scanning</button>
+                <button type="button" className="btn btn-primary" onClick={handleStartScanning}>Scan with camera</button>
+                <button type="button" className="btn btn-ghost" onClick={handleChooseFile}>Upload a scanned PDF</button>
               </div>
             </div>
+          )}
+
+          {/* Always mounted (hidden) so handleChooseFile's ref.click() works
+              regardless of phase — same reasoning as the video element below. */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/pdf,.pdf"
+            style={{ display: 'none' }}
+            onChange={handleFileSelected}
+          />
+
+          {phase === 'upload-review' && uploadedFile && (
+            <div>
+              <p className="auth-sub" style={{ margin: '0 0 12px' }}>
+                Ready to submit this file as your scanned answer sheet.
+              </p>
+              {error && (
+                <div className="alert" role="alert" style={{ marginBottom: 12 }}>
+                  <span className="alert-icon">!</span>
+                  <span>{error}</span>
+                </div>
+              )}
+              <div className="scan-review-page" style={{ maxWidth: 320 }}>
+                <div className="scan-review-page-footer">
+                  <span className="chip chip-neutral"><span className="dot" />{uploadedFile.name}</span>
+                  <span className="auth-sub">{(uploadedFile.size / (1024 * 1024)).toFixed(1)} MB</span>
+                </div>
+              </div>
+              <div className="scan-capture-actions">
+                <button type="button" className="btn btn-ghost" onClick={handleChooseFile}>Choose a different file</button>
+                <button type="button" className="btn btn-primary" onClick={handleUploadFile}>Submit</button>
+              </div>
+            </div>
+          )}
+
+          {phase === 'upload-submitting' && (
+            <p className="sb-loading"><span className="spinner" /> Submitting…</p>
           )}
 
           {/* Always mounted, regardless of phase — the setup effect attaches
@@ -755,7 +848,7 @@ export default function ScanCapture() {
           {phase === 'done' && (
             <div className="alert alert-success" role="status">
               <span className="alert-icon">✓</span>
-              <span>Submitted — status: {uploadResult?.status || 'pending'}. Your teacher will grade it once it's processed.</span>
+              <span>Submitted — status: {formatScanStatus(uploadResult?.status || 'pending')}. Your teacher will grade it once it's processed.</span>
             </div>
           )}
         </div>

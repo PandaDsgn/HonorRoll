@@ -8,7 +8,7 @@ export default function SpaceSwitcher({ activeTab }) {
   const spaces = [
     { id: 'assignments', label: 'Assignments', path: '/assignments' },
     { id: 'exams', label: 'Exams', path: '/exams' },
-    { id: 'playground', label: 'Playground', path: '/ide' },
+    { id: 'ide', label: 'IDE', path: '/ide' },
     ...(isAdmin ? [{ id: 'admin', label: 'Admin', path: '/admin' }] : []),
   ];
 

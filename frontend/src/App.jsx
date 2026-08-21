@@ -12,7 +12,7 @@ import Problems from './pages/Problems';
 import AssignmentResult from './pages/AssignmentResult';
 import Sandbox from './pages/Sandbox';
 import ScanCapture from './pages/ScanCapture';
-import Playground from './pages/Playground';
+import IDE from './pages/IDE';
 import Exams from './pages/Exams';
 import ExamAttempt from './pages/ExamAttempt';
 import ExamResult from './pages/ExamResult';
@@ -38,7 +38,7 @@ function App() {
           <Route path="/assignments/:id/scan" element={<ProtectedRoute><ScanCapture /></ProtectedRoute>} />
           <Route path="/assignments/:id/result" element={<ProtectedRoute><AssignmentResult /></ProtectedRoute>} />
 
-          <Route path="/ide" element={<ProtectedRoute><Playground /></ProtectedRoute>} />
+          <Route path="/ide" element={<ProtectedRoute><IDE /></ProtectedRoute>} />
 
           <Route path="/exams" element={<ProtectedRoute><Exams /></ProtectedRoute>} />
           <Route path="/exams/:id" element={<ProtectedRoute><ExamAttempt /></ProtectedRoute>} />

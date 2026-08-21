@@ -15,7 +15,20 @@ function landingPathFor(role) {
   return role === 'admin' || role === 'teacher' ? '/admin' : '/assignments';
 }
 
+// Purely a labeling aid — email+password alone determine the account's
+// actual role server-side (see POST /api/login), so picking a tab here
+// never changes what credentials are checked or where a successful login
+// lands. It only exists so the form stops permanently reading "Student
+// email" at a teacher/admin/superadmin trying to sign in.
+const AUDIENCES = [
+  { key: 'student', label: 'Student' },
+  { key: 'teacher', label: 'Teacher' },
+  { key: 'admin', label: 'Admin' },
+  { key: 'superadmin', label: 'Super Admin' },
+];
+
 export default function Login() {
+  const [audience, setAudience] = useState('student');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -30,6 +43,8 @@ export default function Login() {
   const navigate = useNavigate();
   const { theme, toggleTheme } = useTheme();
   const { login } = useAuth();
+
+  const audienceLabel = AUDIENCES.find((a) => a.key === audience)?.label || 'Student';
 
   const handleLogin = async (e) => {
     e.preventDefault();
@@ -150,11 +165,26 @@ export default function Login() {
         </div>
 
         <h2 className="auth-title">Sign in to your workspace</h2>
-        <p className="auth-sub">Use your student credentials to continue.</p>
+        <p className="auth-sub">Use your {audienceLabel.toLowerCase()} credentials to continue.</p>
+
+        <div className="segmented" role="tablist" aria-label="Signing in as" style={{ margin: '4px 0 20px' }}>
+          {AUDIENCES.map((a) => (
+            <button
+              key={a.key}
+              type="button"
+              role="tab"
+              aria-pressed={audience === a.key}
+              className={audience === a.key ? 'active' : ''}
+              onClick={() => setAudience(a.key)}
+            >
+              {a.label}
+            </button>
+          ))}
+        </div>
 
         <form onSubmit={handleLogin} className="auth-form">
           <div className="field">
-            <label htmlFor="email">Student email</label>
+            <label htmlFor="email">{audienceLabel} email</label>
             <input
               id="email"
               type="email"

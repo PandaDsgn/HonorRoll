@@ -1,9 +1,14 @@
 /* ---------- admin dashboard ---------- */
 .admin-shell {
-  max-width: 1080px;
+  /* Was 1080px — left most of a normal laptop/desktop viewport as empty
+     margin and forced action-heavy tables (Grade/View text/Run OCR now,
+     Hide/Edit/Deadline/Delete) into horizontal scroll well before the
+     screen's actual width ran out. Font sizes are untouched; this only
+     gives existing content more room to lay out flat. */
+  max-width: 1600px;
   width: 100%;
   margin: 0 auto;
-  padding: 40px 24px 64px;
+  padding: 40px 32px 64px;
 }
 
 .admin-head {

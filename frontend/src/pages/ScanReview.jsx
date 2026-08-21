@@ -13,6 +13,16 @@ function formatScanDate(iso) {
   });
 }
 
+const SCAN_STATUS_LABELS = { pending: 'Pending', processing: 'Processing', ocr_done: 'Complete', ocr_failed: 'Failed' };
+function formatScanStatus(status) {
+  return SCAN_STATUS_LABELS[status] || status;
+}
+
+const FLAG_STATUS_LABELS = { open: 'Open', reviewed_dismissed: 'Dismissed', reviewed_confirmed: 'Confirmed' };
+function formatFlagStatus(status) {
+  return FLAG_STATUS_LABELS[status] || status;
+}
+
 // One scanned submission's full review — OCR'd pages, each question with
 // the AI's correctness assessment (an aid, never authoritative — see
 // backend/aiGrading.js) alongside a marks input the teacher actually
@@ -30,6 +40,7 @@ export default function ScanReview() {
   const [saving, setSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState('');
   const [flagBusyId, setFlagBusyId] = useState(null);
+  const [ocrStarting, setOcrStarting] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -59,6 +70,15 @@ export default function ScanReview() {
     }
   };
 
+  // While OCR is running, poll for completion instead of leaving the page
+  // stuck on "Processing" until some unrelated action happens to refetch —
+  // stops itself the moment status moves on to ocr_done/ocr_failed.
+  useEffect(() => {
+    if (submission?.status !== 'processing') return undefined;
+    const timer = setInterval(refetchSubmission, 3000);
+    return () => clearInterval(timer);
+  }, [submission?.status]);
+
   const saveGrade = async () => {
     setSaving(true);
     setSaveMessage('');
@@ -72,6 +92,18 @@ export default function ScanReview() {
       setSaveMessage(err.response?.data?.error || 'Failed to save grade.');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const runOcrNow = async () => {
+    setOcrStarting(true);
+    try {
+      await axios.post(`${API}/api/admin/scan-submissions/${id}/process`, {}, { withCredentials: true });
+      await refetchSubmission();
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to start OCR.');
+    } finally {
+      setOcrStarting(false);
     }
   };
 
@@ -117,7 +149,7 @@ export default function ScanReview() {
                 <div>
                   <h2 style={{ margin: '0 0 4px' }}>{submission.name || submission.email}</h2>
                   <p className="auth-sub" style={{ margin: 0 }}>
-                    Submitted {formatScanDate(submission.createdAt)} — status: {submission.status}
+                    Submitted {formatScanDate(submission.createdAt)} — status: {formatScanStatus(submission.status)}
                     {submission.ocrError && ` (${submission.ocrError})`}
                   </p>
                 </div>
@@ -125,6 +157,12 @@ export default function ScanReview() {
                   {submission.penalized && <span className="chip chip-hard">Penalized — plagiarism confirmed</span>}
                   {submission.viewUrl && (
                     <a className="btn btn-ghost" href={submission.viewUrl} target="_blank" rel="noreferrer">View PDF</a>
+                  )}
+                  {submission.status !== 'processing' && (
+                    <button type="button" className="btn btn-ghost" disabled={ocrStarting} onClick={runOcrNow}>
+                      {ocrStarting && <span className="spinner" />}
+                      {ocrStarting ? 'Starting…' : submission.status === 'ocr_done' ? 'Run OCR again' : 'Run OCR now'}
+                    </button>
                   )}
                 </div>
               </div>
@@ -149,7 +187,7 @@ export default function ScanReview() {
                             <td>{f.type === 'text_similarity' ? 'Text plagiarism' : 'Handwriting match'}</td>
                             <td>#{f.otherSubmissionId}</td>
                             <td>{Math.round(f.similarityScore * 100)}%</td>
-                            <td>{f.status}</td>
+                            <td>{formatFlagStatus(f.status)}</td>
                             <td>
                               {f.status === 'open' && (
                                 <div style={{ display: 'flex', gap: 6 }}>
@@ -192,16 +230,22 @@ export default function ScanReview() {
                 ))}
               </div>
 
-              {submission.pages.length > 0 && (
-                <>
-                  <div className="field-group-label">OCR'd text</div>
-                  {submission.pages.map((p) => (
-                    <div key={p.page} className="panel" style={{ padding: 14, marginBottom: 10 }}>
-                      <p className="auth-sub" style={{ margin: '0 0 6px' }}>Page {p.page} — confidence {Math.round((p.confidence || 0) * 100)}%</p>
-                      <pre style={{ whiteSpace: 'pre-wrap', margin: 0, fontFamily: 'var(--font-sans)' }}>{p.text || '(no text recognized)'}</pre>
-                    </div>
-                  ))}
-                </>
+              <div className="field-group-label">OCR'd text</div>
+              {submission.pages.length > 0 ? (
+                submission.pages.map((p) => (
+                  <div key={p.page} className="panel" style={{ padding: 14, marginBottom: 10 }}>
+                    <p className="auth-sub" style={{ margin: '0 0 6px' }}>Page {p.page} — confidence {Math.round((p.confidence || 0) * 100)}%</p>
+                    <pre style={{ whiteSpace: 'pre-wrap', margin: 0, fontFamily: 'var(--font-sans)' }}>{p.text || '(no text recognized)'}</pre>
+                  </div>
+                ))
+              ) : submission.status === 'pending' ? (
+                <p className="auth-sub" style={{ margin: '0 0 20px' }}>OCR hasn't run yet — it starts automatically once the assignment's deadline passes, or use "Run OCR now" above to process it immediately.</p>
+              ) : submission.status === 'processing' ? (
+                <p className="auth-sub" style={{ margin: '0 0 20px' }}>OCR is running now — this can take a minute or two. Reload to check back.</p>
+              ) : submission.status === 'ocr_failed' ? (
+                <p className="auth-sub" style={{ margin: '0 0 20px' }}>OCR failed{submission.ocrError ? `: ${submission.ocrError}` : '.'} Please refer to the scanned pdf, or try "Run OCR now" again.</p>
+              ) : (
+                <p className="auth-sub" style={{ margin: '0 0 20px' }}>No text recognised. Please refer to the scanned pdf.</p>
               )}
 
               {saveMessage && <p className="auth-sub" style={{ margin: '0 0 8px' }}>{saveMessage}</p>}

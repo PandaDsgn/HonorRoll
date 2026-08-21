@@ -34,7 +34,7 @@ function PlayIcon() {
   );
 }
 
-export default function Playground() {
+export default function IDE() {
   const navigate = useNavigate();
   const { theme, toggleTheme } = useTheme();
 
@@ -108,7 +108,7 @@ export default function Playground() {
       <header className="sb-topbar">
         <button type="button" className="brand" onClick={() => navigate('/')}><BrandMark /></button>
         <div className="sb-actions">
-          <SpaceSwitcher activeTab="playground" />
+          <SpaceSwitcher activeTab="ide" />
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
           <button type="button" className="btn btn-ghost" onClick={handleLogout}>
             Log out
@@ -119,7 +119,7 @@ export default function Playground() {
       <div className="sandbox">
         <section className="sandbox-left">
           <div className="sb-problem-head">
-            <h1 className="sb-problem-title">Playground</h1>
+            <h1 className="sb-problem-title">IDE</h1>
           </div>
           <p className="sb-problem-desc">
             A free space to write and run code — no problem, no grading, no test cases.
