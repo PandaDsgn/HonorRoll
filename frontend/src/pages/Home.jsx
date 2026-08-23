@@ -26,6 +26,9 @@ export default function Home() {
         {/* Deliberately no "HonorRoll" wordmark here — it's the big heading below instead */}
         <span />
         <div className="sb-actions">
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => navigate('/about')}>About</button>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => navigate('/contact')}>Contact</button>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => navigate('/changelog')}>Changelog</button>
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
         </div>
       </header>

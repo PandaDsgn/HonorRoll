@@ -16,7 +16,7 @@ const { exec } = require('child_process');
 const path = require('path');
 const multer = require('multer');
 const archiver = require('archiver');
-const { isB2Configured, scanObjectKey, examScanObjectKey, uploadScanPdf, deleteScanPdf, getScanPdfUrl, downloadScanPdf } = require('./storage');
+const { isB2Configured, scanObjectKey, examScanObjectKey, notesObjectKey, noticesObjectKey, uploadScanPdf, deleteScanPdf, getScanPdfUrl, downloadScanPdf } = require('./storage');
 const { isOcrConfigured, runOcr } = require('./ocrClient');
 const { isGroqConfigured, assessAnswers } = require('./aiGrading');
 const { parse: parseCsv } = require('csv-parse/sync');
@@ -35,6 +35,20 @@ const scanUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 },
   fileFilter: (req, file, cb) => cb(null, file.mimetype === 'application/pdf'),
+});
+
+// Same shape as scanUpload — memory storage, forwarded to B2 then discarded
+// — but this one backs every file-based note type (pdf/image/video/audio),
+// not just PDFs, so there's no single mimetype to gate on here; the actual
+// per-type mimetype check happens in the route itself once req.body.type is
+// available (multer's fileFilter only sees fields that arrived on the wire
+// before the file part, which the frontend can't be relied on to guarantee).
+// 200MB covers a realistically long lecture-recording video, the largest
+// file type this accepts — B2's 10GB free tier absorbs a modest number of
+// these before it becomes a real capacity concern.
+const notesUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 200 * 1024 * 1024 },
 });
 
 const app = express();
@@ -173,6 +187,7 @@ app.use('/api/login', authLimiter);
 app.use('/api/organizations/signup', authLimiter);
 app.use('/api/forgot-password', authLimiter);
 app.use('/api/reset-password', authLimiter);
+app.use('/api/contact', authLimiter);
 app.use(globalLimiter);
 connectRedisAndUpgradeStores();
 
@@ -846,6 +861,36 @@ async function ensureAdminRequestsSchema() {
 }
 bootSchemaStep(ensureAdminRequestsSchema);
 
+// The public /contact page's inbox — anyone reaching the marketing site,
+// not necessarily an existing user of the platform at all (a prospective
+// institution, a parent, a journalist), so this deliberately carries its
+// own name/mobile/email rather than pointing at a `users` row the way
+// admin_requests does. No organization_id either, for the same reason —
+// there may not be one yet.
+async function ensureContactMessagesSchema() {
+  await ensureUsersSchema(); // resolved_by REFERENCES users(id) below
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS contact_messages (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        mobile TEXT NOT NULL,
+        email TEXT NOT NULL,
+        message TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'resolved')),
+        response_note TEXT,
+        resolved_by UUID REFERENCES users(id),
+        resolved_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS contact_messages_status_idx ON contact_messages(status)');
+  } catch (err) {
+    console.error('Failed to ensure contact_messages schema:', err);
+  }
+}
+bootSchemaStep(ensureContactMessagesSchema);
+
 // An admin's structured request to have another admin added to their own
 // org — unlike admin_requests above (a free-form message a human has to
 // read and act on manually), approving one of these actually creates the
@@ -1274,6 +1319,148 @@ async function ensureScanSubmissionProcessingStartedColumn() {
   }
 }
 bootSchemaStep(ensureScanSubmissionProcessingStartedColumn);
+
+// ============================================================================
+// NOTES — a teacher posts one of six media types against one of their own
+// subjects (Uploads tab): pdf/image/video/audio (a file, stored in B2 same
+// as scan submissions), text (body_text, no file at all), or link
+// (external_url, no file, no B2 involvement either). Students whose own
+// org_unit sees that subject (same ancestor-reaches-descendants rule as
+// getVisibleSubjectIds) can browse and search them by title (Notes tab).
+// subject_id is NOT NULL, unlike problems/exams' optional org-wide
+// subject_id — the whole feature is "pick a subject, see its notes," so a
+// subject-less note wouldn't fit anywhere in that UI.
+// ============================================================================
+let notesSchemaPromise = null;
+function ensureNotesSchema() {
+  if (!notesSchemaPromise) {
+    notesSchemaPromise = Promise.all([ensureSubjectsSchema(), ensureUsersSchema()]).then(async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS notes (
+          id SERIAL PRIMARY KEY,
+          organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          subject_id INTEGER NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
+          teacher_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          title TEXT NOT NULL,
+          original_filename TEXT NOT NULL,
+          storage_key TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `);
+      await pool.query('CREATE INDEX IF NOT EXISTS notes_subject_id_idx ON notes(subject_id)');
+      await pool.query('CREATE INDEX IF NOT EXISTS notes_teacher_id_idx ON notes(teacher_id)');
+
+      // The table above pre-dates the multi-media expansion (originally
+      // PDF-only, both file columns NOT NULL) — these ALTERs bring an
+      // already-created table up to date; every statement here is safe to
+      // re-run on every boot. body_text/external_url are each only ever
+      // populated by their own matching type ('text'/'link'); every other
+      // type stores its payload as a B2 file via storage_key instead, same
+      // as the original PDF-only shape.
+      await pool.query(`ALTER TABLE notes ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'pdf'`);
+      await pool.query('ALTER TABLE notes DROP CONSTRAINT IF EXISTS notes_type_check');
+      await pool.query(`ALTER TABLE notes ADD CONSTRAINT notes_type_check CHECK (type IN ('pdf', 'image', 'video', 'audio', 'text', 'link'))`);
+      await pool.query('ALTER TABLE notes ADD COLUMN IF NOT EXISTS body_text TEXT');
+      await pool.query('ALTER TABLE notes ADD COLUMN IF NOT EXISTS external_url TEXT');
+      await pool.query('ALTER TABLE notes ALTER COLUMN storage_key DROP NOT NULL');
+      await pool.query('ALTER TABLE notes ALTER COLUMN original_filename DROP NOT NULL');
+      await pool.query('ALTER TABLE notes DROP CONSTRAINT IF EXISTS notes_content_check');
+      await pool.query(`
+        ALTER TABLE notes ADD CONSTRAINT notes_content_check CHECK (
+          (type IN ('pdf', 'image', 'video', 'audio') AND storage_key IS NOT NULL AND storage_key != '')
+          OR (type = 'text' AND body_text IS NOT NULL)
+          OR (type = 'link' AND external_url IS NOT NULL)
+        )
+      `);
+    }).catch((err) => console.error('Failed to ensure notes schema:', err));
+  }
+  return notesSchemaPromise;
+}
+bootSchemaStep(ensureNotesSchema);
+
+// ============================================================================
+// NOTICES — admin-posted, org-wide announcements. Same four non-audio/video
+// note types (pdf/image/text/link) — a notice is meant to be read at a
+// glance by the whole org, not sat through as a lecture recording. Unlike
+// notes, there's no subject_id at all: a notice isn't attached to any one
+// subject, so it's visible to every member of the org (student, teacher,
+// admin alike) rather than following the subject-visibility rule.
+// ============================================================================
+let noticesSchemaPromise = null;
+function ensureNoticesSchema() {
+  if (!noticesSchemaPromise) {
+    noticesSchemaPromise = Promise.all([ensureOrganizationsSchema(), ensureUsersSchema()]).then(async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS notices (
+          id SERIAL PRIMARY KEY,
+          organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          admin_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          title TEXT NOT NULL,
+          type TEXT NOT NULL CHECK (type IN ('pdf', 'image', 'text', 'link')),
+          original_filename TEXT,
+          storage_key TEXT,
+          body_text TEXT,
+          external_url TEXT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `);
+      await pool.query('CREATE INDEX IF NOT EXISTS notices_organization_id_idx ON notices(organization_id)');
+      await pool.query('ALTER TABLE notices DROP CONSTRAINT IF EXISTS notices_content_check');
+      await pool.query(`
+        ALTER TABLE notices ADD CONSTRAINT notices_content_check CHECK (
+          (type IN ('pdf', 'image') AND storage_key IS NOT NULL AND storage_key != '')
+          OR (type = 'text' AND body_text IS NOT NULL)
+          OR (type = 'link' AND external_url IS NOT NULL)
+        )
+      `);
+    }).catch((err) => console.error('Failed to ensure notices schema:', err));
+  }
+  return noticesSchemaPromise;
+}
+bootSchemaStep(ensureNoticesSchema);
+
+// ============================================================================
+// NOTIFICATIONS — generic per-user feed, one row per event. Two producers
+// today: a teacher posting a note (POST /api/teacher/notes, unit-scoped to
+// students under that subject) and an admin posting a notice (POST
+// /api/admin/notices, org-wide to every student and teacher) — hence both
+// note_id and notice_id, each nullable and only ever one populated per row
+// depending on type. The shape (title/body/read_at) isn't specific to
+// either, so a future notification kind can reuse this table rather than
+// needing its own. read_at nullable (not a boolean) doubles as "when did
+// they see it," which a plain flag would throw away for free.
+// ============================================================================
+let notificationsSchemaPromise = null;
+function ensureNotificationsSchema() {
+  if (!notificationsSchemaPromise) {
+    notificationsSchemaPromise = Promise.all([ensureNotesSchema(), ensureNoticesSchema(), ensureUsersSchema()]).then(async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS notifications (
+          id SERIAL PRIMARY KEY,
+          organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          type TEXT NOT NULL DEFAULT 'note',
+          title TEXT NOT NULL,
+          body TEXT,
+          note_id INTEGER REFERENCES notes(id) ON DELETE CASCADE,
+          read_at TIMESTAMPTZ,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `);
+      await pool.query('CREATE INDEX IF NOT EXISTS notifications_user_id_created_at_idx ON notifications(user_id, created_at DESC)');
+      // Partial index — only unread rows are ever looked up by user_id
+      // alone (the badge count query below); read ones are always reached
+      // through the (user_id, created_at) index above instead.
+      await pool.query('CREATE INDEX IF NOT EXISTS notifications_user_id_unread_idx ON notifications(user_id) WHERE read_at IS NULL');
+      // Added alongside notices — pre-dates it, same "bring an
+      // already-created table up to date" posture as ensureNotesSchema's
+      // own ALTERs above.
+      await pool.query('ALTER TABLE notifications ADD COLUMN IF NOT EXISTS notice_id INTEGER REFERENCES notices(id) ON DELETE CASCADE');
+    }).catch((err) => console.error('Failed to ensure notifications schema:', err));
+  }
+  return notificationsSchemaPromise;
+}
+bootSchemaStep(ensureNotificationsSchema);
 
 // ============================================================================
 // BILLING — subscription plans by student headcount, via Razorpay.
@@ -2917,6 +3104,60 @@ app.get('/api/admin/teachers', authenticateToken, requireAdmin, async (req, res)
   }
 });
 
+// Mirrors PUT /api/admin/students/:id — name and org_unit_id only, no
+// roll_number (student-only) and no email (same reasoning as the student
+// route's own comment: users.email is the global-identity key shared
+// across every organization that email belongs to, so it's never editable
+// from inside one org's roster view). A teacher's own org_unit_id also
+// newly matters beyond being informational: POST /api/admin/subjects/:id/
+// teachers now only allows assigning a teacher whose org_unit_id matches
+// the subject's own unit, so this is how an admin corrects a teacher's
+// unit after the fact if it was left unset or wrong at creation time.
+app.put('/api/admin/teachers/:id', authenticateToken, requireAdmin, async (req, res) => {
+  const teacherId = req.params.id;
+  const name = req.body.name !== undefined ? (String(req.body.name || '').trim() || null) : undefined;
+  const orgUnitId = req.body.orgUnitId !== undefined
+    ? (req.body.orgUnitId === null || req.body.orgUnitId === '' ? null : Number(req.body.orgUnitId))
+    : undefined;
+
+  try {
+    // Scoped to role='teacher' on purpose, same reasoning as the student
+    // route — never lets this touch an admin/student account even if a
+    // stale/tampered id is passed in. 404, not 403, on a miss so this can't
+    // be used to probe which ids exist in another organization.
+    const membershipRes = await pool.query(
+      `SELECT m.id FROM memberships m WHERE m.user_id = $1 AND m.organization_id = $2 AND m.role = 'teacher'`,
+      [teacherId, req.user.organizationId]
+    );
+    if (membershipRes.rows.length === 0) return res.status(404).json({ error: 'Teacher not found' });
+
+    if (orgUnitId !== undefined && orgUnitId !== null) {
+      const unitCheck = await pool.query('SELECT 1 FROM org_units WHERE id = $1 AND organization_id = $2', [orgUnitId, req.user.organizationId]);
+      if (unitCheck.rows.length === 0) return res.status(404).json({ error: 'Unit not found' });
+    }
+
+    if (name !== undefined) {
+      await pool.query('UPDATE users SET name = $1 WHERE id = $2', [name, teacherId]);
+    }
+    if (orgUnitId !== undefined) {
+      // Same "explicitly sent null clears it" vs "not sent at all leaves it
+      // alone" distinction as the student route — orgUnitId is the only
+      // field here that can be legitimately cleared back to null.
+      await pool.query('UPDATE memberships SET org_unit_id = $1 WHERE user_id = $2 AND organization_id = $3', [orgUnitId, teacherId, req.user.organizationId]);
+    }
+
+    const result = await pool.query(
+      `SELECT u.id, u.email, u.name, m.org_unit_id FROM users u JOIN memberships m ON m.user_id = u.id
+       WHERE u.id = $1 AND m.organization_id = $2`,
+      [teacherId, req.user.organizationId]
+    );
+    res.status(200).json({ teacher: result.rows[0] });
+  } catch (err) {
+    console.error('Update teacher error:', err);
+    res.status(500).json({ error: 'Failed to update teacher' });
+  }
+});
+
 // Teacher counterpart to the student CSV template/import pair below —
 // same header-defines-structure contract (any column besides Name/Email is
 // a tier, left to right), reusing splitTierAndIdentityColumns/
@@ -3749,7 +3990,7 @@ app.get('/api/admin/subjects', authenticateToken, requireAdminOrTeacher, async (
   try {
     const result = await pool.query(
       `SELECT s.id, s.org_unit_id, s.name, u.name AS org_unit_name,
-              COALESCE(json_agg(json_build_object('id', t.id, 'email', t.email)) FILTER (WHERE t.id IS NOT NULL), '[]') AS teachers
+              COALESCE(json_agg(json_build_object('id', t.id, 'email', t.email, 'name', t.name)) FILTER (WHERE t.id IS NOT NULL), '[]') AS teachers
        FROM subjects s
        JOIN org_units u ON u.id = s.org_unit_id
        LEFT JOIN subject_teachers st ON st.subject_id = s.id
@@ -3823,20 +4064,30 @@ app.delete('/api/admin/subjects/:id', authenticateToken, requireAdmin, async (re
   }
 });
 
+// Takes userId, not email — a subject's own unit is now the actual
+// eligibility boundary for who can be assigned to it (an admin picks from
+// GET /api/admin/teachers pre-filtered to teachers whose own org_unit_id
+// matches this subject's, in SubjectsPanel.jsx), so the free-text "type an
+// email and hope they exist" flow is gone: the frontend only ever offers
+// teachers that already pass this check, and the check itself is
+// re-enforced here so a direct API call can't bypass it either.
 app.post('/api/admin/subjects/:id/teachers', authenticateToken, requireAdmin, async (req, res) => {
-  const email = String(req.body.email || '').trim();
-  if (!email) return res.status(400).json({ error: 'Teacher email is required' });
+  const userId = String(req.body.userId || '').trim();
+  if (!userId) return res.status(400).json({ error: 'A teacher must be selected' });
 
   try {
-    const subject = await pool.query('SELECT id FROM subjects WHERE id = $1 AND organization_id = $2', [req.params.id, req.user.organizationId]);
+    const subject = await pool.query('SELECT id, org_unit_id FROM subjects WHERE id = $1 AND organization_id = $2', [req.params.id, req.user.organizationId]);
     if (subject.rows.length === 0) return res.status(404).json({ error: 'Subject not found' });
 
     const teacher = await pool.query(
-      `SELECT u.id FROM users u JOIN memberships m ON m.user_id = u.id
-       WHERE u.email = $1 AND m.organization_id = $2 AND m.role = 'teacher'`,
-      [email, req.user.organizationId]
+      `SELECT u.id, m.org_unit_id FROM users u JOIN memberships m ON m.user_id = u.id
+       WHERE u.id = $1 AND m.organization_id = $2 AND m.role = 'teacher'`,
+      [userId, req.user.organizationId]
     );
-    if (teacher.rows.length === 0) return res.status(404).json({ error: 'No teacher with that email in your organization — create their account first' });
+    if (teacher.rows.length === 0) return res.status(404).json({ error: 'Teacher not found in your organization' });
+    if (teacher.rows[0].org_unit_id !== subject.rows[0].org_unit_id) {
+      return res.status(400).json({ error: "This teacher isn't part of the subject's unit" });
+    }
 
     await pool.query(
       'INSERT INTO subject_teachers (subject_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
@@ -5539,6 +5790,88 @@ app.post('/api/superadmin/requests/:id/resolve', authenticateToken, requireSuper
   }
 });
 
+// Public — the /contact page's submit target. No auth at all, unlike every
+// other request/message route in this file: a prospective institution
+// filling this out has no account yet. Rate-limited like every other
+// public unauthenticated endpoint (see authLimiter's app.use registration
+// near the top of this file) so it can't be used as an open spam relay.
+app.post('/api/contact', async (req, res) => {
+  const name = String(req.body.name || '').trim();
+  const mobile = String(req.body.mobile || '').trim();
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const message = String(req.body.message || '').trim();
+  if (!name) return res.status(400).json({ error: 'Name is required' });
+  if (!mobile) return res.status(400).json({ error: 'Mobile number is required' });
+  if (!email) return res.status(400).json({ error: 'Email is required' });
+  if (!message) return res.status(400).json({ error: 'Message is required' });
+  // Same "won't stop a typo, will stop garbage" bar as every other
+  // free-text field in this app — no email deliverability is ever
+  // verified beyond this shape check.
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'Enter a valid email address' });
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO contact_messages (name, mobile, email, message) VALUES ($1, $2, $3, $4)
+       RETURNING id, created_at`,
+      [name, mobile, email, message]
+    );
+
+    const superadminTarget = getSuperadminEmails()[0] || 'honorroll.admin@gmail.com';
+    const { error: mailErr } = await sendEmail({
+      to: superadminTarget,
+      subject: `HonorRoll — New contact message from ${name}`,
+      text: `${name} <${email}> (${mobile}) sent a message via the public contact form:\n\n${message}\n\n— HonorRoll`,
+    });
+    if (mailErr) console.error('Contact message notification email error:', mailErr);
+
+    res.status(201).json({ message: 'Thanks — we\'ll be in touch soon.', id: result.rows[0].id });
+  } catch (err) {
+    console.error('Create contact message error:', err);
+    res.status(500).json({ error: 'Failed to send message' });
+  }
+});
+
+app.get('/api/superadmin/contact-messages', authenticateToken, requireSuperadmin, async (req, res) => {
+  try {
+    const statusParam = req.query.status;
+    const status = statusParam === 'resolved' ? 'resolved' : 'open';
+    const params = [];
+    let where = '';
+    if (statusParam !== 'all') {
+      params.push(status);
+      where = 'WHERE status = $1';
+    }
+    const result = await pool.query(
+      `SELECT id, name, mobile, email, message, status, response_note, resolved_at, created_at
+       FROM contact_messages ${where} ORDER BY created_at DESC`,
+      params
+    );
+    res.status(200).json({ messages: result.rows });
+  } catch (err) {
+    console.error('Superadmin list contact messages error:', err);
+    res.status(500).json({ error: 'Failed to load messages' });
+  }
+});
+
+app.post('/api/superadmin/contact-messages/:id/resolve', authenticateToken, requireSuperadmin, async (req, res) => {
+  const note = req.body.note != null ? String(req.body.note).trim() || null : null;
+  try {
+    const msgRes = await pool.query('SELECT * FROM contact_messages WHERE id = $1', [req.params.id]);
+    if (msgRes.rows.length === 0) return res.status(404).json({ error: 'Message not found' });
+    if (msgRes.rows[0].status === 'resolved') return res.status(409).json({ error: 'This message was already resolved' });
+
+    const result = await pool.query(
+      `UPDATE contact_messages SET status = 'resolved', resolved_by = $1, resolved_at = now(), response_note = $2
+       WHERE id = $3 RETURNING id, status, response_note, resolved_at`,
+      [req.user.userId, note, req.params.id]
+    );
+    res.status(200).json({ message: result.rows[0] });
+  } catch (err) {
+    console.error('Resolve contact message error:', err);
+    res.status(500).json({ error: 'Failed to resolve message' });
+  }
+});
+
 // An admin's structured request to have someone else added as a co-admin
 // of their own org — see ensureAddAdminRequestsSchema's own comment for why
 // this needs its own table instead of the free-form admin_requests above.
@@ -6163,23 +6496,6 @@ app.get('/api/me', authenticateToken, async (req, res) => {
       [req.user.userId, req.user.organizationId]
     );
     if (result.rows.length === 0) {
-      // An impersonated session (see POST /api/superadmin/organizations/:id/
-      // impersonate) deliberately has no real membership row — it's a
-      // superadmin's own user id wearing a target org's admin token, not an
-      // actual member of that org. Recognize that case (allowlisted email +
-      // an org that really exists) and answer normally instead of bouncing
-      // them as if the session had gone stale; any other zero-row case
-      // really is a stale/removed membership and stays a 401.
-      const userRes = await pool.query('SELECT email, name FROM users WHERE id = $1', [req.user.userId]);
-      const email = userRes.rows[0]?.email;
-      if (email && getSuperadminEmails().includes(email.toLowerCase())) {
-        const orgRes = await pool.query('SELECT name FROM organizations WHERE id = $1', [req.user.organizationId]);
-        if (orgRes.rows.length > 0) {
-          return res.status(200).json({
-            user: { id: req.user.userId, email, role: req.user.role, name: userRes.rows[0]?.name, org_unit_id: null, organization_name: orgRes.rows[0].name },
-          });
-        }
-      }
       // Token is still valid but the membership behind it is gone (e.g.
       // admin removed them from this org, or the account itself is gone)
       return res.status(401).json({ error: 'Session no longer valid' });
@@ -6188,6 +6504,28 @@ app.get('/api/me', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Get current user error:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Self-service display-name update — every OTHER path that sets
+// users.name is someone ELSE naming this account (admin signup collects
+// its own name; CSV import/create-student/create-teacher get it from the
+// admin doing the importing). Superadmin is the one role with no such
+// onboarding step at all — an allowlisted email can reach the platform
+// with users.name still NULL and no admin-driven flow that would ever
+// fill it in — so this is the one place that gap actually gets closed.
+// Left open to any authenticated role rather than superadmin-only since
+// there's nothing role-specific about "let me set my own display name."
+app.put('/api/me', authenticateToken, async (req, res) => {
+  const name = String(req.body.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'Name is required' });
+  try {
+    const result = await pool.query('UPDATE users SET name = $1 WHERE id = $2 RETURNING name', [name, req.user.userId]);
+    if (result.rows.length === 0) return res.status(401).json({ error: 'Session no longer valid' });
+    res.status(200).json({ name: result.rows[0].name });
+  } catch (err) {
+    console.error('Update own name error:', err);
+    res.status(500).json({ error: 'Failed to update name' });
   }
 });
 
@@ -7424,10 +7762,18 @@ app.delete('/api/admin/problems/:id', authenticateToken, requireAdminOrTeacher, 
 // this problem, live (not deadline-filtered) — same as the exam version,
 // teachers see current standings regardless of whether the deadline has
 // passed; the deadline gate only affects the student-facing /result route.
-app.get('/api/admin/problems/:id/attempts', authenticateToken, requireAdmin, async (req, res) => {
+// requireAdminOrTeacher + enforceSubjectAuthority, not requireAdmin — same
+// bug and same fix as GET /api/admin/exams's own comment: this is reachable
+// from AssignmentAttemptsPanel, rendered inside the teacher-only Assignments
+// tab, but a teacher could never actually view it. Scoped to the problem's
+// OWN subject_id (a teacher can only view attempts for assignments in
+// subjects they're assigned to), matching every other problem route's
+// posture.
+app.get('/api/admin/problems/:id/attempts', authenticateToken, requireAdminOrTeacher, async (req, res) => {
   try {
-    const problemRes = await pool.query('SELECT id FROM problems WHERE id = $1 AND organization_id = $2', [req.params.id, req.user.organizationId]);
+    const problemRes = await pool.query('SELECT id, subject_id FROM problems WHERE id = $1 AND organization_id = $2', [req.params.id, req.user.organizationId]);
     if (problemRes.rows.length === 0) return res.status(404).json({ error: 'Assignment not found' });
+    if (await enforceSubjectAuthority(req, res, problemRes.rows[0].subject_id)) return;
 
     const bestRes = await pool.query(
       `SELECT DISTINCT ON (s.user_id) s.user_id, u.email, u.name, s.status, s.passed_count, s.total_count, s.created_at
@@ -7549,7 +7895,14 @@ app.post('/api/admin/exams', authenticateToken, requireAdminOrTeacher, async (re
 
 // List exams for the admin table â€” item_count only, not the full items
 // (those load on-demand when actually editing one).
-app.get('/api/admin/exams', authenticateToken, requireAdmin, async (req, res) => {
+// requireAdminOrTeacher, not requireAdmin — every other verb on this same
+// resource (create/get-one/update/delete, right below) already allows a
+// teacher; this list route was the one inconsistent holdout, which meant a
+// teacher could create/edit/delete an exam by ID but never actually SEE
+// the list to find one. The query itself needs no role-based filtering —
+// it's already org-wide, the same set of exams an admin and every teacher
+// in this org share.
+app.get('/api/admin/exams', authenticateToken, requireAdminOrTeacher, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT e.id, e.title, e.total_marks, e.total_time_seconds, e.webcam_required,
@@ -8291,12 +8644,17 @@ app.post('/api/exams/:id/proctor-flag', authenticateToken, async (req, res) => {
   }
 });
 
-// Admin: every attempt at one exam, with its flag counts, for the flag
-// timeline viewer in the admin Exams panel.
-app.get('/api/admin/exams/:id/attempts', authenticateToken, requireAdmin, async (req, res) => {
+// Every attempt at one exam, with its flag counts, for the flag timeline
+// viewer in the Exams panel's "Attempts" expander — reachable by any
+// teacher there too (see GET /api/admin/exams's own comment: same
+// "list route was the one inconsistent requireAdmin holdout" bug), so
+// requireAdminOrTeacher here as well. The query itself is already scoped
+// to one exam within the caller's own org, nothing admin-specific in it.
+app.get('/api/admin/exams/:id/attempts', authenticateToken, requireAdminOrTeacher, async (req, res) => {
   try {
-    const examRes = await pool.query('SELECT total_marks FROM exams WHERE id = $1 AND organization_id = $2', [req.params.id, req.user.organizationId]);
+    const examRes = await pool.query('SELECT total_marks, subject_id FROM exams WHERE id = $1 AND organization_id = $2', [req.params.id, req.user.organizationId]);
     if (examRes.rows.length === 0) return res.status(404).json({ error: 'Exam not found' });
+    if (await enforceSubjectAuthority(req, res, examRes.rows[0].subject_id)) return;
     const totalMarks = examRes.rows[0].total_marks;
 
     const result = await pool.query(
@@ -8348,12 +8706,23 @@ app.get('/api/admin/exams/:id/attempts', authenticateToken, requireAdmin, async 
   }
 });
 
-// Admin: full flag timeline for one attempt.
-app.get('/api/admin/exam-attempts/:attemptId/flags', authenticateToken, requireAdmin, async (req, res) => {
+// requireAdminOrTeacher + enforceSubjectAuthority, not requireAdmin — same
+// bug/fix as every other route in this exam-grading block: reachable from
+// the teacher-only Exams attempts expander, but a teacher could never
+// actually load it. Scoped to the exam's own subject_id.
+app.get('/api/admin/exam-attempts/:attemptId/flags', authenticateToken, requireAdminOrTeacher, async (req, res) => {
   try {
     // exam_proctor_flags has no organization_id of its own — scoped
     // transitively via attempt -> exam, checked here so one org's admin
     // can't read another's flag timeline by guessing an attempt id.
+    const examRes = await pool.query(
+      `SELECT e.subject_id FROM exam_attempts a JOIN exams e ON e.id = a.exam_id
+       WHERE a.id = $1 AND e.organization_id = $2`,
+      [req.params.attemptId, req.user.organizationId]
+    );
+    if (examRes.rows.length === 0) return res.status(404).json({ error: 'Attempt not found' });
+    if (await enforceSubjectAuthority(req, res, examRes.rows[0].subject_id)) return;
+
     const result = await pool.query(
       `SELECT f.severity, f.flag_type, f.detail, f.created_at
        FROM exam_proctor_flags f
@@ -8373,8 +8742,16 @@ app.get('/api/admin/exam-attempts/:attemptId/flags', authenticateToken, requireA
 // Admin: every answer in one attempt, joined with its item's prompt/marks —
 // powers the grading UI (short/long) and doubles as a full answer review
 // for every item type, not just the ones needing manual grading.
-app.get('/api/admin/exam-attempts/:attemptId/answers', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/exam-attempts/:attemptId/answers', authenticateToken, requireAdminOrTeacher, async (req, res) => {
   try {
+    const examRes = await pool.query(
+      `SELECT e.subject_id FROM exam_attempts a JOIN exams e ON e.id = a.exam_id
+       WHERE a.id = $1 AND e.organization_id = $2`,
+      [req.params.attemptId, req.user.organizationId]
+    );
+    if (examRes.rows.length === 0) return res.status(404).json({ error: 'Attempt not found' });
+    if (await enforceSubjectAuthority(req, res, examRes.rows[0].subject_id)) return;
+
     const result = await pool.query(
       `SELECT ea.id AS answer_id, ei.id AS item_id, ei.type, ei.prompt, ei.marks, ei.options,
               ea.marks_awarded, ea.selected_option_id, ea.text_answer, ea.is_correct,
@@ -8440,10 +8817,10 @@ app.get('/api/admin/exam-attempts/:attemptId/answers', authenticateToken, requir
 // restricted to short/long (mcq/coding stay auto-graded), but remarks can be
 // left on any item type — both fields are independently optional (undefined
 // means "don't touch"), same pattern as the assignment grading route.
-app.put('/api/admin/exam-answers/:answerId/grade', authenticateToken, requireAdmin, async (req, res) => {
+app.put('/api/admin/exam-answers/:answerId/grade', authenticateToken, requireAdminOrTeacher, async (req, res) => {
   try {
     const answerRes = await pool.query(
-      `SELECT ea.id, ea.attempt_id, ei.type, ei.marks
+      `SELECT ea.id, ea.attempt_id, ei.type, ei.marks, e.subject_id
        FROM exam_answers ea
        JOIN exam_items ei ON ei.id = ea.item_id
        JOIN exam_attempts a ON a.id = ea.attempt_id
@@ -8452,6 +8829,7 @@ app.put('/api/admin/exam-answers/:answerId/grade', authenticateToken, requireAdm
       [req.params.answerId, req.user.organizationId]
     );
     if (answerRes.rows.length === 0) return res.status(404).json({ error: 'Answer not found' });
+    if (await enforceSubjectAuthority(req, res, answerRes.rows[0].subject_id)) return;
 
     const answer = answerRes.rows[0];
 
@@ -8484,10 +8862,10 @@ app.put('/api/admin/exam-answers/:answerId/grade', authenticateToken, requireAdm
 // Every row in exam_scan_answers is inherently a scan-type item by
 // construction (see POST /api/exams/:id/submit / scan-submit), so there's
 // no type check to make here the way the short/long route above needs one.
-app.put('/api/admin/exam-scan-answers/:answerId/grade', authenticateToken, requireAdmin, async (req, res) => {
+app.put('/api/admin/exam-scan-answers/:answerId/grade', authenticateToken, requireAdminOrTeacher, async (req, res) => {
   try {
     const answerRes = await pool.query(
-      `SELECT esa.id, esa.attempt_id, ei.marks
+      `SELECT esa.id, esa.attempt_id, ei.marks, e.subject_id
        FROM exam_scan_answers esa
        JOIN exam_items ei ON ei.id = esa.item_id
        JOIN exam_attempts a ON a.id = esa.attempt_id
@@ -8496,6 +8874,7 @@ app.put('/api/admin/exam-scan-answers/:answerId/grade', authenticateToken, requi
       [req.params.answerId, req.user.organizationId]
     );
     if (answerRes.rows.length === 0) return res.status(404).json({ error: 'Answer not found' });
+    if (await enforceSubjectAuthority(req, res, answerRes.rows[0].subject_id)) return;
 
     const answer = answerRes.rows[0];
 
@@ -8523,14 +8902,15 @@ app.put('/api/admin/exam-scan-answers/:answerId/grade', authenticateToken, requi
 
 // Admin: set the overall remarks for an exam attempt (separate from any
 // per-question remarks above).
-app.put('/api/admin/exam-attempts/:attemptId/remarks', authenticateToken, requireAdmin, async (req, res) => {
+app.put('/api/admin/exam-attempts/:attemptId/remarks', authenticateToken, requireAdminOrTeacher, async (req, res) => {
   try {
     const attemptRes = await pool.query(
-      `SELECT a.id FROM exam_attempts a JOIN exams e ON e.id = a.exam_id
+      `SELECT a.id, e.subject_id FROM exam_attempts a JOIN exams e ON e.id = a.exam_id
        WHERE a.id = $1 AND e.organization_id = $2`,
       [req.params.attemptId, req.user.organizationId]
     );
     if (attemptRes.rows.length === 0) return res.status(404).json({ error: 'Attempt not found' });
+    if (await enforceSubjectAuthority(req, res, attemptRes.rows[0].subject_id)) return;
 
     const overallRemarks = String(req.body.overallRemarks || '').trim() || null;
     await pool.query('UPDATE exam_attempts SET overall_remarks = $1 WHERE id = $2', [overallRemarks, req.params.attemptId]);
@@ -8546,14 +8926,15 @@ app.put('/api/admin/exam-attempts/:attemptId/remarks', authenticateToken, requir
 // for assignments. Exams have no shared deadline sweep to wait on in the
 // first place (see processOneExamScanAttempt's own comment), so this is
 // really just for retrying an ocr_failed attempt.
-app.post('/api/admin/exam-attempts/:attemptId/process-scan', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/exam-attempts/:attemptId/process-scan', authenticateToken, requireAdminOrTeacher, async (req, res) => {
   try {
     const attemptRes = await pool.query(
-      `SELECT a.id, a.scan_storage_key FROM exam_attempts a JOIN exams e ON e.id = a.exam_id
+      `SELECT a.id, a.scan_storage_key, e.subject_id FROM exam_attempts a JOIN exams e ON e.id = a.exam_id
        WHERE a.id = $1 AND e.organization_id = $2`,
       [req.params.attemptId, req.user.organizationId]
     );
     if (attemptRes.rows.length === 0) return res.status(404).json({ error: 'Attempt not found' });
+    if (await enforceSubjectAuthority(req, res, attemptRes.rows[0].subject_id)) return;
     if (!attemptRes.rows[0].scan_storage_key) return res.status(400).json({ error: 'No scanned pages were submitted for this attempt' });
     if (!isB2Configured()) return res.status(503).json({ error: 'Scanned-assignment storage is not configured yet' });
     if (!isOcrConfigured()) return res.status(503).json({ error: 'OCR is not configured yet' });
@@ -8891,10 +9272,11 @@ app.get('/api/me/scan-submission', authenticateToken, async (req, res) => {
 // access unilaterally. At most one row per student (see the UNIQUE
 // (problem_id, user_id) index), so this is already every student's FINAL
 // submission, not a "best of many" pick the way code-judge attempts are.
-app.get('/api/admin/problems/:id/scan-submissions', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/problems/:id/scan-submissions', authenticateToken, requireAdminOrTeacher, async (req, res) => {
   try {
-    const problemRes = await pool.query('SELECT id FROM problems WHERE id = $1 AND organization_id = $2', [req.params.id, req.user.organizationId]);
+    const problemRes = await pool.query('SELECT id, subject_id FROM problems WHERE id = $1 AND organization_id = $2', [req.params.id, req.user.organizationId]);
     if (problemRes.rows.length === 0) return res.status(404).json({ error: 'Assignment not found' });
+    if (await enforceSubjectAuthority(req, res, problemRes.rows[0].subject_id)) return;
 
     const totalMarksRes = await pool.query('SELECT COALESCE(SUM(marks), 0) AS total FROM scan_assignment_questions WHERE problem_id = $1', [req.params.id]);
     const totalMarks = Number(totalMarksRes.rows[0].total);
@@ -9205,16 +9587,17 @@ sweepScanSubmissions();
 // assessment and current marks, and this submission's own flags (both
 // types). Backs ScanReview.jsx. requireAdmin-only, same gating as every
 // other scan-review route (see the note on the list route above).
-app.get('/api/admin/scan-submissions/:id', authenticateToken, requireAdmin, async (req, res) => {
+app.get('/api/admin/scan-submissions/:id', authenticateToken, requireAdminOrTeacher, async (req, res) => {
   try {
     const subRes = await pool.query(
-      `SELECT ss.*, u.email, u.name FROM scan_submissions ss
+      `SELECT ss.*, u.email, u.name, p.subject_id FROM scan_submissions ss
        JOIN users u ON u.id = ss.user_id
        JOIN problems p ON p.id = ss.problem_id
        WHERE ss.id = $1 AND p.organization_id = $2`,
       [req.params.id, req.user.organizationId]
     );
     if (subRes.rows.length === 0) return res.status(404).json({ error: 'Submission not found' });
+    if (await enforceSubjectAuthority(req, res, subRes.rows[0].subject_id)) return;
     const submission = subRes.rows[0];
 
     const answersRes = await pool.query(
@@ -9287,14 +9670,15 @@ app.get('/api/admin/scan-submissions/:id', authenticateToken, requireAdmin, asyn
 // sweep's own concurrency limiter and in-flight tracking so a manual
 // trigger can't race the sweep into double-processing the same row, or get
 // silently reset back to 'pending' by the sweep's stuck-row recovery.
-app.post('/api/admin/scan-submissions/:id/process', authenticateToken, requireAdmin, async (req, res) => {
+app.post('/api/admin/scan-submissions/:id/process', authenticateToken, requireAdminOrTeacher, async (req, res) => {
   try {
     const subRes = await pool.query(
-      `SELECT ss.id, ss.status FROM scan_submissions ss JOIN problems p ON p.id = ss.problem_id
+      `SELECT ss.id, ss.status, p.subject_id FROM scan_submissions ss JOIN problems p ON p.id = ss.problem_id
        WHERE ss.id = $1 AND p.organization_id = $2`,
       [req.params.id, req.user.organizationId]
     );
     if (subRes.rows.length === 0) return res.status(404).json({ error: 'Submission not found' });
+    if (await enforceSubjectAuthority(req, res, subRes.rows[0].subject_id)) return;
     if (!isB2Configured()) return res.status(503).json({ error: 'Scanned-assignment storage is not configured yet' });
     if (!isOcrConfigured()) return res.status(503).json({ error: 'OCR is not configured yet' });
 
@@ -9320,7 +9704,7 @@ app.post('/api/admin/scan-submissions/:id/process', authenticateToken, requireAd
 // display label (original_filename) — the actual object key always follows
 // scanObjectKey()'s <org>/<problem>/<submissionId>.pdf convention, same as
 // every other scan submission, never the incoming filename.
-app.post('/api/admin/problems/:id/scan-submissions', authenticateToken, requireAdmin, scanUpload.single('file'), async (req, res) => {
+app.post('/api/admin/problems/:id/scan-submissions', authenticateToken, requireAdminOrTeacher, scanUpload.single('file'), async (req, res) => {
   const problemId = req.params.id;
   const studentEmail = String(req.body.email || '').trim().toLowerCase();
   if (!req.file) return res.status(400).json({ error: 'A PDF file is required' });
@@ -9329,10 +9713,11 @@ app.post('/api/admin/problems/:id/scan-submissions', authenticateToken, requireA
 
   try {
     const problemRes = await pool.query(
-      'SELECT submission_mode FROM problems WHERE id = $1 AND organization_id = $2',
+      'SELECT submission_mode, subject_id FROM problems WHERE id = $1 AND organization_id = $2',
       [problemId, req.user.organizationId]
     );
     if (problemRes.rows.length === 0) return res.status(404).json({ error: 'Assignment not found' });
+    if (await enforceSubjectAuthority(req, res, problemRes.rows[0].subject_id)) return;
     if (problemRes.rows[0].submission_mode !== 'scan') {
       return res.status(400).json({ error: 'This assignment does not accept scanned submissions' });
     }
@@ -9392,17 +9777,18 @@ app.post('/api/admin/problems/:id/scan-submissions', authenticateToken, requireA
 // never authoritative; see aiGrading.js). Ignored while penalized=true, so
 // a confirmed plagiarism flag can't be silently undone by re-saving a grade
 // — see PUT /api/admin/scan-flags/:type/:id for how that flag gets cleared.
-app.put('/api/admin/scan-submissions/:id/grade', authenticateToken, requireAdmin, async (req, res) => {
+app.put('/api/admin/scan-submissions/:id/grade', authenticateToken, requireAdminOrTeacher, async (req, res) => {
   const { marks, overallRemarks } = req.body; // marks: [{ questionId, marksAwarded, remarks }, ...]
   if (!Array.isArray(marks)) return res.status(400).json({ error: 'marks array is required' });
 
   try {
     const subRes = await pool.query(
-      `SELECT ss.id, ss.problem_id FROM scan_submissions ss JOIN problems p ON p.id = ss.problem_id
+      `SELECT ss.id, ss.problem_id, p.subject_id FROM scan_submissions ss JOIN problems p ON p.id = ss.problem_id
        WHERE ss.id = $1 AND p.organization_id = $2`,
       [req.params.id, req.user.organizationId]
     );
     if (subRes.rows.length === 0) return res.status(404).json({ error: 'Submission not found' });
+    if (await enforceSubjectAuthority(req, res, subRes.rows[0].subject_id)) return;
 
     // Max marks per question — validated against below so a teacher can't
     // award more than a question is actually worth (previously unchecked
@@ -9530,7 +9916,14 @@ app.get('/api/admin/problems/:id/scan-flags', authenticateToken, requireAdmin, a
 // see the list/detail routes above) — handwriting flags never penalize
 // anything regardless of status, confirmed or not (see the false-positive-
 // risk note on ensureScanHandwritingFlagsSchema).
-app.put('/api/admin/scan-flags/:type/:id', authenticateToken, requireAdmin, async (req, res) => {
+// requireAdminOrTeacher + enforceSubjectAuthority, not requireAdmin —
+// reachable from ScanReview.jsx, a page a teacher can land on for their own
+// scan-mode assignments (see that page's own ProtectedRoute entry in
+// App.jsx). Both submissions being compared always belong to the same
+// assignment (plagiarism/handwriting comparison is only ever within one
+// assignment — see textShingles/jaccardSimilarity's own comments above),
+// so either side's problem gives the same subject_id either way.
+app.put('/api/admin/scan-flags/:type/:id', authenticateToken, requireAdminOrTeacher, async (req, res) => {
   const { type, id } = req.params;
   const { status } = req.body; // 'reviewed_confirmed' | 'reviewed_dismissed'
   if (!['reviewed_confirmed', 'reviewed_dismissed'].includes(status)) {
@@ -9546,7 +9939,7 @@ app.put('/api/admin/scan-flags/:type/:id', authenticateToken, requireAdmin, asyn
     // (which has no problem_id of its own) — either side's submission's
     // problem is enough to prove org ownership of the flag.
     const flagRes = await client.query(
-      `SELECT f.id, f.submission_a_id, f.submission_b_id FROM ${table} f
+      `SELECT f.id, f.submission_a_id, f.submission_b_id, p.subject_id FROM ${table} f
        JOIN scan_submissions sa ON sa.id = f.submission_a_id
        JOIN problems p ON p.id = sa.problem_id
        WHERE f.id = $1 AND p.organization_id = $2`,
@@ -9556,6 +9949,7 @@ app.put('/api/admin/scan-flags/:type/:id', authenticateToken, requireAdmin, asyn
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'Flag not found' });
     }
+    if (await enforceSubjectAuthority(req, res, flagRes.rows[0].subject_id)) { await client.query('ROLLBACK'); return; }
     const flag = flagRes.rows[0];
 
     await client.query(`UPDATE ${table} SET status = $1 WHERE id = $2`, [status, id]);
@@ -9729,6 +10123,431 @@ app.post('/api/problems/:id/time-log', authenticateToken, async (req, res) => {
   }
 });
 
+// ============================================================================
+// NOTES — teacher-posted subject media, six types (see ensureNotesSchema
+// above for the visibility model and the full type list). Storage reuses
+// the scan-PDF B2 helpers unchanged (uploadScanPdf/getScanPdfUrl/
+// deleteScanPdf take an arbitrary object key + buffer + contentType and
+// have no scan-specific logic in them) with notesObjectKey's own key prefix
+// keeping the two features' objects apart in the bucket — only the four
+// file-based types (pdf/image/video/audio) ever touch B2 at all; text and
+// link notes are pure DB rows.
+// ============================================================================
+const NOTE_FILE_TYPES = new Set(['pdf', 'image', 'video', 'audio']);
+const NOTE_TYPES = new Set(['pdf', 'image', 'video', 'audio', 'text', 'link']);
+// Default extension when an uploaded file's own name has none (rare, but a
+// mobile browser's camera/mic capture sometimes hands back an extension-
+// less blob) — path.extname() on the original filename is tried first.
+const NOTE_DEFAULT_EXT = { pdf: '.pdf', image: '.jpg', video: '.mp4', audio: '.mp3' };
+
+// Shared by every route below that returns note rows — the four file types
+// carry a presigned viewUrl (null if B2 isn't configured); text/link carry
+// their payload directly (bodyText/externalUrl) and never touch B2 at all,
+// so they always have a "view" regardless of whether storage is configured.
+async function serializeNoteRow(row, b2Configured) {
+  return {
+    id: row.id,
+    subjectId: row.subject_id,
+    subjectName: row.subject_name,
+    title: row.title,
+    type: row.type,
+    createdAt: row.created_at,
+    teacherName: row.teacher_name,
+    bodyText: row.body_text,
+    externalUrl: row.external_url,
+    viewUrl: row.storage_key && b2Configured ? await getScanPdfUrl(row.storage_key) : null,
+  };
+}
+
+// Subject dropdown shared by the teacher Uploads tab and the student Notes
+// tab — same subject-visibility rules those roles already have elsewhere
+// (getTeacherScope / getVisibleSubjectIds), just returned as a plain
+// id+name list instead of folded into a bigger payload.
+app.get('/api/notes/subjects', authenticateToken, async (req, res) => {
+  try {
+    let subjectIds;
+    if (req.user.role === 'teacher') {
+      subjectIds = (await getTeacherScope(req.user.userId, req.user.organizationId)).subjectIds;
+    } else if (req.user.role === 'student') {
+      subjectIds = await getVisibleSubjectIds(req.user.orgUnitId);
+    } else {
+      return res.status(403).json({ error: 'Not available for this role' });
+    }
+    if (subjectIds.length === 0) return res.status(200).json({ subjects: [] });
+
+    const result = await pool.query(
+      `SELECT s.id, s.name, u.name AS org_unit_name FROM subjects s JOIN org_units u ON u.id = s.org_unit_id
+       WHERE s.id = ANY($1::int[]) ORDER BY s.name ASC`,
+      [subjectIds]
+    );
+    res.status(200).json({ subjects: result.rows });
+  } catch (err) {
+    console.error('List note subjects error:', err);
+    res.status(500).json({ error: 'Failed to load subjects' });
+  }
+});
+
+// A teacher's own Uploads panel — always scoped to their own uploads
+// (teacher_id = caller), never a co-teacher's, since this is "my uploads,"
+// not "my subject's uploads." subjectId/search are both optional filters;
+// with neither, this is just everything they've ever uploaded, newest first.
+app.get('/api/teacher/notes', authenticateToken, requireAdminOrTeacher, async (req, res) => {
+  const subjectId = req.query.subjectId ? Number(req.query.subjectId) : null;
+  const search = String(req.query.search || '').trim();
+
+  try {
+    const params = [req.user.userId];
+    let where = 'n.teacher_id = $1';
+    if (subjectId) { params.push(subjectId); where += ` AND n.subject_id = $${params.length}`; }
+    if (search) { params.push(`%${search}%`); where += ` AND n.title ILIKE $${params.length}`; }
+
+    const result = await pool.query(
+      `SELECT n.id, n.subject_id, s.name AS subject_name, n.title, n.type, n.storage_key, n.body_text, n.external_url, n.created_at
+       FROM notes n JOIN subjects s ON s.id = n.subject_id
+       WHERE ${where} ORDER BY n.created_at DESC`,
+      params
+    );
+    const configured = isB2Configured();
+    const notes = await Promise.all(result.rows.map((row) => serializeNoteRow(row, configured)));
+    res.status(200).json({ notes });
+  } catch (err) {
+    console.error('List teacher notes error:', err);
+    res.status(500).json({ error: 'Failed to load uploads' });
+  }
+});
+
+app.post('/api/teacher/notes', authenticateToken, requireAdminOrTeacher, notesUpload.single('file'), async (req, res) => {
+  const subjectId = req.body.subjectId != null ? Number(req.body.subjectId) : null;
+  const title = String(req.body.title || '').trim();
+  const type = String(req.body.type || '').trim();
+
+  if (!subjectId) return res.status(400).json({ error: 'A subject is required' });
+  if (!title) return res.status(400).json({ error: 'A title is required' });
+  if (!NOTE_TYPES.has(type)) return res.status(400).json({ error: 'Invalid note type' });
+
+  // Per-type payload validation — exactly one of {file, bodyText,
+  // externalUrl} matters depending on type, matching notes_content_check's
+  // own shape on the DB side.
+  let bodyText = null;
+  let externalUrl = null;
+  if (NOTE_FILE_TYPES.has(type)) {
+    if (!isB2Configured()) return res.status(503).json({ error: 'Notes storage is not configured yet' });
+    if (!req.file) return res.status(400).json({ error: `A ${type} file is required` });
+    const mimeOk = type === 'pdf' ? req.file.mimetype === 'application/pdf' : req.file.mimetype.startsWith(`${type}/`);
+    if (!mimeOk) return res.status(400).json({ error: `That file doesn't look like a ${type}` });
+  } else if (type === 'text') {
+    bodyText = String(req.body.bodyText || '').trim();
+    if (!bodyText) return res.status(400).json({ error: 'Note text is required' });
+  } else if (type === 'link') {
+    externalUrl = String(req.body.externalUrl || '').trim();
+    let parsed;
+    try {
+      parsed = new URL(externalUrl);
+    } catch {
+      return res.status(400).json({ error: 'Enter a valid URL' });
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return res.status(400).json({ error: 'Only http(s) links are allowed' });
+    }
+  }
+
+  if (await enforceSubjectAuthority(req, res, subjectId)) return;
+
+  try {
+    // enforceSubjectAuthority already scopes a teacher's subject to their
+    // own org via its own JOIN; this covers the admin bypass path, where
+    // that check is a no-op — without it an admin request naming another
+    // org's subject id would otherwise sail through to the insert below.
+    const subject = await pool.query('SELECT id, name, org_unit_id FROM subjects WHERE id = $1 AND organization_id = $2', [subjectId, req.user.organizationId]);
+    if (subject.rows.length === 0) return res.status(404).json({ error: 'Subject not found' });
+
+    // File-based types upload to B2 BEFORE the insert (notes_content_check
+    // requires storage_key to already be non-empty on that first row — see
+    // notesObjectKey's own comment for why there's no placeholder-row step
+    // here the way scan_submissions has). Text/link never touch B2 at all.
+    let storageKey = null;
+    let originalFilename = null;
+    if (req.file) {
+      originalFilename = req.file.originalname;
+      const ext = path.extname(req.file.originalname) || NOTE_DEFAULT_EXT[type] || '';
+      storageKey = notesObjectKey(req.user.organizationId, subjectId, crypto.randomUUID(), ext);
+      await uploadScanPdf(storageKey, req.file.buffer, req.file.mimetype);
+    }
+
+    const insertRes = await pool.query(
+      `INSERT INTO notes (organization_id, subject_id, teacher_id, title, type, original_filename, storage_key, body_text, external_url)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id, created_at`,
+      [req.user.organizationId, subjectId, req.user.userId, title, type, originalFilename, storageKey, bodyText, externalUrl]
+    );
+
+    // Best-effort, same "continuing anyway" posture as the delete-on-B2
+    // path below — a notification fan-out failing shouldn't fail the
+    // upload the teacher is actively waiting on. Same descendant-units walk
+    // getTeacherScope uses (a note on a Department-tier subject reaches
+    // every Year beneath it, not just students in the subject's own exact
+    // unit), just seeded from this one subject's org_unit_id instead of a
+    // teacher's whole subject list.
+    try {
+      await pool.query(
+        `WITH RECURSIVE descendant_units AS (
+           SELECT id FROM org_units WHERE id = $1
+           UNION
+           SELECT ou.id FROM org_units ou JOIN descendant_units d ON ou.parent_unit_id = d.id
+         )
+         INSERT INTO notifications (organization_id, user_id, type, title, body, note_id)
+         SELECT $2, m.user_id, 'note', $3, $4, $5
+         FROM memberships m
+         WHERE m.organization_id = $2 AND m.role = 'student' AND m.org_unit_id IN (SELECT id FROM descendant_units)`,
+        [subject.rows[0].org_unit_id, req.user.organizationId, title, `New ${type} in ${subject.rows[0].name}`, insertRes.rows[0].id]
+      );
+    } catch (err) {
+      console.error('Failed to notify students of new note (continuing anyway):', err);
+    }
+
+    res.status(201).json({ id: insertRes.rows[0].id, createdAt: insertRes.rows[0].created_at });
+  } catch (err) {
+    console.error('Upload note error:', err);
+    res.status(500).json({ error: 'Failed to upload note' });
+  }
+});
+
+app.delete('/api/teacher/notes/:id', authenticateToken, requireAdminOrTeacher, async (req, res) => {
+  try {
+    const existing = await pool.query('SELECT storage_key FROM notes WHERE id = $1 AND teacher_id = $2', [req.params.id, req.user.userId]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Note not found' });
+
+    await pool.query('DELETE FROM notes WHERE id = $1', [req.params.id]);
+    if (existing.rows[0].storage_key) {
+      try {
+        await deleteScanPdf(existing.rows[0].storage_key);
+      } catch (err) {
+        console.error('Failed to delete note PDF (continuing anyway):', err);
+      }
+    }
+    res.status(200).json({ message: 'Note deleted' });
+  } catch (err) {
+    console.error('Delete note error:', err);
+    res.status(500).json({ error: 'Failed to delete note' });
+  }
+});
+
+// Student-facing Notes tab. subjectId picks one subject's notes
+// (recent-first, per the ask); search narrows by title and — unlike
+// subjectId — works across every subject visible to the student, so
+// "search up a specific pdf" doesn't first require knowing which subject
+// it lives under. At least one of the two is required so this can never
+// turn into "dump every note in every subject I can see."
+app.get('/api/notes', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'student') return res.status(403).json({ error: 'Not available for this role' });
+
+  const subjectId = req.query.subjectId ? Number(req.query.subjectId) : null;
+  const search = String(req.query.search || '').trim();
+  if (!subjectId && !search) return res.status(400).json({ error: 'A subject or search term is required' });
+
+  try {
+    const visibleSubjectIds = await getVisibleSubjectIds(req.user.orgUnitId);
+    if (subjectId && !visibleSubjectIds.includes(subjectId)) return res.status(404).json({ error: 'Subject not found' });
+    if (visibleSubjectIds.length === 0) return res.status(200).json({ notes: [] });
+
+    const scopeIds = subjectId ? [subjectId] : visibleSubjectIds;
+    const params = [scopeIds];
+    let where = 'n.subject_id = ANY($1::int[])';
+    if (search) { params.push(`%${search}%`); where += ` AND n.title ILIKE $${params.length}`; }
+
+    const result = await pool.query(
+      `SELECT n.id, n.subject_id, s.name AS subject_name, n.title, n.type, n.storage_key, n.body_text, n.external_url, n.created_at, u.name AS teacher_name
+       FROM notes n JOIN subjects s ON s.id = n.subject_id JOIN users u ON u.id = n.teacher_id
+       WHERE ${where} ORDER BY n.created_at DESC`,
+      params
+    );
+    const configured = isB2Configured();
+    const notes = await Promise.all(result.rows.map((row) => serializeNoteRow(row, configured)));
+    res.status(200).json({ notes });
+  } catch (err) {
+    console.error('List notes error:', err);
+    res.status(500).json({ error: 'Failed to load notes' });
+  }
+});
+
+// ============================================================================
+// NOTICES — admin-posted, org-wide media (see ensureNoticesSchema above for
+// the type list and visibility model). No subject, no per-poster scoping on
+// the list route — unlike teacher notes' personal Uploads panel, every
+// admin in the org manages the SAME shared list, and every member of the
+// org (any role) reads it via the one GET route below.
+// ============================================================================
+const NOTICE_FILE_TYPES = new Set(['pdf', 'image']);
+const NOTICE_TYPES = new Set(['pdf', 'image', 'text', 'link']);
+
+async function serializeNoticeRow(row, b2Configured) {
+  return {
+    id: row.id,
+    title: row.title,
+    type: row.type,
+    createdAt: row.created_at,
+    bodyText: row.body_text,
+    externalUrl: row.external_url,
+    viewUrl: row.storage_key && b2Configured ? await getScanPdfUrl(row.storage_key) : null,
+  };
+}
+
+// Any authenticated org member reads this — students, teachers, and admins
+// alike, per notices' own org-wide visibility (no subject/unit scoping to
+// enforce, unlike GET /api/notes). search narrows by title, same ILIKE
+// convention as every other search box in this feature.
+app.get('/api/notices', authenticateToken, async (req, res) => {
+  const search = String(req.query.search || '').trim();
+  try {
+    const params = [req.user.organizationId];
+    let where = 'organization_id = $1';
+    if (search) { params.push(`%${search}%`); where += ` AND title ILIKE $${params.length}`; }
+
+    const result = await pool.query(
+      `SELECT id, title, type, storage_key, body_text, external_url, created_at
+       FROM notices WHERE ${where} ORDER BY created_at DESC LIMIT 100`,
+      params
+    );
+    const configured = isB2Configured();
+    const notices = await Promise.all(result.rows.map((row) => serializeNoticeRow(row, configured)));
+    res.status(200).json({ notices });
+  } catch (err) {
+    console.error('List notices error:', err);
+    res.status(500).json({ error: 'Failed to load notices' });
+  }
+});
+
+app.post('/api/admin/notices', authenticateToken, requireAdmin, notesUpload.single('file'), async (req, res) => {
+  const title = String(req.body.title || '').trim();
+  const type = String(req.body.type || '').trim();
+  if (!title) return res.status(400).json({ error: 'A title is required' });
+  if (!NOTICE_TYPES.has(type)) return res.status(400).json({ error: 'Invalid notice type' });
+
+  let bodyText = null;
+  let externalUrl = null;
+  if (NOTICE_FILE_TYPES.has(type)) {
+    if (!isB2Configured()) return res.status(503).json({ error: 'Notice storage is not configured yet' });
+    if (!req.file) return res.status(400).json({ error: `A ${type} file is required` });
+    const mimeOk = type === 'pdf' ? req.file.mimetype === 'application/pdf' : req.file.mimetype.startsWith('image/');
+    if (!mimeOk) return res.status(400).json({ error: `That file doesn't look like a ${type}` });
+  } else if (type === 'text') {
+    bodyText = String(req.body.bodyText || '').trim();
+    if (!bodyText) return res.status(400).json({ error: 'Notice text is required' });
+  } else if (type === 'link') {
+    externalUrl = String(req.body.externalUrl || '').trim();
+    let parsed;
+    try {
+      parsed = new URL(externalUrl);
+    } catch {
+      return res.status(400).json({ error: 'Enter a valid URL' });
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return res.status(400).json({ error: 'Only http(s) links are allowed' });
+    }
+  }
+
+  try {
+    let storageKey = null;
+    let originalFilename = null;
+    if (req.file) {
+      originalFilename = req.file.originalname;
+      const ext = path.extname(req.file.originalname) || NOTE_DEFAULT_EXT[type] || '';
+      storageKey = noticesObjectKey(req.user.organizationId, crypto.randomUUID(), ext);
+      await uploadScanPdf(storageKey, req.file.buffer, req.file.mimetype);
+    }
+
+    const insertRes = await pool.query(
+      `INSERT INTO notices (organization_id, admin_id, title, type, original_filename, storage_key, body_text, external_url)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id, created_at`,
+      [req.user.organizationId, req.user.userId, title, type, originalFilename, storageKey, bodyText, externalUrl]
+    );
+
+    // Best-effort, same posture as POST /api/teacher/notes' own fan-out —
+    // every student AND teacher in the org (not admins; the poster's fellow
+    // admins already see it directly in their own shared notices list, same
+    // as the poster does, with no separate bell needed for that).
+    try {
+      await pool.query(
+        `INSERT INTO notifications (organization_id, user_id, type, title, body, notice_id)
+         SELECT $1, m.user_id, 'notice', $2, 'New notice posted', $3
+         FROM memberships m WHERE m.organization_id = $1 AND m.role IN ('student', 'teacher')`,
+        [req.user.organizationId, title, insertRes.rows[0].id]
+      );
+    } catch (err) {
+      console.error('Failed to notify org of new notice (continuing anyway):', err);
+    }
+
+    res.status(201).json({ id: insertRes.rows[0].id, createdAt: insertRes.rows[0].created_at });
+  } catch (err) {
+    console.error('Post notice error:', err);
+    res.status(500).json({ error: 'Failed to post notice' });
+  }
+});
+
+// Not scoped to admin_id — any admin in the org can remove any notice, same
+// "one shared list, jointly managed" posture GET /api/notices already has.
+app.delete('/api/admin/notices/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const existing = await pool.query('SELECT storage_key FROM notices WHERE id = $1 AND organization_id = $2', [req.params.id, req.user.organizationId]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Notice not found' });
+
+    await pool.query('DELETE FROM notices WHERE id = $1', [req.params.id]);
+    if (existing.rows[0].storage_key) {
+      try {
+        await deleteScanPdf(existing.rows[0].storage_key);
+      } catch (err) {
+        console.error('Failed to delete notice file (continuing anyway):', err);
+      }
+    }
+    res.status(200).json({ message: 'Notice deleted' });
+  } catch (err) {
+    console.error('Delete notice error:', err);
+    res.status(500).json({ error: 'Failed to delete notice' });
+  }
+});
+
+// Notification feed — two producers now (see ensureNotificationsSchema's
+// own comment), so this is student-or-teacher rather than student-only:
+// a teacher's note-upload notifications were always student-only, but
+// notices fan out to teachers too. Capped at the 50 most recent so a
+// long-inactive user's first load isn't unbounded.
+app.get('/api/notifications', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'student' && req.user.role !== 'teacher') return res.status(403).json({ error: 'Not available for this role' });
+  try {
+    const result = await pool.query(
+      `SELECT id, type, title, body, note_id, notice_id, read_at, created_at FROM notifications
+       WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`,
+      [req.user.userId]
+    );
+    const notifications = result.rows.map((row) => ({
+      id: row.id,
+      type: row.type,
+      title: row.title,
+      body: row.body,
+      noteId: row.note_id,
+      noticeId: row.notice_id,
+      read: row.read_at !== null,
+      createdAt: row.created_at,
+    }));
+    res.status(200).json({ notifications });
+  } catch (err) {
+    console.error('List notifications error:', err);
+    res.status(500).json({ error: 'Failed to load notifications' });
+  }
+});
+
+// Marks every one of the caller's currently-unread notifications as read in
+// one shot — called when the notification dropdown is opened, rather than
+// tracking each notification's read state individually from the frontend.
+app.post('/api/notifications/mark-read', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'student' && req.user.role !== 'teacher') return res.status(403).json({ error: 'Not available for this role' });
+  try {
+    await pool.query('UPDATE notifications SET read_at = now() WHERE user_id = $1 AND read_at IS NULL', [req.user.userId]);
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error('Mark notifications read error:', err);
+    res.status(500).json({ error: 'Failed to update notifications' });
+  }
+});
 
 // Backstop, not the primary error-handling path — every route above already
 // wraps its own body in try/catch and answers its own res.status(500), so

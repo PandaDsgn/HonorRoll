@@ -459,7 +459,15 @@ export default function ScanCapture() {
         </div>
 
         <div className="panel scan-capture-panel">
-          <h2 style={{ margin: '0 0 8px' }}>Scan &amp; submit</h2>
+          {/* This route serves BOTH a purely-digital assignment (every
+              question mcq/short/long/coding, no camera ever involved) and a
+              mixed one with an actual paper-scan question — "Scan & submit"
+              only makes sense for the latter, so the heading is generic
+              until scanContext confirms there's a scan-type question at
+              all (scanQuestions is [] both before scanContext loads and for
+              a genuinely scan-less assignment, so this reads correctly in
+              every phase, not just 'questions'). */}
+          <h2 style={{ margin: '0 0 8px' }}>{scanQuestions.length > 0 ? 'Scan & submit' : 'Submit assignment'}</h2>
 
           {phase === 'loading' && <p className="sb-loading">Starting the scanner…</p>}
 
@@ -502,6 +510,12 @@ export default function ScanCapture() {
                   ? "Answer anything below that isn't on paper first — you won't be able to see this again once the camera opens."
                   : 'Answer every question below, then submit.'}
               </p>
+
+              {scanQuestions.length > 0 && (
+                <p className="auth-sub" style={{ margin: '0 0 12px' }}>
+                  Note: your scanned page is submitted together with the rest of your answers, but it's read and graded afterward — that part of your result may take a little longer to appear than the rest.
+                </p>
+              )}
 
               {(scanContext.questions || []).map((q, idx) => {
                 const ans = answers[q.id] || {};

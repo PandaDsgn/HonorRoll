@@ -19,11 +19,16 @@ import ExamAttempt from './pages/ExamAttempt';
 import ExamResult from './pages/ExamResult';
 import AdminDashboard from './pages/AdminDashboard';
 import MyPerformance from './pages/MyPerformance';
+import Notes from './pages/Notes';
+import Notices from './pages/Notices';
 import ScanReview from './pages/ScanReview';
 import SuperadminDashboard from './pages/SuperadminDashboard';
 import SuperadminOrgDetail from './pages/SuperadminOrgDetail';
 import Terms from './pages/Terms';
 import Privacy from './pages/Privacy';
+import About from './pages/About';
+import Contact from './pages/Contact';
+import Changelog from './pages/Changelog';
 
 function App() {
   return (
@@ -39,6 +44,9 @@ function App() {
           <Route path="/reset-password" element={<ResetPassword />} />
           <Route path="/terms" element={<Terms />} />
           <Route path="/privacy" element={<Privacy />} />
+          <Route path="/about" element={<About />} />
+          <Route path="/contact" element={<Contact />} />
+          <Route path="/changelog" element={<Changelog />} />
 
           <Route path="/assignments" element={<ProtectedRoute><Problems /></ProtectedRoute>} />
           <Route path="/assignments/:id" element={<ProtectedRoute><Sandbox /></ProtectedRoute>} />
@@ -53,6 +61,8 @@ function App() {
           <Route path="/exams/:id/result" element={<ProtectedRoute><ExamResult /></ProtectedRoute>} />
 
           <Route path="/performance" element={<ProtectedRoute roles={['student']}><MyPerformance /></ProtectedRoute>} />
+          <Route path="/notes" element={<ProtectedRoute roles={['student']}><Notes /></ProtectedRoute>} />
+          <Route path="/notices" element={<ProtectedRoute roles={['student', 'teacher']}><Notices /></ProtectedRoute>} />
 
           <Route
             path="/admin"
@@ -66,7 +76,7 @@ function App() {
           <Route
             path="/admin/scan-submissions/:id"
             element={
-              <ProtectedRoute roles={['admin']}>
+              <ProtectedRoute roles={['admin', 'teacher']}>
                 <ScanReview />
               </ProtectedRoute>
             }

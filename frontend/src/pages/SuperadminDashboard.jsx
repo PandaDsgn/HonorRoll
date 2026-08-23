@@ -34,10 +34,13 @@ const PCR_STATUS_CLASS = { pending: 'chip-medium', escalated: 'chip-medium', app
 export default function SuperadminDashboard() {
   const navigate = useNavigate();
   const { theme, toggleTheme } = useTheme();
-  const { user, logout } = useAuth();
+  const { user, logout, setUser } = useAuth();
   const [orgs, setOrgs] = useState(null);
   const [summary, setSummary] = useState(null);
   const [error, setError] = useState('');
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState('');
+  const [savingName, setSavingName] = useState(false);
   const [orgFilter, setOrgFilter] = useState('');
   const [statusBusyId, setStatusBusyId] = useState(null);
   const [deletingOrg, setDeletingOrg] = useState(null); // { id, name } | null — org currently in the confirm-delete flow
@@ -56,6 +59,32 @@ export default function SuperadminDashboard() {
   const handleLogout = async () => {
     await logout();
     navigate('/', { replace: true });
+  };
+
+  // Superadmin is the one role nothing else ever collects a display name
+  // for — an admin sets theirs at signup, a teacher/student gets theirs
+  // from whoever imported them — so this is the one self-service "set my
+  // own name" entry point in the whole app (see PUT /api/me's own comment
+  // on the backend). Updates local auth state directly on success rather
+  // than a full refetch, since the response already carries the new name.
+  const startEditName = () => {
+    setNameDraft(user?.name || '');
+    setEditingName(true);
+  };
+  const saveName = async () => {
+    const trimmed = nameDraft.trim();
+    if (!trimmed) return;
+    setSavingName(true);
+    setError('');
+    try {
+      await axios.put(`${API}/api/me`, { name: trimmed }, { withCredentials: true });
+      setUser((prev) => ({ ...prev, name: trimmed }));
+      setEditingName(false);
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to update name.');
+    } finally {
+      setSavingName(false);
+    }
   };
 
   // Just a navigation — no API call, no token swap. `orgName` rides along as
@@ -126,7 +155,31 @@ export default function SuperadminDashboard() {
 
       <section className="admin-shell">
         <div className="admin-head">
-          <h1 className="problems-title">Superadmin</h1>
+          <div>
+            <h1 className="problems-title" style={{ marginBottom: 4 }}>Superadmin Dashboard</h1>
+            {editingName ? (
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <input
+                  autoFocus
+                  value={nameDraft}
+                  onChange={(e) => setNameDraft(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') saveName(); if (e.key === 'Escape') setEditingName(false); }}
+                  style={{ width: 200, padding: '4px 8px', fontSize: 14, background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text)' }}
+                />
+                <button type="button" className="btn btn-primary btn-sm" disabled={savingName || !nameDraft.trim()} onClick={saveName}>
+                  {savingName ? 'Saving…' : 'Save'}
+                </button>
+                <button type="button" className="btn btn-ghost btn-sm" disabled={savingName} onClick={() => setEditingName(false)}>Cancel</button>
+              </div>
+            ) : (
+              <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-h)', display: 'flex', alignItems: 'center', gap: 8 }}>
+                {user?.name || <span style={{ color: 'var(--text-dim)', fontWeight: 400 }}>No name set</span>}
+                <button type="button" className="btn btn-ghost btn-sm" onClick={startEditName}>
+                  {user?.name ? 'Edit' : 'Add name'}
+                </button>
+              </div>
+            )}
+          </div>
         </div>
 
         {error && <div className="alert" style={{ marginBottom: 16 }}><span className="alert-icon">!</span><span>{error}</span></div>}
@@ -171,6 +224,8 @@ export default function SuperadminDashboard() {
         <ProfileChangeRequestsPanel />
 
         <AdminMessagesPanel />
+
+        <ContactMessagesPanel />
 
         <AddAdminRequestsPanel />
 
@@ -530,6 +585,112 @@ function AdminMessagesPanel() {
                       </div>
                     ) : (
                       r.response_note || '—'
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================================
+// CONTACT MESSAGES — the public /contact page's inbox. Unlike every other
+// panel on this dashboard, senders here aren't necessarily existing users
+// of the platform at all — a prospective institution, a parent, anyone who
+// found the marketing site — so there's no admin/organization identity to
+// show, just whatever they typed into the form (see POST /api/contact).
+// ============================================================================
+function ContactMessagesPanel() {
+  const [messages, setMessages] = useState(null);
+  const [error, setError] = useState('');
+  const [busyId, setBusyId] = useState(null);
+  const [noteDrafts, setNoteDrafts] = useState({});
+  const [showAll, setShowAll] = useState(false);
+
+  const fetchMessages = useCallback(() => {
+    axios.get(`${API}/api/superadmin/contact-messages`, {
+      params: { status: showAll ? 'all' : 'open' },
+      withCredentials: true,
+    })
+      .then((res) => setMessages(res.data.messages))
+      .catch((err) => setError(err.response?.data?.error || 'Failed to load contact messages.'));
+  }, [showAll]);
+
+  useEffect(() => { fetchMessages(); }, [fetchMessages]);
+
+  const resolve = async (id) => {
+    setBusyId(id);
+    setError('');
+    try {
+      await axios.post(`${API}/api/superadmin/contact-messages/${id}/resolve`, {
+        note: noteDrafts[id] || '',
+      }, { withCredentials: true });
+      fetchMessages();
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to resolve message.');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <div className="panel" style={{ padding: 20, marginBottom: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+        <h3 style={{ margin: 0 }}>Contact Messages</h3>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 }}>
+          <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} />
+          Show resolved too
+        </label>
+      </div>
+      <p className="auth-sub" style={{ margin: '0 0 16px' }}>
+        Submissions from the public /contact page.
+      </p>
+
+      {error && <div className="alert" style={{ marginBottom: 16 }}><span className="alert-icon">!</span><span>{error}</span></div>}
+      {!messages && !error && <p className="sb-loading">Loading…</p>}
+      {messages && messages.length === 0 && <p className="sb-loading">No messages to show.</p>}
+
+      {messages && messages.length > 0 && (
+        <div className="admin-table-wrap">
+          <table className="admin-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Contact</th>
+                <th>Message</th>
+                <th>Status</th>
+                <th aria-label="Actions" />
+              </tr>
+            </thead>
+            <tbody>
+              {messages.map((m) => (
+                <tr key={m.id}>
+                  <td className="admin-cell-strong">{m.name}</td>
+                  <td style={{ fontSize: 12.5 }}>
+                    <div>{m.email}</div>
+                    <div style={{ color: 'var(--text-dim)' }}>{m.mobile}</div>
+                  </td>
+                  <td style={{ maxWidth: 320, whiteSpace: 'normal', fontSize: 13 }}>{m.message}</td>
+                  <td><span className={`chip ${m.status === 'resolved' ? 'chip-easy' : 'chip-medium'}`}><span className="dot" />{m.status}</span></td>
+                  <td className="admin-cell-actions">
+                    {m.status === 'open' ? (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-end' }}>
+                        <input
+                          placeholder="Response (optional)"
+                          value={noteDrafts[m.id] || ''}
+                          onChange={(e) => setNoteDrafts((prev) => ({ ...prev, [m.id]: e.target.value }))}
+                          style={{ width: 180, padding: '4px 8px', fontSize: 12.5, background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text)' }}
+                        />
+                        <button type="button" className="btn btn-primary btn-sm" disabled={busyId === m.id} onClick={() => resolve(m.id)}>
+                          {busyId === m.id ? 'Saving…' : 'Mark resolved'}
+                        </button>
+                      </div>
+                    ) : (
+                      m.response_note || '—'
                     )}
                   </td>
                 </tr>

@@ -10,6 +10,8 @@ import AssignmentForm from '../components/AssignmentForm';
 import ExamForm from '../components/ExamForm';
 import OrgStructureBuilder from '../components/OrgStructureBuilder';
 import SubjectsPanel from '../components/SubjectsPanel';
+import TeacherUploadsPanel from '../components/TeacherUploadsPanel';
+import AdminNoticesPanel from '../components/AdminNoticesPanel';
 import BillingPanel from '../components/BillingPanel';
 import PercentBar from '../components/PercentBar';
 import { PERF_STATUS_LABELS, PERF_STATUS_CLASS } from '../lib/performanceStatus';
@@ -87,11 +89,13 @@ export default function AdminDashboard() {
 
       <section className="admin-shell">
         <div className="admin-head">
-          <h1 className="problems-title">
-            Admin dashboard
-            {user?.organization_name && <span className="auth-sub" style={{ marginLeft: 10, fontWeight: 400 }}>— {user.organization_name}</span>}
-            {user?.name && <span className="auth-sub" style={{ marginLeft: 10, fontWeight: 400 }}>({user.name})</span>}
-          </h1>
+          <div>
+            <h1 className="problems-title" style={{ marginBottom: 4 }}>
+              {user?.role === 'teacher' ? 'Teacher Dashboard' : 'Admin Dashboard'}
+            </h1>
+            {user?.name && <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-h)' }}>{user.name}</div>}
+            {user?.organization_name && <div style={{ fontSize: 13, color: 'var(--text-dim)', marginTop: 2 }}>{user.organization_name}</div>}
+          </div>
           <div className="segmented" role="tablist" aria-label="Admin section">
             {user?.role === 'admin' && (
               <button type="button" role="tab" aria-pressed={tab === 'students'} className={tab === 'students' ? 'active' : ''} onClick={() => { setTab('students'); setSelectedStudentId(null); }}>
@@ -111,9 +115,21 @@ export default function AdminDashboard() {
             <button type="button" role="tab" aria-pressed={tab === 'exams'} className={tab === 'exams' ? 'active' : ''} onClick={() => setTab('exams')}>
               Exams
             </button>
-            <button type="button" role="tab" aria-pressed={tab === 'grade-scale'} className={tab === 'grade-scale' ? 'active' : ''} onClick={() => setTab('grade-scale')}>
-              Grading
-            </button>
+            {user?.role === 'teacher' && (
+              <button type="button" role="tab" aria-pressed={tab === 'uploads'} className={tab === 'uploads' ? 'active' : ''} onClick={() => setTab('uploads')}>
+                Uploads
+              </button>
+            )}
+            {user?.role === 'admin' && (
+              <button type="button" role="tab" aria-pressed={tab === 'notices'} className={tab === 'notices' ? 'active' : ''} onClick={() => setTab('notices')}>
+                Notices
+              </button>
+            )}
+            {user?.role === 'admin' && (
+              <button type="button" role="tab" aria-pressed={tab === 'grade-scale'} className={tab === 'grade-scale' ? 'active' : ''} onClick={() => setTab('grade-scale')}>
+                Grading
+              </button>
+            )}
             {user?.role === 'admin' && (
               <button type="button" role="tab" aria-pressed={tab === 'structure'} className={tab === 'structure' ? 'active' : ''} onClick={() => setTab('structure')}>
                 Structure
@@ -152,6 +168,10 @@ export default function AdminDashboard() {
           user?.role === 'teacher' ? <AssignmentsPanel /> : null
         ) : tab === 'exams' ? (
           <ExamsPanel />
+        ) : tab === 'uploads' ? (
+          user?.role === 'teacher' ? <TeacherUploadsPanel /> : null
+        ) : tab === 'notices' ? (
+          user?.role === 'admin' ? <AdminNoticesPanel /> : null
         ) : tab === 'structure' ? (
           user?.role === 'admin' ? (
             <>
@@ -170,14 +190,24 @@ export default function AdminDashboard() {
               <AdminRequestsPanel />
             </>
           ) : null
-        ) : (
-          <>
-            <IntegrationsPanel />
-            <TagVisibilityPanel />
-            <GradeBandsPanel />
-            {user?.role === 'admin' && <ScanPlagiarismThresholdPanel />}
-          </>
-        )}
+        ) : tab === 'grade-scale' ? (
+          // Every panel here is an org-wide policy call (which tags students
+          // see, the grade-band cutoffs, the plagiarism-similarity
+          // threshold), same posture as Structure/Billing above — not
+          // something a teacher sets, and their own backend routes are all
+          // requireAdmin, so rendering this for a teacher was always going
+          // to 403. The tab button itself is admin-only for the same reason
+          // (see the segmented control above); this check is just the
+          // belt-and-braces backstop.
+          user?.role === 'admin' ? (
+            <>
+              <IntegrationsPanel />
+              <TagVisibilityPanel />
+              <GradeBandsPanel />
+              <ScanPlagiarismThresholdPanel />
+            </>
+          ) : null
+        ) : null}
       </section>
     </div>
   );
@@ -2364,6 +2394,10 @@ function TeachersPanel({ refreshSignal }) {
   const [csvResult, setCsvResult] = useState(null);
   const [csvError, setCsvError] = useState('');
   const [csvImporting, setCsvImporting] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [editName, setEditName] = useState('');
+  const [editUnitId, setEditUnitId] = useState('');
+  const [savingEdit, setSavingEdit] = useState(false);
 
   const fetchAll = useCallback(async () => {
     try {
@@ -2405,6 +2439,35 @@ function TeachersPanel({ refreshSignal }) {
       setError(err.response?.data?.error || 'Failed to create teacher.');
     } finally {
       setCreating(false);
+    }
+  };
+
+  const startEditTeacher = (t) => {
+    setEditingId(t.id);
+    setEditName(t.name || '');
+    setEditUnitId(t.org_unit_id != null ? String(t.org_unit_id) : '');
+    setError('');
+  };
+
+  // Unit is the one field here that actually gates something now, not just
+  // informational placement — POST /api/admin/subjects/:id/teachers only
+  // allows assigning a teacher whose own org_unit_id matches the subject's,
+  // so this is how a teacher created with no unit (or the wrong one) gets
+  // corrected after the fact.
+  const saveEditTeacher = async (id) => {
+    setSavingEdit(true);
+    setError('');
+    try {
+      await axios.put(`${API}/api/admin/teachers/${id}`, {
+        name: editName.trim() || null,
+        orgUnitId: editUnitId || null,
+      }, { withCredentials: true });
+      setEditingId(null);
+      fetchAll();
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to update teacher.');
+    } finally {
+      setSavingEdit(false);
     }
   };
 
@@ -2455,9 +2518,52 @@ function TeachersPanel({ refreshSignal }) {
       {teachers && teachers.length > 0 && (
         <div className="admin-table-wrap" style={{ marginBottom: 16 }}>
           <table className="admin-table">
-            <thead><tr><th>Name</th><th>Email</th></tr></thead>
+            <thead><tr><th>Name</th><th>Email</th><th>Unit</th><th aria-label="Actions" /></tr></thead>
             <tbody>
-              {teachers.map((t) => <tr key={t.id}><td>{t.name || '—'}</td><td>{t.email}</td></tr>)}
+              {teachers.map((t) => (
+                <tr key={t.id}>
+                  {editingId === t.id ? (
+                    <>
+                      <td>
+                        <input
+                          value={editName}
+                          onChange={(e) => setEditName(e.target.value)}
+                          placeholder="Full name"
+                          style={{ width: 140, padding: '4px 8px', fontSize: 12.5, background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text)' }}
+                        />
+                      </td>
+                      <td style={{ color: 'var(--text-dim)' }}>{t.email}</td>
+                      <td>
+                        <select
+                          value={editUnitId}
+                          onChange={(e) => setEditUnitId(e.target.value)}
+                          style={{ padding: '4px 8px', fontSize: 12.5, background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text)' }}
+                        >
+                          <option value="">No unit</option>
+                          {units.map((u) => (
+                            <option key={u.id} value={u.id}>{u.name} ({u.level?.label})</option>
+                          ))}
+                        </select>
+                      </td>
+                      <td className="admin-cell-actions">
+                        <button type="button" className="btn btn-primary btn-sm" disabled={savingEdit} onClick={() => saveEditTeacher(t.id)}>
+                          {savingEdit ? 'Saving…' : 'Save'}
+                        </button>
+                        <button type="button" className="btn btn-ghost btn-sm" disabled={savingEdit} onClick={() => setEditingId(null)}>Cancel</button>
+                      </td>
+                    </>
+                  ) : (
+                    <>
+                      <td>{t.name || '—'}</td>
+                      <td>{t.email}</td>
+                      <td>{units.find((u) => u.id === t.org_unit_id)?.name || '—'}</td>
+                      <td className="admin-cell-actions">
+                        <button type="button" className="btn btn-ghost btn-sm" onClick={() => startEditTeacher(t)}>Edit</button>
+                      </td>
+                    </>
+                  )}
+                </tr>
+              ))}
             </tbody>
           </table>
         </div>

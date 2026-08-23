@@ -52,14 +52,39 @@ function examScanObjectKey(organizationId, examId, attemptId) {
   return `exam-scans/${organizationId}/${examId}/${attemptId}.pdf`;
 }
 
-async function uploadScanPdf(objectKey, buffer) {
+// Separate top-level prefix again, same reasoning — a teacher-uploaded
+// note file for the Uploads/Notes feature shares nothing with a scanned
+// answer sheet except "it's a file in this same bucket." Keyed by a random
+// UUID rather than the notes row's own id: the upload has to happen BEFORE
+// the DB insert here (notes.storage_key is required non-empty by
+// notes_content_check for every file-based type, so there's no placeholder-
+// row-then-update-the-key step to get an id from first, unlike
+// scanObjectKey's submissionId). Extension varies with the note's media
+// type (pdf/image/video/audio) — passed in rather than hardcoded, unlike
+// scanObjectKey/examScanObjectKey, which are always PDF.
+function notesObjectKey(organizationId, subjectId, fileId, extension = '.pdf') {
+  return `notes/${organizationId}/${subjectId}/${fileId}${extension}`;
+}
+
+// Same idea, one level shallower — a notice has no subject to key under
+// (admin notices are org-wide, not attached to any one subject), so this
+// only ever nests under organizationId before the random file id.
+function noticesObjectKey(organizationId, fileId, extension = '.pdf') {
+  return `notices/${organizationId}/${fileId}${extension}`;
+}
+
+// contentType defaults to PDF for scanObjectKey/examScanObjectKey's own
+// callers (unchanged behavior for them); the notes feature passes the
+// uploaded file's real mimetype so an image/video/audio note is served back
+// with the right Content-Type instead of being mislabeled as a PDF.
+async function uploadScanPdf(objectKey, buffer, contentType = 'application/pdf') {
   const client = getB2Client();
   if (!client) throw new Error('B2 is not configured');
   await client.send(new PutObjectCommand({
     Bucket: process.env.B2_BUCKET_NAME,
     Key: objectKey,
     Body: buffer,
-    ContentType: 'application/pdf',
+    ContentType: contentType,
   }));
 }
 
@@ -93,4 +118,4 @@ async function deleteScanPdf(objectKey) {
   await client.send(new DeleteObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: objectKey }));
 }
 
-module.exports = { isB2Configured, scanObjectKey, examScanObjectKey, uploadScanPdf, getScanPdfUrl, downloadScanPdf, deleteScanPdf };
+module.exports = { isB2Configured, scanObjectKey, examScanObjectKey, notesObjectKey, noticesObjectKey, uploadScanPdf, getScanPdfUrl, downloadScanPdf, deleteScanPdf };
