@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, Fragment } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import axios from 'axios';
 import { useTheme } from '../hooks/useTheme';
 import { useAuth } from '../context/AuthContext';
@@ -11,6 +11,8 @@ import ExamForm from '../components/ExamForm';
 import OrgStructureBuilder from '../components/OrgStructureBuilder';
 import SubjectsPanel from '../components/SubjectsPanel';
 import BillingPanel from '../components/BillingPanel';
+import PercentBar from '../components/PercentBar';
+import { PERF_STATUS_LABELS, PERF_STATUS_CLASS } from '../lib/performanceStatus';
 import { API } from '../config';
 import '../admin.css';
 const DIFFICULTY_CLASS = { Easy: 'chip-easy', Medium: 'chip-medium', Hard: 'chip-hard' };
@@ -47,32 +49,33 @@ function toDatetimeLocal(iso) {
 
 export default function AdminDashboard() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { theme, toggleTheme } = useTheme();
-  const { logout, user, isImpersonating, exitImpersonation } = useAuth();
+  const { logout, user } = useAuth();
   const [tab, setTab] = useState('students');
   const [selectedStudentId, setSelectedStudentId] = useState(null);
+  const [selectedMyStudentId, setSelectedMyStudentId] = useState(null);
+
+  // 'students' (StudentsPanel/StudentDetailPanel below) hits admin-only
+  // routes — a teacher landing here on the default tab would just see a
+  // 403. Bounce them to their own scoped tab once `user` has loaded.
+  useEffect(() => {
+    if (user?.role === 'teacher' && tab === 'students') setTab('my-students');
+  }, [user?.role, tab]);
+
+  // Bumped whenever OrgStructureBuilder changes units/levels, so the
+  // sibling panels below it (which each keep their own unit-picker copy)
+  // know to refetch instead of showing a newly-added unit only after a
+  // full page reload.
+  const [unitsVersion, setUnitsVersion] = useState(0);
 
   const handleLogout = async () => {
     await logout();
     navigate('/', { replace: true });
   };
 
-  const handleExitImpersonation = async () => {
-    await exitImpersonation();
-    navigate('/superadmin', { replace: true });
-  };
-
   return (
     <div className="sb-shell">
-      {isImpersonating && (
-        <div className="alert" style={{ margin: 0, borderRadius: 0, justifyContent: 'center' }}>
-          <span className="alert-icon">!</span>
-          <span>Viewing {user?.organization_name || 'this organization'} as its admin (superadmin mode).</span>
-          <button type="button" className="btn btn-ghost btn-sm" style={{ marginLeft: 12 }} onClick={handleExitImpersonation}>
-            Exit
-          </button>
-        </div>
-      )}
       <header className="sb-topbar">
         <button type="button" className="brand" onClick={() => navigate('/')}><BrandMark /></button>
         <div className="sb-actions">
@@ -90,23 +93,27 @@ export default function AdminDashboard() {
             {user?.name && <span className="auth-sub" style={{ marginLeft: 10, fontWeight: 400 }}>({user.name})</span>}
           </h1>
           <div className="segmented" role="tablist" aria-label="Admin section">
-            <button type="button" role="tab" aria-pressed={tab === 'students'} className={tab === 'students' ? 'active' : ''} onClick={() => { setTab('students'); setSelectedStudentId(null); }}>
-              Students
-            </button>
-            <button type="button" role="tab" aria-pressed={tab === 'assignments'} className={tab === 'assignments' ? 'active' : ''} onClick={() => setTab('assignments')}>
-              Assignments
-            </button>
+            {user?.role === 'admin' && (
+              <button type="button" role="tab" aria-pressed={tab === 'students'} className={tab === 'students' ? 'active' : ''} onClick={() => { setTab('students'); setSelectedStudentId(null); }}>
+                Students
+              </button>
+            )}
+            {user?.role === 'teacher' && (
+              <button type="button" role="tab" aria-pressed={tab === 'my-students'} className={tab === 'my-students' ? 'active' : ''} onClick={() => { setTab('my-students'); setSelectedMyStudentId(null); }}>
+                My Students
+              </button>
+            )}
+            {user?.role === 'teacher' && (
+              <button type="button" role="tab" aria-pressed={tab === 'assignments'} className={tab === 'assignments' ? 'active' : ''} onClick={() => setTab('assignments')}>
+                Assignments
+              </button>
+            )}
             <button type="button" role="tab" aria-pressed={tab === 'exams'} className={tab === 'exams' ? 'active' : ''} onClick={() => setTab('exams')}>
               Exams
             </button>
             <button type="button" role="tab" aria-pressed={tab === 'grade-scale'} className={tab === 'grade-scale' ? 'active' : ''} onClick={() => setTab('grade-scale')}>
               Grading
             </button>
-            {user?.role === 'teacher' && (
-              <button type="button" role="tab" aria-pressed={tab === 'non-submitters'} className={tab === 'non-submitters' ? 'active' : ''} onClick={() => setTab('non-submitters')}>
-                Non-submitters
-              </button>
-            )}
             {user?.role === 'admin' && (
               <button type="button" role="tab" aria-pressed={tab === 'structure'} className={tab === 'structure' ? 'active' : ''} onClick={() => setTab('structure')}>
                 Structure
@@ -117,31 +124,52 @@ export default function AdminDashboard() {
                 Billing
               </button>
             )}
+            {user?.role === 'admin' && (
+              <button type="button" role="tab" aria-pressed={tab === 'contact-superadmin'} className={tab === 'contact-superadmin' ? 'active' : ''} onClick={() => setTab('contact-superadmin')}>
+                Contact Superadmin
+              </button>
+            )}
           </div>
         </div>
 
         {tab === 'students' ? (
-          selectedStudentId ? (
-            <StudentDetailPanel studentId={selectedStudentId} onBack={() => setSelectedStudentId(null)} />
-          ) : (
-            <StudentsPanel onSelectStudent={setSelectedStudentId} />
-          )
+          user?.role === 'admin' ? (
+            selectedStudentId ? (
+              <StudentDetailPanel studentId={selectedStudentId} onBack={() => setSelectedStudentId(null)} />
+            ) : (
+              <StudentsPanel onSelectStudent={setSelectedStudentId} />
+            )
+          ) : null
+        ) : tab === 'my-students' ? (
+          user?.role === 'teacher' ? (
+            selectedMyStudentId ? (
+              <TeacherStudentDetailPanel studentId={selectedMyStudentId} onBack={() => setSelectedMyStudentId(null)} />
+            ) : (
+              <TeacherStudentsPanel onSelectStudent={setSelectedMyStudentId} />
+            )
+          ) : null
         ) : tab === 'assignments' ? (
-          <AssignmentsPanel />
+          user?.role === 'teacher' ? <AssignmentsPanel /> : null
         ) : tab === 'exams' ? (
           <ExamsPanel />
-        ) : tab === 'non-submitters' ? (
-          user?.role === 'teacher' ? <NonSubmittersPanel /> : null
         ) : tab === 'structure' ? (
           user?.role === 'admin' ? (
             <>
-              <OrgStructureBuilder />
-              <SubjectsPanel />
-              <TeachersPanel />
+              <OrgStructureBuilder onChange={() => setUnitsVersion((v) => v + 1)} />
+              <SubjectsPanel refreshSignal={unitsVersion} />
+              <TeachersPanel refreshSignal={unitsVersion} />
+              <PromoteStudentsPanel refreshSignal={unitsVersion} />
             </>
           ) : null
         ) : tab === 'billing' ? (
           user?.role === 'admin' ? <BillingPanel /> : null
+        ) : tab === 'contact-superadmin' ? (
+          user?.role === 'admin' ? (
+            <>
+              <RequestAddAdminPanel />
+              <AdminRequestsPanel />
+            </>
+          ) : null
         ) : (
           <>
             <IntegrationsPanel />
@@ -155,52 +183,240 @@ export default function AdminDashboard() {
   );
 }
 
+const TEACHER_STUDENT_SORT_COLUMNS = [
+  { key: 'name', label: 'Student', numeric: false },
+  { key: 'assignmentsSubmitted', label: 'Assignments submitted', numeric: true },
+  { key: 'avgAssignmentPercent', label: 'Assignment score', numeric: true },
+  { key: 'examsAttempted', label: 'Exams attempted', numeric: true },
+  { key: 'avgExamPercent', label: 'Exam score', numeric: true },
+];
+
 // ============================================================================
-// NON-SUBMITTERS PANEL — teacher-only. Students in the teacher's own
-// classes (their subjects' org units, and everything beneath them) who
-// have zero submissions and zero exam attempts anywhere in the org.
+// TEACHER STUDENTS PANEL — every student under the subjects this teacher is
+// assigned to (see GET /api/teacher/students), with a rolled-up assignment/
+// exam performance percentage per student, computed only from that
+// teacher's own subjects (not an org-wide figure). Row click drills into
+// TeacherStudentDetailPanel below. Sortable columns + a "no submissions
+// yet" filter stand in for what used to be a separate Non-submitters tab —
+// sorting Assignments/Exams submitted ascending surfaces the exact same
+// people, without a whole extra tab + route for it.
 // ============================================================================
-function NonSubmittersPanel() {
+function TeacherStudentsPanel({ onSelectStudent }) {
   const [students, setStudents] = useState(null);
+  const [subjectCount, setSubjectCount] = useState(0);
   const [error, setError] = useState('');
+  const [sortKey, setSortKey] = useState('name');
+  const [sortDir, setSortDir] = useState('asc');
+  const [onlyNonSubmitters, setOnlyNonSubmitters] = useState(false);
 
   useEffect(() => {
-    axios.get(`${API}/api/teacher/non-submitters`, { withCredentials: true })
-      .then((res) => setStudents(res.data.students))
-      .catch(() => setError('Failed to load non-submitters.'));
+    axios.get(`${API}/api/teacher/students`, { withCredentials: true })
+      .then((res) => { setStudents(res.data.students); setSubjectCount(res.data.subjectCount); })
+      .catch(() => setError('Failed to load students.'));
   }, []);
+
+  const handleSort = (col) => {
+    if (sortKey === col.key) {
+      setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortKey(col.key);
+      setSortDir(col.numeric ? 'desc' : 'asc');
+    }
+  };
+
+  const visibleStudents = useMemo(() => {
+    if (!students) return null;
+    const filtered = onlyNonSubmitters
+      ? students.filter((s) => s.assignmentsSubmitted === 0 && s.examsAttempted === 0)
+      : students;
+    const dir = sortDir === 'asc' ? 1 : -1;
+    const col = TEACHER_STUDENT_SORT_COLUMNS.find((c) => c.key === sortKey);
+    return [...filtered].sort((a, b) => {
+      if (!col?.numeric) {
+        const av = a.name || a.email;
+        const bv = b.name || b.email;
+        return dir * String(av || '').localeCompare(String(bv || ''));
+      }
+      return dir * ((a[sortKey] ?? -1) - (b[sortKey] ?? -1));
+    });
+  }, [students, sortKey, sortDir, onlyNonSubmitters]);
 
   if (error) return <div className="alert"><span className="alert-icon">!</span><span>{error}</span></div>;
   if (!students) return <p className="sb-loading">Loading…</p>;
 
   return (
     <div className="panel" style={{ padding: 20 }}>
-      <h3 style={{ margin: '0 0 4px' }}>Students who haven't submitted anything</h3>
+      <h3 style={{ margin: '0 0 4px' }}>My students</h3>
       <p className="auth-sub" style={{ margin: '0 0 16px' }}>
-        Scoped to your own classes — students under the subjects you're assigned to who have zero
-        assignment submissions and zero exam attempts.
+        Everyone under the subjects you're assigned to, with their performance on your own assignments and exams.
       </p>
-      {students.length === 0 ? (
-        <p className="sb-loading">Nobody's flagged — every student in your classes has submitted something.</p>
+      {subjectCount === 0 ? (
+        <p className="sb-loading">You aren't assigned to any subjects yet — ask an admin to add you under Structure → Subjects.</p>
+      ) : students.length === 0 ? (
+        <p className="sb-loading">No students found under your subjects yet.</p>
       ) : (
-        <div className="admin-table-wrap">
-          <table className="admin-table">
-            <thead><tr><th>Student</th><th>Unit</th><th>Joined</th></tr></thead>
-            <tbody>
-              {students.map((s) => (
-                <tr key={s.id}>
-                  <td className="admin-cell-strong">
-                    {s.name || s.email}
-                    {s.name && <div style={{ color: 'var(--text-dim)', fontSize: '12px', fontWeight: 400 }}>{s.email}</div>}
-                  </td>
-                  <td style={{ whiteSpace: 'nowrap', color: 'var(--text-dim)', fontSize: '12.5px' }}>
-                    {s.unit_path?.length ? s.unit_path.map((p) => p.name).join(' / ') : '—'}
-                  </td>
-                  <td>{formatDate(s.created_at)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12, fontSize: 13.5 }}>
+            <input type="checkbox" checked={onlyNonSubmitters} onChange={(e) => setOnlyNonSubmitters(e.target.checked)} />
+            Show only students with zero submissions and zero exam attempts
+          </label>
+          {visibleStudents.length === 0 ? (
+            <p className="sb-loading">Nobody matches — every student in your classes has submitted something.</p>
+          ) : (
+            <div className="admin-table-wrap">
+              <table className="admin-table">
+                <thead>
+                  <tr>
+                    {TEACHER_STUDENT_SORT_COLUMNS.map((col, i) => (
+                      <Fragment key={col.key}>
+                        <th
+                          className="admin-th-sortable"
+                          aria-sort={sortKey === col.key ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}
+                          onClick={() => handleSort(col)}
+                        >
+                          {col.label}
+                          <span className="admin-th-sort-arrow">{sortKey === col.key ? (sortDir === 'asc' ? ' ▲' : ' ▼') : ''}</span>
+                        </th>
+                        {i === 0 && <th>Unit</th>}
+                      </Fragment>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibleStudents.map((s) => (
+                    <tr key={s.id} onClick={() => onSelectStudent(s.id)} style={{ cursor: 'pointer' }}>
+                      <td className="admin-cell-strong">
+                        {s.name || s.email}
+                        {s.name && <div style={{ color: 'var(--text-dim)', fontSize: '12px', fontWeight: 400 }}>{s.email}</div>}
+                      </td>
+                      <td style={{ whiteSpace: 'nowrap', color: 'var(--text-dim)', fontSize: '12.5px' }}>
+                        {s.unit_path?.length ? s.unit_path.map((p) => p.name).join(' / ') : '—'}
+                      </td>
+                      <td>{s.assignmentsSubmitted}/{s.assignmentsTotal}</td>
+                      <td style={{ minWidth: 170 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <PercentBar percent={s.avgAssignmentPercent} />
+                          <span style={{ fontSize: 12.5, color: 'var(--text-dim)', whiteSpace: 'nowrap' }}>
+                            {s.avgAssignmentPercent != null ? `${s.avgAssignmentPercent.toFixed(0)}%` : '—'}
+                          </span>
+                        </div>
+                      </td>
+                      <td>{s.examsAttempted}/{s.examsTotal}</td>
+                      <td style={{ minWidth: 170 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <PercentBar percent={s.avgExamPercent} />
+                          <span style={{ fontSize: 12.5, color: 'var(--text-dim)', whiteSpace: 'nowrap' }}>
+                            {s.avgExamPercent != null ? `${s.avgExamPercent.toFixed(0)}%` : '—'}
+                          </span>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ============================================================================
+// TEACHER STUDENT DETAIL PANEL — one student's assignments/exams, scoped to
+// the teacher's own subjects only (see GET /api/teacher/students/:id).
+// ============================================================================
+function TeacherStudentDetailPanel({ studentId, onBack }) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    axios.get(`${API}/api/teacher/students/${studentId}`, { withCredentials: true })
+      .then((res) => setData(res.data))
+      .catch(() => setError('Failed to load student details.'));
+  }, [studentId]);
+
+  if (error) return <div className="alert"><span className="alert-icon">!</span><span>{error}</span></div>;
+  if (!data) return <p className="sb-loading">Loading student…</p>;
+
+  return (
+    <div>
+      <div className="admin-toolbar" style={{ justifyContent: 'flex-start' }}>
+        <button type="button" className="btn btn-ghost" onClick={onBack}>&larr; Back to my students</button>
+      </div>
+
+      <div className="panel" style={{ padding: '24px', marginBottom: '24px' }}>
+        <h2 style={{ margin: 0 }}>{data.student.name || data.student.email}</h2>
+        {data.student.name && <p className="auth-sub" style={{ margin: '4px 0 0' }}>{data.student.email}</p>}
+        {data.unitPath?.length > 0 && (
+          <p style={{ margin: '10px 0 0', display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+            {data.unitPath.map((p, i) => (
+              <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                {i > 0 && <span style={{ color: 'var(--text-dim)' }}>/</span>}
+                <span className="chip chip-easy" title={p.label}><span className="dot" />{p.name}</span>
+              </span>
+            ))}
+          </p>
+        )}
+        <div style={{ display: 'flex', gap: 24, marginTop: 16, flexWrap: 'wrap' }}>
+          <div style={{ minWidth: 200 }}>
+            <div className="field-group-label" style={{ marginBottom: 6 }}>Assignments (your subjects)</div>
+            <PercentBar percent={data.avgAssignmentPercent} />
+            <p className="auth-sub" style={{ margin: '6px 0 0' }}>
+              {data.avgAssignmentPercent != null ? `${data.avgAssignmentPercent.toFixed(1)}% average` : 'No graded assignments yet'}
+              {data.assignmentPercentileTag && ` — ${data.assignmentPercentileTag} among your students`}
+            </p>
+          </div>
+          <div style={{ minWidth: 200 }}>
+            <div className="field-group-label" style={{ marginBottom: 6 }}>Exams (your subjects)</div>
+            <PercentBar percent={data.avgExamPercent} />
+            <p className="auth-sub" style={{ margin: '6px 0 0' }}>
+              {data.avgExamPercent != null ? `${data.avgExamPercent.toFixed(1)}% average` : 'No graded exams yet'}
+              {data.examPercentileTag && ` — ${data.examPercentileTag} among your students`}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <h3 style={{ marginBottom: 16 }}>Assignments</h3>
+      {data.assignments.length === 0 ? (
+        <p className="sb-loading" style={{ marginBottom: 24 }}>You have no assignments under your subjects yet.</p>
+      ) : (
+        <div className="submission-history" style={{ marginBottom: 24 }}>
+          {data.assignments.map((a) => (
+            <div className="submission-card" key={a.problemId}>
+              <div className="submission-card-head">
+                <span>{a.title}{a.subjectName && <span className="auth-sub"> — {a.subjectName}</span>}</span>
+                <span className={`chip ${PERF_STATUS_CLASS[a.status]}`}><span className="dot" />{PERF_STATUS_LABELS[a.status]}</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 8 }}>
+                <PercentBar percent={a.percent} />
+                {a.percent != null && <span className="auth-sub">{a.percent.toFixed(1)}%</span>}
+              </div>
+              {a.remarks && <p className="auth-sub" style={{ margin: '8px 0 0' }}>Remarks: {a.remarks}</p>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <h3 style={{ marginBottom: 16 }}>Exams</h3>
+      {data.exams.length === 0 ? (
+        <p className="sb-loading">You have no exams under your subjects yet.</p>
+      ) : (
+        <div className="submission-history">
+          {data.exams.map((e) => (
+            <div className="submission-card" key={e.examId}>
+              <div className="submission-card-head">
+                <span>{e.title}{e.subjectName && <span className="auth-sub"> — {e.subjectName}</span>}</span>
+                <span className={`chip ${PERF_STATUS_CLASS[e.status]}`}><span className="dot" />{PERF_STATUS_LABELS[e.status]}</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 8 }}>
+                <PercentBar percent={e.percent} />
+                {e.percent != null && <span className="auth-sub">{e.percent.toFixed(1)}%</span>}
+              </div>
+              {e.remarks && <p className="auth-sub" style={{ margin: '8px 0 0' }}>Remarks: {e.remarks}</p>}
+            </div>
+          ))}
         </div>
       )}
     </div>
@@ -208,13 +424,14 @@ function NonSubmittersPanel() {
 }
 
 // ============================================================================
-// STUDENT DETAIL PANEL
+// STUDENT DETAIL PANEL — identity + the two total scores only (see
+// GET /api/admin/students/:id's own comment on why the attempt-by-attempt
+// history and percentile tags were dropped).
 // ============================================================================
 function StudentDetailPanel({ studentId, onBack }) {
   const { user } = useAuth();
   const [data, setData] = useState(null);
   const [error, setError] = useState('');
-  const [expandedProblemId, setExpandedProblemId] = useState(null);
 
   // Admin-only edit — teachers never see this toggle at all (requireAdmin
   // on the backend route enforces the same boundary, this is just the UI
@@ -291,10 +508,6 @@ function StudentDetailPanel({ studentId, onBack }) {
   if (error) return <div className="alert"><span className="alert-icon">!</span><span>{error}</span></div>;
   if (!data) return <p className="sb-loading">Loading student history…</p>;
 
-  const toggleExpanded = (problemId) => {
-    setExpandedProblemId((current) => (current === problemId ? null : problemId));
-  };
-
   return (
     <div>
       <div className="admin-toolbar" style={{ justifyContent: 'flex-start' }}>
@@ -356,120 +569,28 @@ function StudentDetailPanel({ studentId, onBack }) {
             ) : (
               <p className="auth-sub" style={{ margin: '6px 0 0' }}>Not assigned to a unit in your organization structure.</p>
             )}
-            {(data.overallExamsPercentileTag || data.overallAssignmentsPercentileTag) && (
-              <p style={{ margin: '10px 0 0', display: 'flex', gap: 8 }}>
-                {data.overallExamsPercentileTag && (
-                  <span className="chip chip-neutral"><span className="dot" />Overall (exams): {data.overallExamsPercentileTag}</span>
-                )}
-                {data.overallAssignmentsPercentileTag && (
-                  <span className="chip chip-neutral"><span className="dot" />Overall (assignments): {data.overallAssignmentsPercentileTag}</span>
-                )}
-              </p>
-            )}
           </>
         )}
       </div>
 
-      <h3 style={{ marginBottom: '16px' }}>Assignment Submissions</h3>
-      {data.problems.length === 0 ? (
-        <p className="sb-loading">This student hasn't submitted any code yet.</p>
-      ) : (
-        <div className="panel admin-table-wrap">
-          <table className="admin-table">
-            <thead>
-              <tr>
-                <th>Problem</th>
-                <th>Difficulty</th>
-                <th>Status</th>
-                <th>Total Attempts</th>
-                <th>Last Attempt</th>
-                <th aria-label="Actions" />
-              </tr>
-            </thead>
-            <tbody>
-              {data.problems.map((p) => (
-                <Fragment key={p.problem_id}>
-                  <tr>
-                    <td className="admin-cell-strong">{p.title}</td>
-                    <td><span className={`chip ${DIFFICULTY_CLASS[p.difficulty]}`}><span className="dot" />{p.difficulty}</span></td>
-                    <td>
-                      {p.solved ? (
-                        <span className="chip chip-easy"><span className="dot" />Solved</span>
-                      ) : (
-                        <span className="chip chip-hard"><span className="dot" />Failing</span>
-                      )}
-                    </td>
-                    <td>{p.attempts}</td>
-                    <td>{formatDate(p.last_attempt_at)}</td>
-                    <td className="admin-cell-actions">
-                      <button type="button" className="btn btn-ghost btn-sm" onClick={() => toggleExpanded(p.problem_id)}>
-                        {expandedProblemId === p.problem_id ? 'Hide code' : 'View code'}
-                      </button>
-                    </td>
-                  </tr>
-                  {expandedProblemId === p.problem_id && (
-                    <tr>
-                      <td colSpan={6} style={{ background: 'var(--surface-2)' }}>
-                        <SubmissionHistory studentId={studentId} problemId={p.problem_id} />
-                      </td>
-                    </tr>
-                  )}
-                </Fragment>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ============================================================================
-// SUBMISSION HISTORY â€” every attempt a student made on one problem, with the
-// actual code, so an admin can see exactly what they tried and where it went
-// wrong across attempts, not just a pass/fail summary.
-// ============================================================================
-function SubmissionHistory({ studentId, problemId }) {
-  const [submissions, setSubmissions] = useState(null);
-  const [error, setError] = useState('');
-
-  useEffect(() => {
-    let cancelled = false;
-    const fetchHistory = async () => {
-      try {
-        const res = await axios.get(
-          `${API}/api/admin/students/${studentId}/problems/${problemId}/submissions`,
-          { withCredentials: true }
-        );
-        if (!cancelled) setSubmissions(res.data.submissions);
-      } catch (err) {
-        if (!cancelled) setError('Failed to load submission history.');
-      }
-    };
-    fetchHistory();
-    return () => { cancelled = true; };
-  }, [studentId, problemId]);
-
-  if (error) return <div className="alert" style={{ margin: '12px 0' }}><span className="alert-icon">!</span><span>{error}</span></div>;
-  if (!submissions) return <p className="sb-loading" style={{ margin: '16px 0' }}>Loading attempts…</p>;
-  if (submissions.length === 0) return <p className="sb-loading" style={{ margin: '16px 0' }}>No attempts recorded.</p>;
-
-  return (
-    <div className="submission-history">
-      {submissions.map((s, idx) => (
-        <div className="submission-card" key={s.id}>
-          <div className="submission-card-head">
-            <span>
-              Attempt {submissions.length - idx} &middot; {s.language} &middot; {formatDate(s.created_at)}
-            </span>
-            <span className={`chip ${s.status === 'Accepted' ? 'chip-easy' : 'chip-hard'}`}>
-              <span className="dot" />
-              {s.status} ({s.passed_count}/{s.total_count})
-            </span>
+      <div className="panel" style={{ padding: '24px' }}>
+        <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' }}>
+          <div style={{ minWidth: 200 }}>
+            <div className="field-group-label" style={{ marginBottom: 6 }}>Total assignment score</div>
+            <PercentBar percent={data.totalAssignmentPercent} />
+            <p className="auth-sub" style={{ margin: '6px 0 0' }}>
+              {data.totalAssignmentPercent != null ? `${data.totalAssignmentPercent.toFixed(1)}%` : 'No graded assignments yet'}
+            </p>
           </div>
-          <pre className="submission-code">{s.code}</pre>
+          <div style={{ minWidth: 200 }}>
+            <div className="field-group-label" style={{ marginBottom: 6 }}>Total exam score</div>
+            <PercentBar percent={data.totalExamPercent} />
+            <p className="auth-sub" style={{ margin: '6px 0 0' }}>
+              {data.totalExamPercent != null ? `${data.totalExamPercent.toFixed(1)}%` : 'No graded exams yet'}
+            </p>
+          </div>
         </div>
-      ))}
+      </div>
     </div>
   );
 }
@@ -477,24 +598,19 @@ function SubmissionHistory({ studentId, problemId }) {
 // ============================================================================
 // STUDENTS PANEL
 // ============================================================================
-// Sortable columns on the students table. `numeric: false` (email) sorts
-// alphabetically and defaults to ascending; every numeric/date column
-// defaults to descending on first click, since "biggest first" is what an
-// admin scanning for top/bottom performers wants for all five of these.
+// Sortable columns on the students table — deliberately just the two
+// headline scores plus name (see GET /api/admin/students' own comment on
+// why the old attempt-count/time-on-task/efficiency-score columns were
+// dropped). `numeric: false` (email) sorts alphabetically and defaults to
+// ascending; the two score columns default to descending on first click.
 const STUDENT_SORT_COLUMNS = [
-  { key: 'email', label: 'Email', numeric: false },
-  { key: 'problems_solved', label: 'Solved', numeric: true },
-  { key: 'total_submissions', label: 'Attempts', numeric: true, title: 'Total attempt numbers — every submission across every assignment' },
-  { key: 'total_seconds', label: 'Total time', numeric: true, title: 'True time-on-task: assignment open → final submission, revisits added in' },
-  { key: 'last_active_at', label: 'Last active', numeric: true, isDate: true, title: 'Most recent of: last submission, last time the assignment was open' },
-  { key: 'successful_test_cases', label: 'Tests passed', numeric: true, title: 'Test cases passed on each problem\'s best attempt, summed' },
-  { key: 'composite_score', label: 'Score', numeric: true, title: 'Efficiency score = tests passed / ((1 + attempts) × (1 + hours spent)) — higher = fast, few attempts, high success' },
+  { key: 'email', label: 'Student', numeric: false },
+  { key: 'totalAssignmentPercent', label: 'Assignment score', numeric: true },
+  { key: 'totalExamPercent', label: 'Exam score', numeric: true },
 ];
 
 function StudentsPanel({ onSelectStudent }) {
   const [students, setStudents] = useState(null);
-  const [assignments, setAssignments] = useState([]);
-  const [selectedProblemId, setSelectedProblemId] = useState(''); // '' = all assignments combined
   const [error, setError] = useState('');
   const [confirmingId, setConfirmingId] = useState(null);
   const [busyId, setBusyId] = useState(null);
@@ -603,30 +719,16 @@ function StudentsPanel({ onSelectStudent }) {
     }
   };
 
-  // Populate the "scope to assignment" dropdown once. Failing silently here
-  // is fine — worst case the dropdown just stays on "All assignments".
-  useEffect(() => {
-    axios.get(`${API}/api/problems`, { withCredentials: true })
-      .then((res) => setAssignments(res.data.problems))
-      .catch(() => {});
-  }, []);
-
   const fetchStudents = useCallback(async () => {
     try {
-      const res = await axios.get(`${API}/api/admin/students`, {
-        params: selectedProblemId ? { problemId: selectedProblemId } : {},
-        withCredentials: true,
-      });
+      const res = await axios.get(`${API}/api/admin/students`, { withCredentials: true });
       setStudents(res.data.students);
     } catch (err) {
       setError(err.response?.data?.error || 'Failed to load students.');
     }
-  }, [selectedProblemId]);
+  }, []);
 
-  useEffect(() => {
-    setStudents(null); // show the loading state while re-scoping to a new assignment
-    fetchStudents();
-  }, [fetchStudents]);
+  useEffect(() => { fetchStudents(); }, [fetchStudents]);
 
   const handleRemove = async (id) => {
     setBusyId(id);
@@ -668,23 +770,6 @@ function StudentsPanel({ onSelectStudent }) {
 
   return (
     <div>
-      <div className="admin-toolbar" style={{ justifyContent: 'flex-start', gap: '10px', alignItems: 'center' }}>
-        <label htmlFor="assignment-filter" style={{ fontSize: '13px', color: 'var(--text-dim)' }}>
-          Scope stats to
-        </label>
-        <select
-          id="assignment-filter"
-          className="assignment-select"
-          value={selectedProblemId}
-          onChange={(e) => setSelectedProblemId(e.target.value)}
-        >
-          <option value="">All assignments (combined)</option>
-          {assignments.map((a, idx) => (
-            <option key={a.id} value={a.id}>{idx + 1}. {a.title}</option>
-          ))}
-        </select>
-      </div>
-
       <div className="panel" style={{ padding: 16, marginBottom: 16 }}>
         <div className="field-group-label" style={{ marginBottom: 10 }}>Add a student manually</div>
         {atCap && (
@@ -768,6 +853,9 @@ function StudentsPanel({ onSelectStudent }) {
         </div>
       </div>
 
+      <AdminProfileChangeRequestsPanel />
+      <LegacyScoresPanel onImported={fetchStudents} />
+
       {!students && <p className="sb-loading">Loading students…</p>}
       {students && students.length === 0 && <p className="sb-loading">No students yet.</p>}
 
@@ -807,12 +895,22 @@ function StudentsPanel({ onSelectStudent }) {
                   <td style={{ whiteSpace: 'nowrap', color: 'var(--text-dim)', fontSize: '12.5px' }}>
                     {s.unit_path?.length ? s.unit_path.map((p) => p.name).join(' / ') : '—'}
                   </td>
-                  <td>{s.problems_solved}</td>
-                  <td>{s.total_submissions}</td>
-                  <td>{formatDuration(s.total_seconds)}</td>
-                  <td>{formatDate(s.last_active_at)}</td>
-                  <td>{s.successful_test_cases}</td>
-                  <td>{s.composite_score.toFixed(3)}</td>
+                  <td style={{ minWidth: 170 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <PercentBar percent={s.totalAssignmentPercent} />
+                      <span style={{ fontSize: 12.5, color: 'var(--text-dim)', whiteSpace: 'nowrap' }}>
+                        {s.totalAssignmentPercent != null ? `${s.totalAssignmentPercent.toFixed(0)}%` : '—'}
+                      </span>
+                    </div>
+                  </td>
+                  <td style={{ minWidth: 170 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <PercentBar percent={s.totalExamPercent} />
+                      <span style={{ fontSize: 12.5, color: 'var(--text-dim)', whiteSpace: 'nowrap' }}>
+                        {s.totalExamPercent != null ? `${s.totalExamPercent.toFixed(0)}%` : '—'}
+                      </span>
+                    </div>
+                  </td>
                   <td className="admin-cell-actions">
                     {confirmingId === s.id ? (
                       <span className="confirm-row">
@@ -831,6 +929,89 @@ function StudentsPanel({ onSelectStudent }) {
           </table>
         </div>
       )}
+    </div>
+  );
+}
+
+// ============================================================================
+// LEGACY SCORES PANEL — CSV import of pre-platform score history, for
+// institutions onboarding after already having a track record. Every row
+// must match an existing student in this org by email (see POST
+// /api/admin/legacy-scores/import) — this never creates accounts, unlike
+// the roster CSV import above it. onImported refetches StudentsPanel's own
+// list so the newly-blended totals show up without a manual reload.
+// ============================================================================
+function LegacyScoresPanel({ onImported }) {
+  const [file, setFile] = useState(null);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState('');
+  const [importing, setImporting] = useState(false);
+
+  const downloadTemplate = async () => {
+    try {
+      const res = await axios.get(`${API}/api/admin/legacy-scores/csv-template`, { withCredentials: true, responseType: 'blob' });
+      const url = URL.createObjectURL(res.data);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'legacy-scores-template.csv';
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      setError('Failed to download template.');
+    }
+  };
+
+  const importFile = async () => {
+    if (!file) return;
+    setError('');
+    setResult(null);
+    setImporting(true);
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const res = await axios.post(`${API}/api/admin/legacy-scores/import`, formData, { withCredentials: true });
+      setResult(res.data);
+      setFile(null);
+      onImported?.();
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to import CSV.');
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  return (
+    <div className="panel" style={{ padding: 16, marginBottom: 16 }}>
+      <div className="field-group-label" style={{ marginBottom: 10 }}>Import previous years' scores</div>
+      <p className="auth-sub" style={{ margin: '0 0 10px' }}>
+        For institutions just getting started here — upload a CSV of scores from before this platform was in use
+        (columns: Email, AcademicYear, AssignmentScorePercent, ExamScorePercent, Notes). Each row must match an
+        existing student's email in your organization; re-uploading the same student + year overwrites that row.
+        These scores are blended into "total score" alongside everything they do on the platform going forward.
+      </p>
+      {error && <div className="alert" style={{ marginBottom: 12 }}><span className="alert-icon">!</span><span>{error}</span></div>}
+      {result && (
+        <div className={result.errors.length ? 'alert' : 'alert alert-success'} style={{ marginBottom: 12, flexDirection: 'column', alignItems: 'stretch' }}>
+          <span>{result.imported} row(s) imported{result.errors.length > 0 && `, ${result.errors.length} row(s) failed`}</span>
+          {result.errors.length > 0 && (
+            <table className="admin-table" style={{ marginTop: 10 }}>
+              <thead><tr><th>Row</th><th>Email</th><th>Reason</th></tr></thead>
+              <tbody>
+                {result.errors.map((e, i) => (
+                  <tr key={i}><td>{e.row}</td><td>{e.email}</td><td>{e.reason}</td></tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+      <div className="testcase-row" style={{ maxWidth: 560, marginBottom: 0 }}>
+        <button type="button" className="btn btn-ghost btn-sm" onClick={downloadTemplate}>Download template</button>
+        <input type="file" accept=".csv" onChange={(e) => setFile(e.target.files?.[0] || null)} />
+        <button type="button" className="btn btn-primary btn-sm" disabled={!file || importing} onClick={importFile}>
+          {importing ? 'Importing…' : 'Upload'}
+        </button>
+      </div>
     </div>
   );
 }
@@ -1391,9 +1572,13 @@ function GradingForm({ attemptId, onGraded }) {
   const [answers, setAnswers] = useState(null);
   const [scanAnswers, setScanAnswers] = useState([]);
   const [attemptScan, setAttemptScan] = useState(null);
+  const [overallRemarks, setOverallRemarks] = useState('');
   const [error, setError] = useState('');
-  const [drafts, setDrafts] = useState({}); // answerId -> in-progress input value
+  const [drafts, setDrafts] = useState({}); // answerId -> in-progress marks input value
+  const [remarksDrafts, setRemarksDrafts] = useState({}); // answerId -> in-progress remarks value
   const [savingId, setSavingId] = useState(null);
+  const [savingRemarksId, setSavingRemarksId] = useState(null);
+  const [savingOverall, setSavingOverall] = useState(false);
   const [processingScan, setProcessingScan] = useState(false);
 
   const load = useCallback(() => {
@@ -1402,6 +1587,10 @@ function GradingForm({ attemptId, onGraded }) {
         setAnswers(res.data.answers);
         setScanAnswers(res.data.scanAnswers || []);
         setAttemptScan(res.data.attemptScan || null);
+        setOverallRemarks(res.data.overallRemarks || '');
+        setRemarksDrafts(Object.fromEntries(
+          [...res.data.answers, ...(res.data.scanAnswers || [])].map((a) => [a.answer_id, a.remarks || ''])
+        ));
       })
       .catch(() => setError('Failed to load answers.'));
   }, [attemptId]);
@@ -1409,6 +1598,7 @@ function GradingForm({ attemptId, onGraded }) {
   useEffect(() => { load(); }, [load]);
 
   const gradable = (answers || []).filter((a) => a.type === 'short' || a.type === 'long');
+  const autoGraded = (answers || []).filter((a) => a.type === 'mcq' || a.type === 'coding');
 
   // Shared by both the short/long route and the scan-answer route — same
   // shape response ({ score, fullyGraded }), just a different URL per kind.
@@ -1428,6 +1618,34 @@ function GradingForm({ attemptId, onGraded }) {
     }
   };
 
+  // Remarks are settable on any item type, independent of the marks-only
+  // routes above — same URL split by kind, just a different body field.
+  const saveRemarks = async (kind, answerId) => {
+    setSavingRemarksId(answerId);
+    try {
+      const url = kind === 'scan'
+        ? `${API}/api/admin/exam-scan-answers/${answerId}/grade`
+        : `${API}/api/admin/exam-answers/${answerId}/grade`;
+      await axios.put(url, { remarks: remarksDrafts[answerId] ?? '' }, { withCredentials: true });
+      load();
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to save remarks.');
+    } finally {
+      setSavingRemarksId(null);
+    }
+  };
+
+  const saveOverallRemarks = async () => {
+    setSavingOverall(true);
+    try {
+      await axios.put(`${API}/api/admin/exam-attempts/${attemptId}/remarks`, { overallRemarks }, { withCredentials: true });
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to save overall remarks.');
+    } finally {
+      setSavingOverall(false);
+    }
+  };
+
   const processScanNow = async () => {
     setProcessingScan(true);
     setError('');
@@ -1443,9 +1661,6 @@ function GradingForm({ attemptId, onGraded }) {
 
   if (error) return <div className="alert" style={{ margin: '12px 0' }}><span className="alert-icon">!</span><span>{error}</span></div>;
   if (!answers) return <p className="sb-loading" style={{ margin: '12px 0' }}>Loading answers…</p>;
-  if (gradable.length === 0 && scanAnswers.length === 0) {
-    return <p className="sb-loading" style={{ margin: '12px 0' }}>Nothing to manually grade on this attempt — every item is auto-graded.</p>;
-  }
 
   const gradeInput = (kind, a) => (
     <div className="testcase-row" style={{ marginTop: '10px' }}>
@@ -1471,8 +1686,58 @@ function GradingForm({ attemptId, onGraded }) {
     </div>
   );
 
+  // Remarks are addable to every item type, independent of whether marks
+  // are manually gradable here — a separate save action from gradeInput
+  // above so a teacher can leave feedback without also touching the score.
+  const remarksField = (kind, a) => (
+    <div style={{ marginTop: '10px' }}>
+      <textarea
+        rows={2}
+        style={{ width: '100%', resize: 'vertical' }}
+        placeholder="Remarks for this answer…"
+        value={remarksDrafts[a.answer_id] ?? ''}
+        onChange={(e) => setRemarksDrafts((prev) => ({ ...prev, [a.answer_id]: e.target.value }))}
+      />
+      <button
+        type="button"
+        className="btn btn-ghost btn-sm"
+        style={{ marginTop: 6 }}
+        disabled={savingRemarksId === a.answer_id}
+        onClick={() => saveRemarks(kind, a.answer_id)}
+      >
+        {savingRemarksId === a.answer_id && <span className="spinner" />}
+        Save remarks
+      </button>
+    </div>
+  );
+
   return (
     <div className="submission-history">
+      {autoGraded.map((a) => (
+        <div className="submission-card" key={a.answer_id}>
+          <div className="submission-card-head">
+            <span>{a.prompt}</span>
+            <span className="chip chip-neutral"><span className="dot" />{a.marks_awarded ?? 0}/{a.marks} marks (auto-graded)</span>
+          </div>
+          {a.type === 'mcq' && (
+            <p className="auth-sub" style={{ margin: '8px 0' }}>
+              Selected: {a.options?.find((o) => o.id === a.selected_option_id)?.text || '(no answer given)'}
+              {' — '}
+              <span className={a.is_correct ? 'chip chip-easy' : 'chip chip-hard'} style={{ display: 'inline-flex' }}>
+                <span className="dot" />{a.is_correct ? 'Correct' : 'Incorrect'}
+              </span>
+            </p>
+          )}
+          {a.type === 'coding' && (
+            <>
+              <p className="auth-sub" style={{ margin: '8px 0 4px' }}>{a.language || 'No language selected'} — {a.passed_count ?? 0}/{a.total_count ?? 0} sample cases passed</p>
+              <pre className="submission-code">{a.code || '(no code submitted)'}</pre>
+            </>
+          )}
+          {remarksField('short-long', a)}
+        </div>
+      ))}
+
       {gradable.map((a) => (
         <div className="submission-card" key={a.answer_id}>
           <div className="submission-card-head">
@@ -1481,6 +1746,7 @@ function GradingForm({ attemptId, onGraded }) {
           </div>
           <pre className="submission-code">{a.text_answer || '(no answer given)'}</pre>
           {gradeInput('short-long', a)}
+          {remarksField('short-long', a)}
         </div>
       ))}
 
@@ -1536,8 +1802,32 @@ function GradingForm({ attemptId, onGraded }) {
           </div>
           {a.ai_assessment && <p className="auth-sub" style={{ margin: '8px 0' }}>AI assessment (aid only): {a.ai_assessment}</p>}
           {gradeInput('scan', a)}
+          {remarksField('scan', a)}
         </div>
       ))}
+
+      <div className="submission-card">
+        <div className="submission-card-head">
+          <span>Overall remarks</span>
+        </div>
+        <textarea
+          rows={3}
+          style={{ width: '100%', resize: 'vertical', marginTop: 8 }}
+          placeholder="Optional feedback on the attempt as a whole…"
+          value={overallRemarks}
+          onChange={(e) => setOverallRemarks(e.target.value)}
+        />
+        <button
+          type="button"
+          className="btn btn-ghost btn-sm"
+          style={{ marginTop: 6 }}
+          disabled={savingOverall}
+          onClick={saveOverallRemarks}
+        >
+          {savingOverall && <span className="spinner" />}
+          Save overall remarks
+        </button>
+      </div>
     </div>
   );
 }
@@ -2061,7 +2351,7 @@ function GradeBandsPanel() {
 // this panel only provisions the account and, optionally, its org-chart
 // placement.
 // ============================================================================
-function TeachersPanel() {
+function TeachersPanel({ refreshSignal }) {
   const [teachers, setTeachers] = useState(null);
   const [units, setUnits] = useState([]);
   const [error, setError] = useState('');
@@ -2088,7 +2378,10 @@ function TeachersPanel() {
     }
   }, []);
 
-  useEffect(() => { fetchAll(); }, [fetchAll]);
+  // refreshSignal ticks whenever OrgStructureBuilder (rendered alongside
+  // this panel) adds/renames/removes a unit — without it, this panel's own
+  // units list only ever reflected whatever existed at its own mount time.
+  useEffect(() => { fetchAll(); }, [fetchAll, refreshSignal]);
 
   const createTeacher = async (e) => {
     e.preventDefault();
@@ -2234,6 +2527,469 @@ function TeachersPanel() {
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// PROMOTE STUDENTS — end-of-academic-year bulk move from one unit to
+// another (see POST /api/admin/org-units/:fromUnitId/promote). Purely an
+// org_unit_id reassignment; every score a student has is keyed off their
+// user id, not their unit, so nothing about their history needs to change
+// here — the backend route's own comment covers why. refreshSignal (bumped
+// by OrgStructureBuilder) keeps the two unit dropdowns in sync with
+// newly-added units, same as SubjectsPanel/TeachersPanel above.
+// ============================================================================
+const PCR_STATUS_CLASS = { pending: 'chip-medium', escalated: 'chip-medium', approved: 'chip-easy', rejected: 'chip-hard' };
+
+// ============================================================================
+// ADMIN: PROFILE CHANGE REQUESTS — a student's own request to correct their
+// roster info lands here first (their own org's admin), not the superadmin.
+// Approve/Reject resolve it directly; Escalate hands it to the superadmin
+// queue for anything this admin can't or shouldn't decide alone.
+// ============================================================================
+function AdminProfileChangeRequestsPanel() {
+  const [requests, setRequests] = useState(null);
+  const [error, setError] = useState('');
+  const [busyId, setBusyId] = useState(null);
+  const [noteDrafts, setNoteDrafts] = useState({});
+  const [showAll, setShowAll] = useState(false);
+
+  const fetchRequests = useCallback(() => {
+    axios.get(`${API}/api/admin/profile-change-requests`, {
+      params: { status: showAll ? 'all' : 'pending' },
+      withCredentials: true,
+    })
+      .then((res) => setRequests(res.data.requests))
+      .catch((err) => setError(err.response?.data?.error || 'Failed to load profile change requests.'));
+  }, [showAll]);
+
+  useEffect(() => { fetchRequests(); }, [fetchRequests]);
+
+  const review = async (id, action) => {
+    setBusyId(id);
+    setError('');
+    try {
+      await axios.post(`${API}/api/admin/profile-change-requests/${id}/review`, {
+        action,
+        note: noteDrafts[id] || '',
+      }, { withCredentials: true });
+      fetchRequests();
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to review request.');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  if (!requests && !error) return <p className="sb-loading">Loading profile change requests…</p>;
+
+  return (
+    <div className="panel" style={{ padding: 20, marginBottom: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+        <h3 style={{ margin: 0 }}>Profile change requests</h3>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 }}>
+          <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} />
+          Show reviewed too
+        </label>
+      </div>
+      <p className="auth-sub" style={{ margin: '0 0 16px' }}>
+        Corrections your students have requested to their own roster record. Approve or reject directly,
+        or escalate to the platform owner if you can't resolve it yourself.
+      </p>
+
+      {error && <div className="alert" style={{ marginBottom: 16 }}><span className="alert-icon">!</span><span>{error}</span></div>}
+      {requests && requests.length === 0 && <p className="sb-loading">No requests to show.</p>}
+
+      {requests && requests.length > 0 && (
+        <div className="admin-table-wrap">
+          <table className="admin-table">
+            <thead>
+              <tr>
+                <th>Student</th>
+                <th>Field</th>
+                <th>Current → Requested</th>
+                <th>Reason</th>
+                <th>Status</th>
+                <th aria-label="Actions" />
+              </tr>
+            </thead>
+            <tbody>
+              {requests.map((r) => (
+                <tr key={r.id}>
+                  <td className="admin-cell-strong">
+                    {r.student_name || r.student_email}
+                    {r.student_name && <div style={{ color: 'var(--text-dim)', fontSize: '12px', fontWeight: 400 }}>{r.student_email}</div>}
+                  </td>
+                  <td>{r.field}</td>
+                  <td>{r.current_value || '—'} <span style={{ color: 'var(--text-dim)' }}>&rarr;</span> {r.requested_value}</td>
+                  <td style={{ maxWidth: 220, whiteSpace: 'normal' }}>{r.reason || '—'}</td>
+                  <td><span className={`chip ${PCR_STATUS_CLASS[r.status] || 'chip-neutral'}`}><span className="dot" />{r.status}</span></td>
+                  <td className="admin-cell-actions">
+                    {r.status === 'pending' ? (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-end' }}>
+                        <input
+                          placeholder="Note (optional)"
+                          value={noteDrafts[r.id] || ''}
+                          onChange={(e) => setNoteDrafts((prev) => ({ ...prev, [r.id]: e.target.value }))}
+                          style={{ width: 180, padding: '4px 8px', fontSize: 12.5, background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text)' }}
+                        />
+                        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                          <button type="button" className="btn btn-ghost btn-sm" disabled={busyId === r.id} onClick={() => review(r.id, 'rejected')}>Reject</button>
+                          <button type="button" className="btn btn-ghost btn-sm" disabled={busyId === r.id} onClick={() => review(r.id, 'escalated')}>Escalate</button>
+                          <button type="button" className="btn btn-primary btn-sm" disabled={busyId === r.id} onClick={() => review(r.id, 'approved')}>
+                            {busyId === r.id ? 'Saving…' : 'Approve'}
+                          </button>
+                        </div>
+                      </div>
+                    ) : r.status === 'escalated' ? (
+                      <span className="auth-sub">Sent to superadmin{r.escalation_note ? `: ${r.escalation_note}` : ''}</span>
+                    ) : (
+                      r.review_note || '—'
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================================
+// REQUEST ADD-ADMIN — structured, unlike AdminRequestsPanel's free-form
+// message below: approving one of these actually creates the membership
+// (see POST /api/superadmin/add-admin-requests/:id/approve), so it needs
+// real name/email fields, not prose the superadmin has to parse and action
+// by hand. Nothing in this dashboard lets an admin add a co-admin directly
+// the way they can add a teacher/student themselves — admin is the org's
+// top role here, so that has to be gated through the superadmin.
+// ============================================================================
+function RequestAddAdminPanel() {
+  const [requests, setRequests] = useState(null);
+  const [error, setError] = useState('');
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState(false);
+
+  const fetchRequests = useCallback(() => {
+    axios.get(`${API}/api/admin/add-admin-requests`, { withCredentials: true })
+      .then((res) => setRequests(res.data.requests))
+      .catch((err) => setError(err.response?.data?.error || 'Failed to load your requests.'));
+  }, []);
+
+  useEffect(() => { fetchRequests(); }, [fetchRequests]);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setSending(true);
+    setError('');
+    setSent(false);
+    try {
+      await axios.post(`${API}/api/admin/add-admin-requests`, { name, email }, { withCredentials: true });
+      setName('');
+      setEmail('');
+      setSent(true);
+      fetchRequests();
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to send request.');
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <div className="panel" style={{ padding: 20, marginBottom: 16 }}>
+      <h3 style={{ margin: '0 0 4px' }}>Request another admin be added</h3>
+      <p className="auth-sub" style={{ margin: '0 0 16px' }}>
+        Adding a co-admin for your institution goes through the platform owner — tell them who to add.
+      </p>
+
+      {error && <div className="alert" style={{ marginBottom: 16 }}><span className="alert-icon">!</span><span>{error}</span></div>}
+      {sent && <p className="auth-sub" style={{ color: 'var(--accent)', margin: '0 0 16px' }}>Request sent.</p>}
+
+      <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 420, marginBottom: 20 }}>
+        <input
+          placeholder="Name (optional)"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          style={{ padding: '8px 10px', fontSize: 13.5, background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text)' }}
+        />
+        <input
+          type="email"
+          placeholder="Email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          required
+          style={{ padding: '8px 10px', fontSize: 13.5, background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text)' }}
+        />
+        <button type="submit" className="btn btn-primary btn-sm" disabled={sending} style={{ alignSelf: 'flex-start' }}>
+          {sending ? 'Sending…' : 'Send request'}
+        </button>
+      </form>
+
+      {requests && requests.length > 0 && (
+        <div className="admin-table-wrap">
+          <table className="admin-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Email</th>
+                <th>Status</th>
+                <th>Note</th>
+                <th>Sent</th>
+              </tr>
+            </thead>
+            <tbody>
+              {requests.map((r) => (
+                <tr key={r.id}>
+                  <td className="admin-cell-strong">{r.new_admin_name || '—'}</td>
+                  <td>{r.new_admin_email}</td>
+                  <td><span className={`chip ${r.status === 'approved' ? 'chip-easy' : r.status === 'rejected' ? 'chip-hard' : 'chip-medium'}`}><span className="dot" />{r.status}</span></td>
+                  <td style={{ maxWidth: 200, whiteSpace: 'normal', fontSize: 13 }}>{r.review_note || '—'}</td>
+                  <td>{new Date(r.created_at).toLocaleDateString(undefined, { dateStyle: 'medium' })}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================================
+// ADMIN REQUESTS — an institution admin's own free-form message to the
+// platform owner. Separate from AdminProfileChangeRequestsPanel's "Escalate"
+// button above: that only fires in reaction to a student's pre-existing
+// request, so it's not a way for an admin to reach the superadmin on their
+// own initiative. This is that missing direct channel.
+// ============================================================================
+function AdminRequestsPanel() {
+  const [requests, setRequests] = useState(null);
+  const [error, setError] = useState('');
+  const [subject, setSubject] = useState('');
+  const [message, setMessage] = useState('');
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState(false);
+
+  const fetchRequests = useCallback(() => {
+    axios.get(`${API}/api/admin/requests`, { withCredentials: true })
+      .then((res) => setRequests(res.data.requests))
+      .catch((err) => setError(err.response?.data?.error || 'Failed to load your requests.'));
+  }, []);
+
+  useEffect(() => { fetchRequests(); }, [fetchRequests]);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setSending(true);
+    setError('');
+    setSent(false);
+    try {
+      await axios.post(`${API}/api/admin/requests`, { subject, message }, { withCredentials: true });
+      setSubject('');
+      setMessage('');
+      setSent(true);
+      fetchRequests();
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to send request.');
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <div className="panel" style={{ padding: 20, marginBottom: 16 }}>
+      <h3 style={{ margin: '0 0 4px' }}>Contact the platform owner</h3>
+      <p className="auth-sub" style={{ margin: '0 0 16px' }}>
+        Send a request or question straight to the superadmin — for anything that isn't a student info correction.
+      </p>
+
+      {error && <div className="alert" style={{ marginBottom: 16 }}><span className="alert-icon">!</span><span>{error}</span></div>}
+      {sent && <p className="auth-sub" style={{ color: 'var(--accent)', margin: '0 0 16px' }}>Request sent.</p>}
+
+      <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 10, maxWidth: 480, marginBottom: 20 }}>
+        <input
+          placeholder="Subject"
+          value={subject}
+          onChange={(e) => setSubject(e.target.value)}
+          required
+          style={{ padding: '8px 10px', fontSize: 13.5, background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text)' }}
+        />
+        <textarea
+          placeholder="Message"
+          value={message}
+          onChange={(e) => setMessage(e.target.value)}
+          required
+          rows={4}
+          style={{ padding: '8px 10px', fontSize: 13.5, background: 'var(--surface-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text)', resize: 'vertical' }}
+        />
+        <button type="submit" className="btn btn-primary btn-sm" disabled={sending} style={{ alignSelf: 'flex-start' }}>
+          {sending ? 'Sending…' : 'Send request'}
+        </button>
+      </form>
+
+      {requests && requests.length > 0 && (
+        <div className="admin-table-wrap">
+          <table className="admin-table">
+            <thead>
+              <tr>
+                <th>Subject</th>
+                <th>Message</th>
+                <th>Status</th>
+                <th>Response</th>
+                <th>Sent</th>
+              </tr>
+            </thead>
+            <tbody>
+              {requests.map((r) => (
+                <tr key={r.id}>
+                  <td className="admin-cell-strong">{r.subject}</td>
+                  <td style={{ maxWidth: 260, whiteSpace: 'normal', fontSize: 13 }}>{r.message}</td>
+                  <td><span className={`chip ${r.status === 'resolved' ? 'chip-easy' : 'chip-medium'}`}><span className="dot" />{r.status}</span></td>
+                  <td style={{ maxWidth: 200, whiteSpace: 'normal', fontSize: 13 }}>{r.response_note || '—'}</td>
+                  <td>{new Date(r.created_at).toLocaleDateString(undefined, { dateStyle: 'medium' })}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PromoteStudentsPanel({ refreshSignal }) {
+  const [units, setUnits] = useState([]);
+  const [students, setStudents] = useState(null);
+  const [error, setError] = useState('');
+  const [fromUnitId, setFromUnitId] = useState('');
+  const [toUnitId, setToUnitId] = useState('');
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [promoting, setPromoting] = useState(false);
+  const [result, setResult] = useState('');
+
+  const fetchAll = useCallback(async () => {
+    try {
+      const [unitsRes, studentsRes] = await Promise.all([
+        axios.get(`${API}/api/admin/org-units`, { withCredentials: true }),
+        axios.get(`${API}/api/admin/students`, { withCredentials: true }),
+      ]);
+      setUnits(unitsRes.data.units.map((u) => ({ ...u, level: unitsRes.data.levels.find((l) => l.id === u.level_def_id) })));
+      setStudents(studentsRes.data.students);
+    } catch {
+      setError('Failed to load units/students.');
+    }
+  }, []);
+
+  useEffect(() => { fetchAll(); }, [fetchAll, refreshSignal]);
+
+  const studentsInFromUnit = students && fromUnitId
+    ? students.filter((s) => String(s.org_unit_id) === String(fromUnitId))
+    : [];
+
+  const toggleSelected = (id) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const selectFromUnit = (id) => {
+    setFromUnitId(id);
+    setResult('');
+    setSelectedIds(new Set((students || []).filter((s) => String(s.org_unit_id) === String(id)).map((s) => s.id)));
+  };
+
+  const promote = async () => {
+    setPromoting(true);
+    setError('');
+    setResult('');
+    try {
+      const res = await axios.post(
+        `${API}/api/admin/org-units/${fromUnitId}/promote`,
+        { toUnitId: Number(toUnitId), studentIds: Array.from(selectedIds) },
+        { withCredentials: true }
+      );
+      setResult(`Promoted ${res.data.promoted} student(s) to ${res.data.toUnitName}.`);
+      setFromUnitId('');
+      setToUnitId('');
+      setSelectedIds(new Set());
+      fetchAll();
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to promote students.');
+    } finally {
+      setPromoting(false);
+    }
+  };
+
+  if (!students) return <p className="sb-loading">Loading…</p>;
+
+  return (
+    <div className="panel" style={{ padding: 20, marginTop: 24 }}>
+      <h3 style={{ margin: '0 0 4px' }}>Promote students</h3>
+      <p className="auth-sub" style={{ margin: '0 0 16px' }}>
+        End of academic year — move students from one unit to the next. Their assignment/exam scores stay
+        attached to them regardless of which unit they're in, so nothing about their history is affected.
+      </p>
+
+      {error && <div className="alert" style={{ marginBottom: 16 }}><span className="alert-icon">!</span><span>{error}</span></div>}
+      {result && <div className="alert alert-success" style={{ marginBottom: 16 }}><span className="alert-icon">✓</span><span>{result}</span></div>}
+
+      <div className="testcase-row" style={{ maxWidth: 560, marginBottom: 16 }}>
+        <select value={fromUnitId} onChange={(e) => selectFromUnit(e.target.value)} style={{ minWidth: 200 }}>
+          <option value="">From unit…</option>
+          {units.map((u) => (
+            <option key={u.id} value={u.id}>{u.name} ({u.level?.label})</option>
+          ))}
+        </select>
+        <span className="auth-sub">&rarr;</span>
+        <select value={toUnitId} onChange={(e) => setToUnitId(e.target.value)} style={{ minWidth: 200 }}>
+          <option value="">To unit…</option>
+          {units.filter((u) => String(u.id) !== String(fromUnitId)).map((u) => (
+            <option key={u.id} value={u.id}>{u.name} ({u.level?.label})</option>
+          ))}
+        </select>
+      </div>
+
+      {fromUnitId && (
+        studentsInFromUnit.length === 0 ? (
+          <p className="sb-loading">No students currently in this unit.</p>
+        ) : (
+          <>
+            <div className="field-group-label" style={{ marginBottom: 8 }}>
+              Students to promote ({selectedIds.size}/{studentsInFromUnit.length} selected)
+            </div>
+            <div className="admin-table-wrap" style={{ marginBottom: 16, maxHeight: 320, overflowY: 'auto' }}>
+              <table className="admin-table">
+                <tbody>
+                  {studentsInFromUnit.map((s) => (
+                    <tr key={s.id}>
+                      <td style={{ width: 32 }}>
+                        <input type="checkbox" checked={selectedIds.has(s.id)} onChange={() => toggleSelected(s.id)} />
+                      </td>
+                      <td className="admin-cell-strong">{s.name || s.email}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <button
+              type="button"
+              className="btn btn-primary btn-sm"
+              disabled={!toUnitId || selectedIds.size === 0 || promoting}
+              onClick={promote}
+            >
+              {promoting ? 'Promoting…' : `Promote ${selectedIds.size} student(s)`}
+            </button>
+          </>
+        )
+      )}
     </div>
   );
 }

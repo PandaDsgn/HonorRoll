@@ -8,7 +8,7 @@ import { API } from '../config';
 // assigning its teachers is admin-only; a teacher only ever gets read
 // access to (a subset of) this list, via GET /api/admin/subjects itself,
 // to power the subject-picker on the assignment/exam forms.
-export default function SubjectsPanel() {
+export default function SubjectsPanel({ refreshSignal }) {
   const [subjects, setSubjects] = useState(null);
   const [units, setUnits] = useState([]);
   const [error, setError] = useState('');
@@ -30,7 +30,10 @@ export default function SubjectsPanel() {
     }
   }, []);
 
-  useEffect(() => { fetchAll(); }, [fetchAll]);
+  // refreshSignal ticks whenever OrgStructureBuilder (rendered alongside
+  // this panel) adds/renames/removes a unit — without it, this panel's own
+  // units list only ever reflected whatever existed at its own mount time.
+  useEffect(() => { fetchAll(); }, [fetchAll, refreshSignal]);
 
   const addSubject = async () => {
     const name = newName.trim();

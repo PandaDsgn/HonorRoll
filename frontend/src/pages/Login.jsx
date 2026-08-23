@@ -15,11 +15,10 @@ function landingPathFor(role) {
   return role === 'admin' || role === 'teacher' ? '/admin' : '/assignments';
 }
 
-// Purely a labeling aid — email+password alone determine the account's
-// actual role server-side (see POST /api/login), so picking a tab here
-// never changes what credentials are checked or where a successful login
-// lands. It only exists so the form stops permanently reading "Student
-// email" at a teacher/admin/superadmin trying to sign in.
+// Sent to the backend as `audience` and enforced there (see POST
+// /api/login) — picking a tab is a real filter, not just a label:
+// signing in with a student's own credentials while "Teacher" is selected
+// is now a rejection, not a silent redirect into the student area.
 const AUDIENCES = [
   { key: 'student', label: 'Student' },
   { key: 'teacher', label: 'Teacher' },
@@ -39,6 +38,13 @@ export default function Login() {
   // instead of a usable token in that case.
   const [orgChoice, setOrgChoice] = useState(null);
   const [selectingOrgId, setSelectingOrgId] = useState(null);
+  // Set when the account is a teacher/student signing in for the first
+  // time — their account was created by an admin, so they never saw a
+  // Terms of Service checkbox anywhere else (see POST /api/login's
+  // requiresTosAcceptance branch). Holds the short-lived token that
+  // completes the login once they accept.
+  const [tosPendingToken, setTosPendingToken] = useState(null);
+  const [acceptingTos, setAcceptingTos] = useState(false);
 
   const navigate = useNavigate();
   const { theme, toggleTheme } = useTheme();
@@ -54,11 +60,16 @@ export default function Login() {
     try {
       const response = await axios.post(
         `${API}/api/login`,
-        { email, password }
+        { email, password, audience }
       );
 
       if (response.data.requiresOrgSelection) {
         setOrgChoice(response.data);
+        return;
+      }
+
+      if (response.data.requiresTosAcceptance) {
+        setTosPendingToken(response.data.tosPendingToken);
         return;
       }
 
@@ -89,6 +100,11 @@ export default function Login() {
         preAuthToken: orgChoice.preAuthToken,
         organizationId,
       });
+      if (response.data.requiresTosAcceptance) {
+        setOrgChoice(null);
+        setTosPendingToken(response.data.tosPendingToken);
+        return;
+      }
       login(response.data.token, response.data.user);
       navigate(landingPathFor(response.data.user.role), { replace: true });
     } catch (err) {
@@ -96,6 +112,21 @@ export default function Login() {
       setOrgChoice(null);
     } finally {
       setSelectingOrgId(null);
+    }
+  };
+
+  const handleAcceptTos = async () => {
+    setError('');
+    setAcceptingTos(true);
+    try {
+      const response = await axios.post(`${API}/api/login/accept-tos`, { tosPendingToken });
+      login(response.data.token, response.data.user);
+      navigate(landingPathFor(response.data.user.role), { replace: true });
+    } catch (err) {
+      setError(err.response?.data?.error || 'Network error. Is the backend server running?');
+      setTosPendingToken(null);
+    } finally {
+      setAcceptingTos(false);
     }
   };
 
@@ -136,6 +167,54 @@ export default function Login() {
 
           <div className="auth-back-row">
             <button type="button" className="auth-link" onClick={() => setOrgChoice(null)}>
+              Back to sign in
+            </button>
+          </div>
+
+          {error && (
+            <div className="alert" role="alert">
+              <span className="alert-icon">!</span>
+              <span>{error}</span>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (tosPendingToken) {
+    return (
+      <div className="auth-shell">
+        <div className="auth-card bracket-frame">
+          <span className="corner tl" aria-hidden="true" />
+          <span className="corner tr" aria-hidden="true" />
+          <span className="corner bl" aria-hidden="true" />
+          <span className="corner br" aria-hidden="true" />
+
+          <div className="auth-card-head">
+            <button type="button" className="brand" onClick={() => navigate('/', { replace: true })}><BrandMark /></button>
+            <ThemeToggle theme={theme} onToggle={toggleTheme} />
+          </div>
+
+          <h2 className="auth-title">Before you continue</h2>
+          <p className="auth-sub">
+            This is your first time signing in — please review and accept our Terms of Service and
+            Privacy Policy to continue.
+          </p>
+
+          <p style={{ margin: '16px 0' }}>
+            <a href="#/terms" target="_blank" rel="noreferrer" className="auth-link" style={{ display: 'inline' }}>Terms of Service</a>
+            {' · '}
+            <a href="#/privacy" target="_blank" rel="noreferrer" className="auth-link" style={{ display: 'inline' }}>Privacy Policy</a>
+          </p>
+
+          <button type="button" className="btn btn-primary auth-submit" disabled={acceptingTos} onClick={handleAcceptTos}>
+            {acceptingTos && <span className="spinner" />}
+            {acceptingTos ? 'Continuing…' : 'Accept and continue'}
+          </button>
+
+          <div className="auth-back-row">
+            <button type="button" className="auth-link" onClick={() => setTosPendingToken(null)}>
               Back to sign in
             </button>
           </div>
@@ -246,6 +325,12 @@ export default function Login() {
             <span>{error}</span>
           </div>
         )}
+
+        <p className="auth-sub" style={{ textAlign: 'center', margin: '20px 0 0' }}>
+          <a href="#/terms" target="_blank" rel="noreferrer" className="auth-link" style={{ display: 'inline' }}>Terms of Service</a>
+          {' · '}
+          <a href="#/privacy" target="_blank" rel="noreferrer" className="auth-link" style={{ display: 'inline' }}>Privacy Policy</a>
+        </p>
       </div>
     </div>
   );

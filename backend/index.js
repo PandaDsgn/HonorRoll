@@ -15,6 +15,7 @@ const { sendEmail } = require('./mailer');
 const { exec } = require('child_process');
 const path = require('path');
 const multer = require('multer');
+const archiver = require('archiver');
 const { isB2Configured, scanObjectKey, examScanObjectKey, uploadScanPdf, deleteScanPdf, getScanPdfUrl, downloadScanPdf } = require('./storage');
 const { isOcrConfigured, runOcr } = require('./ocrClient');
 const { isGroqConfigured, assessAnswers } = require('./aiGrading');
@@ -37,6 +38,23 @@ const scanUpload = multer({
 });
 
 const app = express();
+// Without this, req.ip (what rateLimiter.js keys every limit on) is always
+// the DIRECT TCP peer — which, once this sits behind the nginx load
+// balancer in docker-compose.yml/nginx.conf, is nginx's own container IP
+// on every single request, for every user. That collapses every visitor
+// into one shared rate-limit bucket: one busy legitimate user can lock
+// everyone else out, and an attacker gets the SAME 10-attempts-per-15-min
+// budget as the entire rest of the platform combined instead of their own.
+// `1` trusts exactly one hop — the immediate connecting proxy — matching
+// this deployment's actual topology (browser -> nginx -> this app, nothing
+// else in between). Express then reads the real client IP as the last
+// entry nginx's own $proxy_add_x_forwarded_for appended, and does NOT
+// trust anything further back that a client could have forged in an
+// X-Forwarded-For header of their own. Harmless with no proxy in front
+// (e.g. hitting this directly on localhost in dev) — there's simply
+// nothing at that one trusted hop to read a header from, so req.ip falls
+// back to the direct connection either way.
+app.set('trust proxy', 1);
 // The `verify` callback stashes the raw request-body bytes on req.rawBody —
 // needed by the Razorpay webhook route to check X-Razorpay-Signature, which
 // must be computed over the exact raw bytes Razorpay sent, not a
@@ -71,11 +89,117 @@ if (!fs.existsSync(tempDir)) {
 // Initialize PostgreSQL Connection Pool
 // ssl is required for Neon (and most hosted Postgres) even when sslmode=require
 // is already in the connection string — this is a belt-and-braces fallback so
-// pg doesn't reject Neon's cert chain.
+// pg doesn't reject Neon's cert chain. But a plain self-hosted Postgres (the
+// docker-compose `db` service, or Postgres running directly on a box you
+// control) typically has SSL off entirely, and pg's client-side `ssl`
+// option isn't negotiable the way sslmode=prefer would be — passing it at
+// all makes the client demand SSL and fail outright ("the server does not
+// support SSL connections") against one that doesn't offer it. DB_SSL
+// defaults to "true" so every existing deployment (Neon) is unaffected;
+// set DB_SSL=false for a target that doesn't speak TLS at all.
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: process.env.DB_SSL === 'false' ? false : { rejectUnauthorized: false },
+  // Bounds how many concurrent DB connections one instance can open — with
+  // no cap, a burst of concurrent requests would each grab a client and a
+  // slow/locked query could exhaust Postgres's own max_connections across
+  // every horizontally-scaled replica combined. 20 is pg's own client
+  // default; set explicitly so it's a deliberate, visible number rather
+  // than an implicit one.
+  max: Number(process.env.DB_POOL_MAX) || 20,
 });
+// node-postgres's own documented gotcha: an idle pooled client can emit an
+// 'error' event on its own (the server closed the connection, a network
+// blip) with no query in flight to catch it. Pool is an EventEmitter, and
+// an EventEmitter with zero listeners on an 'error' event rethrows it as an
+// uncaught exception — which crashes the entire Node process instantly,
+// taking down every in-flight request on this instance. This listener is
+// the difference between "one bad connection logs a warning" and "the
+// whole server falls over"; see the 429/503-not-crashes goal this whole
+// pass exists for.
+pool.on('error', (err) => {
+  console.error('Unexpected error on idle PostgreSQL client:', err);
+});
+
+// Health check for the load balancer (nginx) and Docker's own healthcheck
+// directive — see docker-compose.yml. Deliberately registered before the
+// rate limiter and load guard below: an infrastructure check hitting this
+// every few seconds from every replica shouldn't compete with real traffic
+// for the same rate-limit budget, and a health check is exactly the signal
+// that should keep working even while the instance is shedding load via
+// dbLoadGuard. Actually queries the DB rather than just returning 200
+// unconditionally — a process that's alive but can't reach Postgres is not
+// healthy, and the load balancer needs to know to route around it.
+app.get('/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.status(200).json({ status: 'ok' });
+  } catch (err) {
+    console.error('Health check failed:', err);
+    res.status(503).json({ status: 'unhealthy' });
+  }
+});
+
+// Circuit breaker for real DB overload, not just a single slow query — if
+// every pooled connection is already checked out AND requests are already
+// queuing up behind the pool waiting for one to free, a fresh request
+// piling on top only makes the backlog worse and eventually times out
+// anyway. Short-circuiting to 503 here means an overloaded instance sheds
+// load predictably (and fast — no query attempted, no wait) instead of
+// every route's own individual query eventually timing out into a slow
+// 500, or worse, requests queuing until the process falls over. Threshold
+// is proportional to pool size, not a fixed number, so it scales with
+// DB_POOL_MAX. Applied globally via app.use, not per-route, since every
+// route shares the same one pool.
+function dbLoadGuard(req, res, next) {
+  const waitThreshold = Math.max(5, pool.options.max);
+  if (pool.waitingCount >= waitThreshold) {
+    res.set('Retry-After', '2');
+    return res.status(503).json({ error: 'Service is temporarily overloaded — please retry in a moment.' });
+  }
+  next();
+}
+app.use(dbLoadGuard);
+
+// See rateLimiter.js for why these are built as always-on middleware from
+// the start (in-memory) rather than waiting on an async Redis connection.
+// authLimiter's path-prefix match covers /api/login, .../select-organization,
+// and .../accept-tos in one line — all three are steps of the same login
+// flow and belong behind the same, much tighter, brute-force ceiling than
+// the rest of the API gets from globalLimiter below.
+const { globalLimiter, authLimiter, connectRedisAndUpgradeStores } = require('./rateLimiter');
+const { cached, invalidate } = require('./cache');
+app.use('/api/login', authLimiter);
+app.use('/api/organizations/signup', authLimiter);
+app.use('/api/forgot-password', authLimiter);
+app.use('/api/reset-password', authLimiter);
+app.use(globalLimiter);
+connectRedisAndUpgradeStores();
+
+// Every ensureXSchema() function below is memoized (its own cached
+// xSchemaPromise) and most explicitly `await` the specific other schema
+// functions their own CREATE TABLE/ALTER TABLE references — but the ~40
+// bare `ensureXSchema();` trigger calls that actually KICK OFF that whole
+// graph at the bottom of each function are fired independently, all at
+// once, the instant this file loads. Against the real production
+// database that's always been harmless (every table already exists, so
+// nearly every one of these is an instant no-op) — but against a
+// genuinely empty Postgres (a fresh deploy, this repo's own
+// docker-compose `db` service) it isn't: two unrelated CREATE TABLEs
+// running concurrently can still deadlock on Postgres's own catalog locks
+// even when neither depends on the other, and any dependency edge that
+// isn't explicitly awaited races for real. bootSchemaStep queues every
+// trigger call to run strictly one at a time, in the order it's called —
+// which is already the order the file defines them in, i.e. already
+// dependency order by construction (a table's own ensureXSchema always
+// appears before the first thing that ALTERs or references it). That
+// turns the ordering this file's authors clearly intended, but never
+// actually enforced, into something that's really true.
+let bootSchemaQueue = Promise.resolve();
+function bootSchemaStep(fn) {
+  bootSchemaQueue = bootSchemaQueue.then(() => fn()).catch((err) => console.error('Schema boot step failed:', err));
+  return bootSchemaQueue;
+}
 
 // The root of multi-tenancy: every college/school is one row here. Several
 // other schema functions below need this table to exist before they can add
@@ -99,37 +223,176 @@ function ensureOrganizationsSchema() {
   }
   return organizationsSchemaPromise;
 }
-ensureOrganizationsSchema();
+bootSchemaStep(ensureOrganizationsSchema);
+
+// The global identity table — every other ensureXSchema function in this
+// file assumes `users` already exists (memberships.user_id REFERENCES
+// users(id), problems.created_by, etc.), but until now nothing actually
+// created it: the three column-migration functions right below only ever
+// ALTER it, and the production database has had a `users` table since
+// before any of this ensureXSchema machinery existed, so the gap was
+// invisible there. A genuinely fresh Postgres (a new deployment, this
+// repo's own docker-compose `db` service) has no such history — without
+// this, table creation, and therefore ALL of it: signup, login, every
+// route that touches an account.
+//
+// id defaults via gen_random_uuid(), a built-in SQL function since
+// Postgres 13 — no CREATE EXTENSION needed (unlike pre-13, which required
+// pgcrypto or uuid-ossp for this). role/organization_id are included here
+// only because ensureUsersOrgColumn below still needs to ADD COLUMN them
+// on pre-existing databases that predate this function; a truly fresh
+// table gets them from this CREATE TABLE directly instead, same end state
+// either way. reset_token/token_expiry back the forgot-password flow
+// (POST /api/forgot-password, /api/reset-password) — genuinely missing
+// from every ALTER-column function until now, the same blind spot as the
+// table itself.
+let usersSchemaPromise = null;
+function ensureUsersSchema() {
+  if (!usersSchemaPromise) {
+    usersSchemaPromise = pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        reset_token TEXT,
+        token_expiry TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `).catch((err) => console.error('Failed to ensure users schema:', err));
+  }
+  return usersSchemaPromise;
+}
+bootSchemaStep(ensureUsersSchema);
 
 // Nullable — has to tolerate whatever pre-multi-tenancy rows still exist
 // (this platform started single-tenant). Every new row from here on is
 // always given one at the application level (signup, create-student, the
 // Google Form webhook, exam/problem creation) — see the routes that use it.
 async function ensureUsersOrgColumn() {
+  await ensureUsersSchema();
   await ensureOrganizationsSchema();
   try {
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS organization_id INTEGER REFERENCES organizations(id)');
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT`);
   } catch (err) {
     console.error('Failed to ensure users.organization_id:', err);
   }
 }
-ensureUsersOrgColumn();
+bootSchemaStep(ensureUsersOrgColumn);
 
 // Nullable — a person's display name, collected wherever it's already
 // naturally available (a CSV/Google Form "Name" column, or the manual add
 // forms) and stored once on the global identity rather than per-org, since
-// it's the same person regardless of which organization is asking. No
-// dependency on organizations, so this can run standalone.
+// it's the same person regardless of which organization is asking.
 async function ensureUsersNameColumn() {
+  await ensureUsersSchema();
   try {
     await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS name TEXT');
   } catch (err) {
     console.error('Failed to ensure users.name:', err);
   }
 }
-ensureUsersNameColumn();
+bootSchemaStep(ensureUsersNameColumn);
+
+// Global, per-identity, not per-org — the Terms of Service/Privacy Policy
+// are platform-wide, not something a person accepts separately for every
+// institution they belong to. Set once: at signup for an admin (the
+// checkbox on that form — see POST /api/organizations/signup), or on first
+// login for a teacher/student (accounts admins create for them never ask
+// this directly, so their own first login is the only moment to collect
+// it — see the requiresTosAcceptance branch in POST /api/login). Superadmin
+// sessions never touch this column at all — platform staff, not a
+// customer accepting terms.
+async function ensureUsersTosColumn() {
+  await ensureUsersSchema();
+  try {
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS tos_accepted_at TIMESTAMPTZ');
+  } catch (err) {
+    console.error('Failed to ensure users.tos_accepted_at:', err);
+  }
+}
+bootSchemaStep(ensureUsersTosColumn);
+
+// The other founding table nothing ever created — same gap as `users`
+// (see ensureUsersSchema's own comment): every ALTER-column function below
+// (org/subject/submission_mode/time_limit) and everything that joins
+// against `problems` assumed this table already existed, which was only
+// ever true because the real production database predates this whole
+// ensureXSchema migration pattern. Base columns only — organization_id,
+// subject_id, time_limit_seconds, submission_mode, and assignment_no all
+// still arrive via their own existing ADD COLUMN IF NOT EXISTS functions
+// right below, unchanged; this only adds the CREATE TABLE those functions
+// were silently relying on. Schema (types, constraints, defaults) copied
+// directly from the real production database via information_schema/
+// pg_constraint, not guessed from call sites.
+let problemsSchemaPromise = null;
+function ensureProblemsSchema() {
+  if (!problemsSchemaPromise) {
+    problemsSchemaPromise = ensureUsersSchema().then(() => pool.query(`
+      CREATE TABLE IF NOT EXISTS problems (
+        id SERIAL PRIMARY KEY,
+        title VARCHAR NOT NULL,
+        description TEXT NOT NULL,
+        difficulty VARCHAR NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_by UUID REFERENCES users(id),
+        opens_at TIMESTAMPTZ,
+        closes_at TIMESTAMPTZ,
+        notified BOOLEAN DEFAULT false
+      )
+    `)).catch((err) => console.error('Failed to ensure problems schema:', err));
+  }
+  return problemsSchemaPromise;
+}
+bootSchemaStep(ensureProblemsSchema);
+
+// submissions/test_cases/starter_code are the third, fourth, and fifth
+// founding tables with the same never-created gap — grouped in one
+// function since all three depend on nothing but `problems` and each
+// other's absence doesn't block the others. Schema again copied verbatim
+// from production.
+let judgeDataSchemaPromise = null;
+function ensureJudgeDataSchema() {
+  if (!judgeDataSchemaPromise) {
+    judgeDataSchemaPromise = Promise.all([ensureProblemsSchema(), ensureUsersSchema()]).then(() => Promise.all([
+      pool.query(`
+        CREATE TABLE IF NOT EXISTS submissions (
+          id SERIAL PRIMARY KEY,
+          user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          problem_id INTEGER NOT NULL REFERENCES problems(id) ON DELETE CASCADE,
+          language VARCHAR NOT NULL,
+          code TEXT NOT NULL,
+          status VARCHAR NOT NULL,
+          passed_count INTEGER NOT NULL DEFAULT 0,
+          total_count INTEGER NOT NULL DEFAULT 0,
+          created_at TIMESTAMP DEFAULT now()
+        )
+      `),
+      pool.query(`
+        CREATE TABLE IF NOT EXISTS test_cases (
+          id SERIAL PRIMARY KEY,
+          problem_id INTEGER REFERENCES problems(id) ON DELETE CASCADE,
+          input TEXT NOT NULL,
+          expected_output TEXT NOT NULL,
+          is_hidden BOOLEAN DEFAULT true
+        )
+      `),
+      pool.query(`
+        CREATE TABLE IF NOT EXISTS starter_code (
+          id SERIAL PRIMARY KEY,
+          problem_id INTEGER REFERENCES problems(id) ON DELETE CASCADE,
+          language VARCHAR NOT NULL,
+          code TEXT NOT NULL
+        )
+      `),
+    ])).catch((err) => console.error('Failed to ensure judge data schema:', err));
+  }
+  return judgeDataSchemaPromise;
+}
+bootSchemaStep(ensureJudgeDataSchema);
 
 async function ensureProblemsOrgColumn() {
+  await ensureProblemsSchema();
   await ensureOrganizationsSchema();
   try {
     await pool.query('ALTER TABLE problems ADD COLUMN IF NOT EXISTS organization_id INTEGER REFERENCES organizations(id)');
@@ -137,7 +400,7 @@ async function ensureProblemsOrgColumn() {
     console.error('Failed to ensure problems.organization_id:', err);
   }
 }
-ensureProblemsOrgColumn();
+bootSchemaStep(ensureProblemsOrgColumn);
 
 // Auto-provisions the time-tracking table if it doesn't exist yet, so
 // "true time on task" tracking (see POST /api/problems/:id/time-log) works
@@ -145,10 +408,11 @@ ensureProblemsOrgColumn();
 // (user, problem), accumulated across every visit — not per-attempt, since a
 // student can spend time reading/re-reading a problem between submissions.
 async function ensureTimeTrackingSchema() {
+  await ensureUsersSchema();
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS problem_time_logs (
-        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         problem_id INTEGER NOT NULL REFERENCES problems(id) ON DELETE CASCADE,
         total_seconds INTEGER NOT NULL DEFAULT 0,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -159,20 +423,21 @@ async function ensureTimeTrackingSchema() {
     console.error('Failed to ensure time-tracking schema:', err);
   }
 }
-ensureTimeTrackingSchema();
+bootSchemaStep(ensureTimeTrackingSchema);
 
 // Auto-provisions the optional per-assignment time limit column. NULL (the
 // default for every existing row) means "no limit" — this is deliberately
 // nullable rather than defaulting to 0, so "unset" and "zero minutes" can
 // never be confused with each other anywhere downstream.
 async function ensureTimeLimitColumn() {
+  await ensureProblemsSchema();
   try {
     await pool.query(`ALTER TABLE problems ADD COLUMN IF NOT EXISTS time_limit_seconds INTEGER`);
   } catch (err) {
     console.error('Failed to ensure time_limit_seconds column:', err);
   }
 }
-ensureTimeLimitColumn();
+bootSchemaStep(ensureTimeLimitColumn);
 
 // Auto-provisions the exam data model: `exams` (the container — total time,
 // total marks, webcam requirement, scheduling) and `exam_items` (the actual
@@ -198,6 +463,7 @@ function ensureExamSchema() {
 }
 async function ensureExamSchemaImpl() {
   await ensureOrganizationsSchema();
+  await ensureUsersSchema();
   {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS exams (
@@ -252,7 +518,7 @@ async function ensureExamSchemaImpl() {
     await pool.query(`ALTER TABLE exam_items ADD CONSTRAINT exam_items_type_check CHECK (type IN ('mcq', 'short', 'long', 'coding', 'scan'))`);
   }
 }
-ensureExamSchema();
+bootSchemaStep(ensureExamSchema);
 
 // Auto-provisions the exam-taking data model: one `exam_attempts` row per
 // (exam, student) — the UNIQUE(exam_id, user_id) constraint is what makes
@@ -262,6 +528,7 @@ ensureExamSchema();
 // covers the admin-authored exam definition, not a student's progress
 // through it.
 async function ensureExamSubmissionSchema() {
+  await ensureUsersSchema();
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS exam_attempts (
@@ -328,11 +595,19 @@ async function ensureExamSubmissionSchema() {
         UNIQUE (attempt_id, item_id)
       )
     `);
+
+    // A teacher's free-text note — one per answered item (any type, not
+    // just the manually-graded ones), plus one covering the whole attempt.
+    // Independent of marks_awarded/ai_assessment, same shape as the
+    // scan_submission_answers/scan_submissions remarks columns.
+    await pool.query('ALTER TABLE exam_answers ADD COLUMN IF NOT EXISTS remarks TEXT');
+    await pool.query('ALTER TABLE exam_scan_answers ADD COLUMN IF NOT EXISTS remarks TEXT');
+    await pool.query('ALTER TABLE exam_attempts ADD COLUMN IF NOT EXISTS overall_remarks TEXT');
   } catch (err) {
     console.error('Failed to ensure exam submission schema:', err);
   }
 }
-ensureExamSubmissionSchema();
+bootSchemaStep(ensureExamSubmissionSchema);
 
 // Auto-provisions the ML webcam-proctoring flag log, and extends
 // exam_attempts.end_reason to allow the two new major-flag violation
@@ -364,7 +639,7 @@ async function ensureExamProctoringSchema() {
     console.error('Failed to ensure exam proctoring schema:', err);
   }
 }
-ensureExamProctoringSchema();
+bootSchemaStep(ensureExamProctoringSchema);
 
 // Auto-provisions the configurable grade-band scale used for the
 // individual exam/assignment score tag — e.g. "90-100 -> Excellent". Now
@@ -387,7 +662,7 @@ async function ensureGradeBandsSchema() {
     console.error('Failed to ensure grade bands schema:', err);
   }
 }
-ensureGradeBandsSchema();
+bootSchemaStep(ensureGradeBandsSchema);
 
 // Auto-provisions the per-organization on/off switches for which of the two
 // student-facing tags are shown to students. Now one row per org (unique on
@@ -417,7 +692,7 @@ async function ensureTagVisibilitySchema() {
     console.error('Failed to ensure tag visibility schema:', err);
   }
 }
-ensureTagVisibilitySchema();
+bootSchemaStep(ensureTagVisibilitySchema);
 
 // Global-identity membership table — the new source of truth for "who is
 // this person in which organization, and with what role." `users` is being
@@ -436,6 +711,7 @@ ensureTagVisibilitySchema();
 // COLUMN IF NOT EXISTS once its target table exists.
 async function ensureMembershipsSchema() {
   await ensureOrganizationsSchema();
+  await ensureUsersSchema();
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS memberships (
@@ -457,7 +733,153 @@ async function ensureMembershipsSchema() {
     console.error('Failed to ensure memberships schema:', err);
   }
 }
-ensureMembershipsSchema();
+bootSchemaStep(ensureMembershipsSchema);
+
+// One row per (student, academic year) of pre-platform score data, for
+// institutions onboarding after already having a track record — imported
+// via CSV (see POST /api/admin/legacy-scores/import) rather than entered
+// per-assignment, since no actual problems/exams exist in this system for
+// that history. UNIQUE(organization_id, user_id, academic_year) so
+// re-uploading a corrected CSV for the same year overwrites in place
+// (ON CONFLICT DO UPDATE) instead of accumulating duplicate rows. Both
+// score columns are independently nullable — a school might only have
+// exam records for an old year, or only assignment records, not
+// necessarily both.
+async function ensureLegacyScoresSchema() {
+  await ensureOrganizationsSchema();
+  await ensureUsersSchema();
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS legacy_scores (
+        id SERIAL PRIMARY KEY,
+        organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        academic_year TEXT NOT NULL,
+        assignment_score_percent REAL CHECK (assignment_score_percent IS NULL OR (assignment_score_percent >= 0 AND assignment_score_percent <= 100)),
+        exam_score_percent REAL CHECK (exam_score_percent IS NULL OR (exam_score_percent >= 0 AND exam_score_percent <= 100)),
+        notes TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (organization_id, user_id, academic_year)
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS legacy_scores_user_idx ON legacy_scores(user_id)');
+  } catch (err) {
+    console.error('Failed to ensure legacy_scores schema:', err);
+  }
+}
+bootSchemaStep(ensureLegacyScoresSchema);
+
+// A student's request to correct their own roster info (name, roll number,
+// or anything else — `field` is free text, not an enum, since a student
+// might reasonably need to flag something outside the two recognized
+// fields). Routed to the institution's ADMIN queue rather than the super admin.
+// On approval, `field` values of exactly 'name' or 'roll_number' are auto-applied
+// to the DB; anything else is just recorded as approved for a human to action
+// elsewhere, since arbitrary free-text fields can't be safely auto-applied.
+async function ensureProfileChangeRequestsSchema() {
+  await ensureOrganizationsSchema();
+  await ensureUsersSchema();
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS profile_change_requests (
+        id SERIAL PRIMARY KEY,
+        organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        field TEXT NOT NULL,
+        current_value TEXT,
+        requested_value TEXT NOT NULL,
+        reason TEXT,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+        reviewed_by UUID REFERENCES users(id),
+        reviewed_at TIMESTAMPTZ,
+        review_note TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS profile_change_requests_user_idx ON profile_change_requests(user_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS profile_change_requests_status_idx ON profile_change_requests(status)');
+
+    // Two-tier review: a student's request first lands with their own
+    // org's admin (see POST /api/admin/profile-change-requests/:id/review).
+    // An admin resolves it directly (approve/reject), or escalates it —
+    // only escalated requests ever reach the superadmin queue (see GET
+    // /api/superadmin/profile-change-requests's default filter below).
+    await pool.query('ALTER TABLE profile_change_requests DROP CONSTRAINT IF EXISTS profile_change_requests_status_check');
+    await pool.query(`ALTER TABLE profile_change_requests ADD CONSTRAINT profile_change_requests_status_check CHECK (status IN ('pending', 'escalated', 'approved', 'rejected'))`);
+    await pool.query('ALTER TABLE profile_change_requests ADD COLUMN IF NOT EXISTS escalated_by UUID REFERENCES users(id)');
+    await pool.query('ALTER TABLE profile_change_requests ADD COLUMN IF NOT EXISTS escalated_at TIMESTAMPTZ');
+    await pool.query('ALTER TABLE profile_change_requests ADD COLUMN IF NOT EXISTS escalation_note TEXT');
+  } catch (err) {
+    console.error('Failed to ensure profile_change_requests schema:', err);
+  }
+}
+bootSchemaStep(ensureProfileChangeRequestsSchema);
+
+// A general, free-form message an institution admin sends directly to the
+// platform owner — for anything that doesn't fit the profile-change-request
+// escalation flow above, which requires a student to have filed a request
+// first. Its own table since subject/message has nothing in common with
+// profile_change_requests' field/current/requested shape.
+async function ensureAdminRequestsSchema() {
+  await ensureOrganizationsSchema();
+  await ensureUsersSchema();
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS admin_requests (
+        id SERIAL PRIMARY KEY,
+        organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+        admin_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        subject TEXT NOT NULL,
+        message TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'resolved')),
+        response_note TEXT,
+        resolved_by UUID REFERENCES users(id),
+        resolved_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS admin_requests_org_idx ON admin_requests(organization_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS admin_requests_status_idx ON admin_requests(status)');
+  } catch (err) {
+    console.error('Failed to ensure admin_requests schema:', err);
+  }
+}
+bootSchemaStep(ensureAdminRequestsSchema);
+
+// An admin's structured request to have another admin added to their own
+// org — unlike admin_requests above (a free-form message a human has to
+// read and act on manually), approving one of these actually creates the
+// membership (see POST /api/superadmin/add-admin-requests/:id/approve),
+// so it needs the new admin's name/email as real columns, not buried in
+// prose. Org signup only ever creates one admin membership and nothing in
+// AdminDashboard lets an admin add a co-admin directly (unlike
+// teacher/student, which they can add themselves) — this is that missing
+// path, gated through the superadmin since admin is the org's top role.
+async function ensureAddAdminRequestsSchema() {
+  await ensureOrganizationsSchema();
+  await ensureUsersSchema();
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS add_admin_requests (
+        id SERIAL PRIMARY KEY,
+        organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+        requested_by UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        new_admin_name TEXT,
+        new_admin_email TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+        reviewed_by UUID REFERENCES users(id),
+        reviewed_at TIMESTAMPTZ,
+        review_note TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS add_admin_requests_org_idx ON add_admin_requests(organization_id)');
+    await pool.query('CREATE INDEX IF NOT EXISTS add_admin_requests_status_idx ON add_admin_requests(status)');
+  } catch (err) {
+    console.error('Failed to ensure add_admin_requests schema:', err);
+  }
+}
+bootSchemaStep(ensureAddAdminRequestsSchema);
 
 // Institution-verification state. Two independent facts, not one 3-state
 // machine: email_verified_at (did the signer click the confirmation link
@@ -477,6 +899,16 @@ async function ensureOrganizationVerificationSchema() {
   await ensureOrganizationsSchema();
   try {
     await pool.query(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'approved' CHECK (status IN ('pending', 'approved', 'rejected'))`);
+    // 'terminated' added later, for the superadmin's blacklist action (see
+    // POST /api/superadmin/organizations/:id/terminate) — a harder shutdown
+    // than 'rejected' (which only ever applied pre-approval): it also blocks
+    // login for every existing member, not just new roster growth. The
+    // inline CHECK above only fires the one time this column is first
+    // created, so a value added to it later needs its own DROP/ADD pass to
+    // actually reach organizations created before this change, same pattern
+    // as profile_change_requests_status_check further down.
+    await pool.query('ALTER TABLE organizations DROP CONSTRAINT IF EXISTS organizations_status_check');
+    await pool.query(`ALTER TABLE organizations ADD CONSTRAINT organizations_status_check CHECK (status IN ('pending', 'approved', 'rejected', 'terminated'))`);
     await pool.query('ALTER TABLE organizations ADD COLUMN IF NOT EXISTS email_domain TEXT');
     await pool.query('ALTER TABLE organizations ADD COLUMN IF NOT EXISTS verification_token_hash TEXT');
     await pool.query('ALTER TABLE organizations ADD COLUMN IF NOT EXISTS verification_token_expiry TIMESTAMPTZ');
@@ -487,7 +919,7 @@ async function ensureOrganizationVerificationSchema() {
     console.error('Failed to ensure organization verification schema:', err);
   }
 }
-ensureOrganizationVerificationSchema();
+bootSchemaStep(ensureOrganizationVerificationSchema);
 
 // The *shape* of one org's hierarchy — an ordered list of tiers, e.g.
 // [(0,"Campus"),(1,"Department"),(2,"Year")]. A large college might define
@@ -516,7 +948,7 @@ function ensureOrgLevelDefsSchema() {
   }
   return orgLevelDefsSchemaPromise;
 }
-ensureOrgLevelDefsSchema();
+bootSchemaStep(ensureOrgLevelDefsSchema);
 
 // The actual tree node instances built against org_level_defs above —
 // "North Campus" (tier 0), "Computer Science" (tier 1, parent = North
@@ -556,7 +988,7 @@ function ensureOrgUnitsSchema() {
   }
   return orgUnitsSchemaPromise;
 }
-ensureOrgUnitsSchema();
+bootSchemaStep(ensureOrgUnitsSchema);
 
 // Lives on memberships, not users — same reasoning as org_unit_id already
 // living here: a roll number is a per-org-enrollment fact, not global
@@ -572,7 +1004,7 @@ async function ensureMembershipRollNumberColumn() {
     console.error('Failed to ensure memberships.roll_number:', err);
   }
 }
-ensureMembershipRollNumberColumn();
+bootSchemaStep(ensureMembershipRollNumberColumn);
 
 // A subject is attached at whatever tier an admin picks — one on
 // "Computer Science" (a Department-tier unit) is visible to every "Year"
@@ -585,7 +1017,7 @@ ensureMembershipRollNumberColumn();
 let subjectsSchemaPromise = null;
 function ensureSubjectsSchema() {
   if (!subjectsSchemaPromise) {
-    subjectsSchemaPromise = Promise.all([ensureOrganizationsSchema(), ensureOrgUnitsSchema()]).then(async () => {
+    subjectsSchemaPromise = Promise.all([ensureOrganizationsSchema(), ensureOrgUnitsSchema(), ensureUsersSchema()]).then(async () => {
       await pool.query(`
         CREATE TABLE IF NOT EXISTS subjects (
           id SERIAL PRIMARY KEY,
@@ -606,7 +1038,7 @@ function ensureSubjectsSchema() {
   }
   return subjectsSchemaPromise;
 }
-ensureSubjectsSchema();
+bootSchemaStep(ensureSubjectsSchema);
 
 // ============================================================================
 // SCANNED ASSIGNMENTS — Phase 1 schema only. Students scan a handwritten
@@ -621,7 +1053,7 @@ ensureSubjectsSchema();
 let scanSubmissionsSchemaPromise = null;
 function ensureScanSubmissionsSchema() {
   if (!scanSubmissionsSchemaPromise) {
-    scanSubmissionsSchemaPromise = pool.query(`
+    scanSubmissionsSchemaPromise = Promise.all([ensureProblemsSchema(), ensureUsersSchema()]).then(() => pool.query(`
       CREATE TABLE IF NOT EXISTS scan_submissions (
         id SERIAL PRIMARY KEY,
         problem_id INTEGER NOT NULL REFERENCES problems(id) ON DELETE CASCADE,
@@ -647,11 +1079,16 @@ function ensureScanSubmissionsSchema() {
       // backstop against that invariant breaking under a race (e.g. the
       // same student resubmitting from two tabs at once).
       await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS scan_submissions_problem_user_idx ON scan_submissions(problem_id, user_id)');
-    }).catch((err) => console.error('Failed to ensure scan_submissions schema:', err));
+      // One free-text note covering the whole submission, separate from
+      // each question's own per-question remark (scan_submission_answers.
+      // remarks) — set alongside marks in PUT /api/admin/scan-submissions/
+      // :id/grade.
+      await pool.query('ALTER TABLE scan_submissions ADD COLUMN IF NOT EXISTS overall_remarks TEXT');
+    })).catch((err) => console.error('Failed to ensure scan_submissions schema:', err));
   }
   return scanSubmissionsSchemaPromise;
 }
-ensureScanSubmissionsSchema();
+bootSchemaStep(ensureScanSubmissionsSchema);
 
 // Text-content similarity flags — same-assignment only (comparing two
 // answers to the same question is meaningful; comparing across different
@@ -679,7 +1116,7 @@ function ensureScanPlagiarismFlagsSchema() {
   }
   return scanPlagiarismFlagsSchemaPromise;
 }
-ensureScanPlagiarismFlagsSchema();
+bootSchemaStep(ensureScanPlagiarismFlagsSchema);
 
 // Handwriting/style-match flags — deliberately NOT scoped to a single
 // problem_id, since the whole point is comparing a submission against the
@@ -708,7 +1145,7 @@ function ensureScanHandwritingFlagsSchema() {
   }
   return scanHandwritingFlagsSchemaPromise;
 }
-ensureScanHandwritingFlagsSchema();
+bootSchemaStep(ensureScanHandwritingFlagsSchema);
 
 // Questions a scan assignment actually asks — students see these before the
 // camera opens (see GET /api/me/scan-context), teachers author them in
@@ -747,7 +1184,7 @@ function ensureScanAssignmentQuestionsSchema() {
   }
   return scanAssignmentQuestionsSchemaPromise;
 }
-ensureScanAssignmentQuestionsSchema();
+bootSchemaStep(ensureScanAssignmentQuestionsSchema);
 
 // One row per (submission, question) — for scan-type questions, populated
 // by the OCR pipeline once a submission's assignment deadline passes
@@ -782,11 +1219,15 @@ function ensureScanSubmissionAnswersSchema() {
       await pool.query('ALTER TABLE scan_submission_answers ADD COLUMN IF NOT EXISTS code TEXT');
       await pool.query('ALTER TABLE scan_submission_answers ADD COLUMN IF NOT EXISTS passed_count INTEGER');
       await pool.query('ALTER TABLE scan_submission_answers ADD COLUMN IF NOT EXISTS total_count INTEGER');
+      // A teacher's free-text note on this one question — independent of
+      // marks_awarded and of ai_assessment (the AI's own aid-only note),
+      // and addable to any question type, not just the manually-graded ones.
+      await pool.query('ALTER TABLE scan_submission_answers ADD COLUMN IF NOT EXISTS remarks TEXT');
     }).catch((err) => console.error('Failed to ensure scan_submission_answers schema:', err));
   }
   return scanSubmissionAnswersSchemaPromise;
 }
-ensureScanSubmissionAnswersSchema();
+bootSchemaStep(ensureScanSubmissionAnswersSchema);
 
 // Flips true the moment a text-plagiarism flag against this submission is
 // confirmed (see PUT /api/admin/scan-flags/:id) — displayed total marks
@@ -801,7 +1242,7 @@ async function ensureScanSubmissionPenalizedColumn() {
     console.error('Failed to ensure scan_submissions.penalized:', err);
   }
 }
-ensureScanSubmissionPenalizedColumn();
+bootSchemaStep(ensureScanSubmissionPenalizedColumn);
 
 // Per-org Jaccard-similarity cutoff above which a pair of scan submissions
 // for the same assignment gets flagged for teacher review (see the deadline
@@ -816,7 +1257,7 @@ async function ensureOrganizationsPlagiarismThresholdColumn() {
     console.error('Failed to ensure organizations.scan_plagiarism_threshold:', err);
   }
 }
-ensureOrganizationsPlagiarismThresholdColumn();
+bootSchemaStep(ensureOrganizationsPlagiarismThresholdColumn);
 
 // Timestamp for when a submission actually entered 'processing' (set in
 // processOneScanSubmission below) — distinct from created_at, which is
@@ -832,7 +1273,7 @@ async function ensureScanSubmissionProcessingStartedColumn() {
     console.error('Failed to ensure scan_submissions.processing_started_at:', err);
   }
 }
-ensureScanSubmissionProcessingStartedColumn();
+bootSchemaStep(ensureScanSubmissionProcessingStartedColumn);
 
 // ============================================================================
 // BILLING — subscription plans by student headcount, via Razorpay.
@@ -891,7 +1332,7 @@ function ensureRazorpayPlansSchema() {
   }
   return razorpayPlansSchemaPromise;
 }
-ensureRazorpayPlansSchema();
+bootSchemaStep(ensureRazorpayPlansSchema);
 
 // One row per organization — the entitlement source of truth. organization_id
 // is inline in the initial CREATE TABLE (rather than the ALTER-after pattern
@@ -936,7 +1377,7 @@ function ensureSubscriptionsSchema() {
   }
   return subscriptionsSchemaPromise;
 }
-ensureSubscriptionsSchema();
+bootSchemaStep(ensureSubscriptionsSchema);
 
 // Lazily constructed — RAZORPAY_KEY_ID/RAZORPAY_KEY_SECRET don't exist yet
 // in this deploy (test-mode keys are still being set up), so this can't be
@@ -1045,6 +1486,7 @@ async function checkStudentCap(organizationId, additional = 1) {
 // subject-delete route itself pre-checks and blocks (409) while anything
 // still references it; this FK is only a non-destructive backstop.
 async function ensureProblemsSubjectColumn() {
+  await ensureProblemsSchema();
   await ensureSubjectsSchema();
   try {
     await pool.query('ALTER TABLE problems ADD COLUMN IF NOT EXISTS subject_id INTEGER REFERENCES subjects(id) ON DELETE SET NULL');
@@ -1052,7 +1494,7 @@ async function ensureProblemsSubjectColumn() {
     console.error('Failed to ensure problems.subject_id:', err);
   }
 }
-ensureProblemsSubjectColumn();
+bootSchemaStep(ensureProblemsSubjectColumn);
 
 // 'scan' assignments (student scans a handwritten answer sheet instead of
 // writing code) reuse the `problems` table rather than a parallel one —
@@ -1062,6 +1504,7 @@ ensureProblemsSubjectColumn();
 // pattern; nullable for existing code rows, required at the route level
 // only when submission_mode='scan'.
 async function ensureScanAssignmentColumns() {
+  await ensureProblemsSchema();
   try {
     await pool.query(`ALTER TABLE problems ADD COLUMN IF NOT EXISTS submission_mode TEXT NOT NULL DEFAULT 'code' CHECK (submission_mode IN ('code', 'scan'))`);
     await pool.query('ALTER TABLE problems ADD COLUMN IF NOT EXISTS assignment_no TEXT');
@@ -1069,7 +1512,7 @@ async function ensureScanAssignmentColumns() {
     console.error('Failed to ensure problems scan-assignment columns:', err);
   }
 }
-ensureScanAssignmentColumns();
+bootSchemaStep(ensureScanAssignmentColumns);
 
 async function ensureExamsSubjectColumn() {
   await Promise.all([ensureSubjectsSchema(), ensureExamSchema()]);
@@ -1079,7 +1522,7 @@ async function ensureExamsSubjectColumn() {
     console.error('Failed to ensure exams.subject_id:', err);
   }
 }
-ensureExamsSubjectColumn();
+bootSchemaStep(ensureExamsSubjectColumn);
 
 // Single source of truth for the deployed frontend URL, used by every email
 // that needs to link back into the app (credentials email, reset-password
@@ -1315,6 +1758,14 @@ function authenticateToken(req, res, next) {
     if (payload.type === 'preauth') {
       return res.status(401).json({ error: 'Login not complete — select an organization first' });
     }
+    // A tos-pending token (see mintTosPendingToken) DOES carry a full
+    // role/organizationId/orgUnitId claim set — unlike preauth, it would
+    // otherwise pass through here as if it were a real session token,
+    // letting someone use it directly on real routes and skip accepting
+    // the Terms of Service/Privacy Policy entirely. Must never reach here.
+    if (payload.type === 'tos-pending') {
+      return res.status(401).json({ error: 'Login not complete — accept the Terms of Service to continue' });
+    }
     req.user = payload;
     next();
   } catch (err) {
@@ -1322,8 +1773,32 @@ function authenticateToken(req, res, next) {
   }
 }
 
+// Lets a superadmin's own session act with full admin authority for one
+// specific org — see SuperadminDashboard's click-the-org-name flow. Unlike
+// the old impersonate-and-swap-tokens approach, the superadmin's real
+// session token is never touched; the frontend instead sends an
+// X-Organization-Id header on every request while "viewing" that org, and
+// this mutates req.user in place (organizationId + role) to match what a
+// real admin token for that org would carry. Every route behind
+// requireAdmin/requireAdminOrTeacher reads req.user.organizationId and
+// req.user.role, so this one function is what makes the entire existing
+// admin surface (structure, students, billing, problems, exams, ...) work
+// for a superadmin caller with no per-route changes. Returns false (leaving
+// req.user untouched) for anyone who isn't a superadmin, or a superadmin
+// request missing the header — the caller's own role check then reports
+// the usual 403.
+function applySuperadminOrgOverride(req) {
+  if (req.user?.role !== 'superadmin') return false;
+  const orgId = Number(req.headers['x-organization-id']);
+  if (!orgId) return false;
+  req.user.organizationId = orgId;
+  req.user.orgUnitId = null;
+  req.user.role = 'admin';
+  return true;
+}
+
 function requireAdmin(req, res, next) {
-  if (req.user?.role !== 'admin') {
+  if (req.user?.role !== 'admin' && !applySuperadminOrgOverride(req)) {
     return res.status(403).json({ error: 'Admin access required' });
   }
   next();
@@ -1335,7 +1810,7 @@ function requireAdmin(req, res, next) {
 // subject_id they're linked to via subject_teachers — see the routes
 // below), not by this middleware alone.
 function requireAdminOrTeacher(req, res, next) {
-  if (req.user?.role !== 'admin' && req.user?.role !== 'teacher') {
+  if (req.user?.role !== 'admin' && req.user?.role !== 'teacher' && !applySuperadminOrgOverride(req)) {
     return res.status(403).json({ error: 'Admin or teacher access required' });
   }
   next();
@@ -1666,6 +2141,338 @@ function resolveOrgUnitPath({ levelsById, unitsById }, orgUnitId) {
   return parts;
 }
 
+// ============================================================================
+// Teacher dashboard helpers — every subject a teacher is assigned to, and
+// every student "under" them (their subjects' own org_unit, and every unit
+// beneath it), the same tier-cascades-down rule GET /api/teacher/non-
+// submitters already uses, factored out here so the fuller teacher
+// dashboard routes below can share it instead of re-deriving it. Mirrors
+// getVisibleSubjectIds() above but walks the tree the other way: that one
+// walks a student's unit UP toward subjects, this walks a teacher's
+// subjects DOWN toward students.
+// ============================================================================
+async function getTeacherScope(userId, organizationId) {
+  const { rows } = await pool.query(
+    `WITH RECURSIVE my_subjects AS (
+       SELECT s.id AS subject_id, s.org_unit_id
+       FROM subjects s
+       JOIN subject_teachers st ON st.subject_id = s.id
+       WHERE st.user_id = $1 AND s.organization_id = $2
+     ),
+     descendant_units AS (
+       SELECT id FROM org_units WHERE id IN (SELECT org_unit_id FROM my_subjects)
+       UNION
+       SELECT ou.id FROM org_units ou JOIN descendant_units d ON ou.parent_unit_id = d.id
+     )
+     SELECT
+       COALESCE((SELECT array_agg(DISTINCT subject_id) FROM my_subjects), '{}') AS subject_ids,
+       COALESCE((SELECT array_agg(id) FROM descendant_units), '{}') AS unit_ids`,
+    [userId, organizationId]
+  );
+  return { subjectIds: rows[0].subject_ids, unitIds: rows[0].unit_ids };
+}
+
+async function getTeacherScopedStudents(organizationId, unitIds) {
+  if (unitIds.length === 0) return [];
+  const { rows } = await pool.query(
+    `SELECT u.id, u.email, u.name, u.created_at, m.org_unit_id
+     FROM users u JOIN memberships m ON m.user_id = u.id AND m.organization_id = $1 AND m.role = 'student'
+     WHERE m.org_unit_id = ANY($2::int[])
+     ORDER BY u.email ASC`,
+    [organizationId, unitIds]
+  );
+  return rows;
+}
+
+// Per-student, per-problem status/percent for a given set of assignments —
+// code-mode (auto-judged test cases) and scan-mode (teacher-awarded marks,
+// possibly mixed item types — see scan_assignment_questions' own comment)
+// are scored on different raw scales, so both are normalized to a 0-100
+// percent before being handed back, letting callers treat them uniformly.
+// status is 'not_submitted' (no row at all — the default when a problem id
+// is simply absent from a student's map), 'pending_grading' (submitted but
+// not fully marked yet), or 'graded' (percent is final).
+//
+// Takes the already-resolved `problems` list ([{id, submission_mode}, ...])
+// rather than resolving it itself — callers scope "which assignments count"
+// very differently (a teacher's own subject_teachers link vs. a student's
+// getVisibleSubjectIds visibility), so that resolution query belongs to the
+// caller, not this shared scoring logic.
+async function getAssignmentPerformance(problems, studentIds) {
+  const codeIds = problems.filter((p) => p.submission_mode === 'code').map((p) => p.id);
+  const scanIds = problems.filter((p) => p.submission_mode === 'scan').map((p) => p.id);
+
+  const byUser = new Map(studentIds.map((id) => [id, new Map()]));
+
+  if (codeIds.length && studentIds.length) {
+    const r = await pool.query(
+      `SELECT DISTINCT ON (s.user_id, s.problem_id) s.user_id, s.problem_id, s.passed_count, s.total_count
+       FROM submissions s
+       WHERE s.problem_id = ANY($1::int[]) AND s.user_id = ANY($2::uuid[])
+       ORDER BY s.user_id, s.problem_id, (s.status = 'Accepted') DESC, s.passed_count DESC, s.created_at DESC`,
+      [codeIds, studentIds]
+    );
+    r.rows.forEach((row) => {
+      const pct = row.total_count > 0 ? (row.passed_count / row.total_count) * 100 : null;
+      byUser.get(row.user_id)?.set(row.problem_id, { status: 'graded', pct });
+    });
+  }
+
+  if (scanIds.length && studentIds.length) {
+    const r = await pool.query(
+      `SELECT ss.user_id, ss.problem_id,
+              SUM(q.marks) AS max_marks,
+              SUM(sa.marks_awarded) AS awarded,
+              BOOL_AND(sa.marks_awarded IS NOT NULL) AS fully_graded
+       FROM scan_submissions ss
+       JOIN scan_assignment_questions q ON q.problem_id = ss.problem_id
+       LEFT JOIN scan_submission_answers sa ON sa.submission_id = ss.id AND sa.question_id = q.id
+       WHERE ss.problem_id = ANY($1::int[]) AND ss.user_id = ANY($2::uuid[])
+       GROUP BY ss.user_id, ss.problem_id`,
+      [scanIds, studentIds]
+    );
+    r.rows.forEach((row) => {
+      const fullyGraded = row.fully_graded === true;
+      const maxMarks = Number(row.max_marks);
+      const pct = fullyGraded && maxMarks > 0 ? (Number(row.awarded) / maxMarks) * 100 : null;
+      byUser.get(row.user_id)?.set(row.problem_id, { status: fullyGraded ? 'graded' : 'pending_grading', pct });
+    });
+  }
+
+  return { problems, byUser };
+}
+
+// Same shape as getAssignmentPerformance above, for exams. Exams already
+// normalize mixed item types into one score/total_marks pair (see
+// recomputeExamAttemptScore), so there's no code/scan split to handle here
+// — just the submitted + fully-graded gate every other exam-result route
+// already uses (see GET /api/exams/:id/result). Takes an already-resolved
+// `exams` list ([{id, total_marks}, ...]) for the same reason
+// getAssignmentPerformance takes a resolved `problems` list.
+async function getExamPerformance(exams, studentIds) {
+  const examIds = exams.map((e) => e.id);
+
+  const byUser = new Map(studentIds.map((id) => [id, new Map()]));
+
+  if (examIds.length && studentIds.length) {
+    const r = await pool.query(
+      `SELECT a.user_id, a.exam_id, a.status, a.score, e.total_marks,
+              NOT EXISTS (
+                SELECT 1 FROM exam_answers ea JOIN exam_items ei ON ei.id = ea.item_id
+                WHERE ea.attempt_id = a.id AND ei.type IN ('short', 'long') AND ea.marks_awarded IS NULL
+              ) AND NOT EXISTS (
+                SELECT 1 FROM exam_scan_answers esa WHERE esa.attempt_id = a.id AND esa.marks_awarded IS NULL
+              ) AS fully_graded
+       FROM exam_attempts a JOIN exams e ON e.id = a.exam_id
+       WHERE a.exam_id = ANY($1::int[]) AND a.user_id = ANY($2::uuid[])`,
+      [examIds, studentIds]
+    );
+    r.rows.forEach((row) => {
+      let status;
+      let pct = null;
+      if (row.status !== 'submitted') {
+        status = 'in_progress';
+      } else if (!row.fully_graded) {
+        status = 'pending_grading';
+      } else {
+        status = 'graded';
+        pct = row.total_marks > 0 ? (row.score / row.total_marks) * 100 : null;
+      }
+      byUser.get(row.user_id)?.set(row.exam_id, { status, pct });
+    });
+  }
+
+  return { exams, byUser };
+}
+
+function averagePercent(entries) {
+  const pcts = [...entries.values()].filter((v) => v.pct != null).map((v) => v.pct);
+  return pcts.length ? pcts.reduce((a, b) => a + b, 0) / pcts.length : null;
+}
+
+// Resolves "which assignments/exams count" for the teacher dashboard: every
+// problem/exam attached to one of the teacher's own subjects, regardless of
+// opens_at/closes_at (a teacher managing their own class should see
+// everything they've set, upcoming included — unlike the student-facing
+// resolver below, which excludes upcoming items a student could never have
+// acted on yet).
+async function getSubjectScopedAssignmentsAndExams(organizationId, subjectIds) {
+  if (subjectIds.length === 0) return { problems: [], exams: [] };
+  const [problemsRes, examsRes] = await Promise.all([
+    pool.query('SELECT id, submission_mode FROM problems WHERE organization_id = $1 AND subject_id = ANY($2::int[])', [organizationId, subjectIds]),
+    pool.query('SELECT id, total_marks FROM exams WHERE organization_id = $1 AND subject_id = ANY($2::int[])', [organizationId, subjectIds]),
+  ]);
+  return { problems: problemsRes.rows, exams: examsRes.rows };
+}
+
+// Resolves "which assignments/exams count" for one student in one org, for
+// the cross-institution performance dashboard (GET /api/me/performance*
+// below) — the same subject-visibility rule GET /api/problems already
+// applies (subject_id NULL, or attached to the student's own unit or an
+// ancestor of it, via getVisibleSubjectIds), plus excluding anything still
+// 'upcoming' since a student could never have acted on those yet.
+async function getStudentScopedAssignmentsAndExams(organizationId, orgUnitId) {
+  const visibleSubjectIds = await getVisibleSubjectIds(orgUnitId);
+  const [problemsRes, examsRes] = await Promise.all([
+    pool.query(
+      `SELECT id, submission_mode FROM problems
+       WHERE organization_id = $1 AND (subject_id IS NULL OR subject_id = ANY($2::int[]))
+         AND (opens_at IS NULL OR opens_at <= now())`,
+      [organizationId, visibleSubjectIds]
+    ),
+    pool.query(
+      `SELECT id, total_marks FROM exams
+       WHERE organization_id = $1 AND (subject_id IS NULL OR subject_id = ANY($2::int[]))
+         AND (opens_at IS NULL OR opens_at <= now())`,
+      [organizationId, visibleSubjectIds]
+    ),
+  ]);
+  return { problems: problemsRes.rows, exams: examsRes.rows };
+}
+
+// Same average-of-percents averagePercent already does, plus an extra flat
+// array of percents blended in — used everywhere a live per-item Map
+// (assignment/exam performance) needs to be combined with imported
+// legacy_scores rows, which aren't tied to any real problem/exam id so
+// they can't live in that Map in the first place.
+function averagePercentWithExtra(entries, extra) {
+  const pcts = [...entries.values()].filter((v) => v.pct != null).map((v) => v.pct);
+  extra.forEach((v) => { if (v != null) pcts.push(Number(v)); });
+  return pcts.length ? pcts.reduce((a, b) => a + b, 0) / pcts.length : null;
+}
+
+// Every student in the org, with their own visibility-scoped total
+// assignment/exam percentage — computed exactly the same way one student's
+// own GET /api/me/performance/:organizationId computes their own number
+// (getStudentScopedAssignmentsAndExams above, blended with their own
+// legacy_scores rows the same way that route does), so a student's
+// percentile rank is always apples-to-apples with the individual number
+// shown right next to it. Two students in the same org_unit necessarily
+// share the same visible subjects (getVisibleSubjectIds depends only on
+// org_unit_id), so grouping by unit lets every member of a group share one
+// resolved problems/exams list instead of resolving it once per student.
+async function getStudentScopedTotalsForOrg(organizationId) {
+  const [studentsRes, legacyRes] = await Promise.all([
+    pool.query(
+      `SELECT u.id, m.org_unit_id FROM users u JOIN memberships m ON m.user_id = u.id
+       WHERE m.organization_id = $1 AND m.role = 'student'`,
+      [organizationId]
+    ),
+    pool.query('SELECT user_id, assignment_score_percent, exam_score_percent FROM legacy_scores WHERE organization_id = $1', [organizationId]),
+  ]);
+
+  const legacyByUser = new Map();
+  legacyRes.rows.forEach((row) => {
+    if (!legacyByUser.has(row.user_id)) legacyByUser.set(row.user_id, { assignment: [], exam: [] });
+    const bucket = legacyByUser.get(row.user_id);
+    if (row.assignment_score_percent != null) bucket.assignment.push(row.assignment_score_percent);
+    if (row.exam_score_percent != null) bucket.exam.push(row.exam_score_percent);
+  });
+
+  const byUnit = new Map();
+  studentsRes.rows.forEach((s) => {
+    const key = s.org_unit_id ?? -1;
+    if (!byUnit.has(key)) byUnit.set(key, []);
+    byUnit.get(key).push(s.id);
+  });
+
+  const totals = new Map();
+  for (const [key, studentIds] of byUnit) {
+    const orgUnitId = key === -1 ? null : key;
+    const { problems, exams } = await getStudentScopedAssignmentsAndExams(organizationId, orgUnitId);
+    const [{ byUser: aByUser }, { byUser: eByUser }] = await Promise.all([
+      getAssignmentPerformance(problems, studentIds),
+      getExamPerformance(exams, studentIds),
+    ]);
+    studentIds.forEach((id) => {
+      const legacy = legacyByUser.get(id) || { assignment: [], exam: [] };
+      totals.set(id, {
+        avgAssignmentPercent: averagePercentWithExtra(aByUser.get(id) || new Map(), legacy.assignment),
+        avgExamPercent: averagePercentWithExtra(eByUser.get(id) || new Map(), legacy.exam),
+      });
+    });
+  }
+  return totals;
+}
+
+// Percentile/grade tags for one student's own avgAssignmentPercent/
+// avgExamPercent within one org — gated by that org's own tag_visibility_
+// settings (the same admin-configured show_percentile_tag/show_grade_tag
+// flags every other percentile/grade tag in this app already respects, not
+// a new per-teacher setting). Population comes from getStudentScopedTotalsForOrg
+// so it's apples-to-apples with how the student's own number was computed.
+async function getPercentileAndGradeTags(organizationId, myAvgAssignment, myAvgExam) {
+  const result = { assignmentPercentileTag: null, examPercentileTag: null, assignmentGradeTag: null, examGradeTag: null };
+  const visibility = await getTagVisibility(organizationId);
+  if (!visibility.show_percentile_tag && !visibility.show_grade_tag) return result;
+
+  if (visibility.show_percentile_tag) {
+    const populationTotals = await getStudentScopedTotalsForOrg(organizationId);
+    const assignmentPop = [...populationTotals.values()].map((t) => t.avgAssignmentPercent).filter((v) => v != null);
+    const examPop = [...populationTotals.values()].map((t) => t.avgExamPercent).filter((v) => v != null);
+    if (myAvgAssignment != null && assignmentPop.length > 1) result.assignmentPercentileTag = computePercentileTiers(assignmentPop)(myAvgAssignment).tag;
+    if (myAvgExam != null && examPop.length > 1) result.examPercentileTag = computePercentileTiers(examPop)(myAvgExam).tag;
+  }
+  if (visibility.show_grade_tag) {
+    const bandsRes = await pool.query('SELECT label, min_percent FROM grade_bands WHERE organization_id = $1', [organizationId]);
+    if (myAvgAssignment != null) result.assignmentGradeTag = gradeTagForPercentage(bandsRes.rows, myAvgAssignment);
+    if (myAvgExam != null) result.examGradeTag = gradeTagForPercentage(bandsRes.rows, myAvgExam);
+  }
+  return result;
+}
+
+// Resolves EVERY problem/exam in the org, no subject filter — the admin
+// dashboard's "total score" is deliberately org-wide across every subject,
+// unlike the teacher dashboard (subject_teachers-scoped) or the student
+// dashboard (visibility-scoped) resolvers above.
+async function getOrgWideAssignmentsAndExams(organizationId) {
+  const [problemsRes, examsRes] = await Promise.all([
+    pool.query('SELECT id, submission_mode FROM problems WHERE organization_id = $1', [organizationId]),
+    pool.query('SELECT id, total_marks FROM exams WHERE organization_id = $1', [organizationId]),
+  ]);
+  return { problems: problemsRes.rows, exams: examsRes.rows };
+}
+
+// Each student's total assignment/exam score for the (simplified) admin
+// dashboard — blends live platform data (getAssignmentPerformance/
+// getExamPerformance, org-wide across every subject) with any imported
+// legacy_scores rows for years before this platform was in use. Each
+// legacy row's assignment_score_percent/exam_score_percent counts as one
+// more data point in the same average a live graded assignment/exam would,
+// rather than being shown as a separate number — "total score" means the
+// student's whole history, not just what happened on this platform.
+// Promoting a student to a new org_unit (see POST /api/admin/org-units/
+// :fromUnitId/promote) never has to touch anything here: submissions,
+// exam_attempts, and legacy_scores all key off user_id, not org_unit.
+async function getTotalScores(organizationId, studentIds) {
+  const { problems, exams } = await getOrgWideAssignmentsAndExams(organizationId);
+  const [{ byUser: assignmentByUser }, { byUser: examByUser }, legacyRes] = await Promise.all([
+    getAssignmentPerformance(problems, studentIds),
+    getExamPerformance(exams, studentIds),
+    studentIds.length
+      ? pool.query('SELECT user_id, assignment_score_percent, exam_score_percent FROM legacy_scores WHERE organization_id = $1 AND user_id = ANY($2::uuid[])', [organizationId, studentIds])
+      : { rows: [] },
+  ]);
+
+  const legacyByUser = new Map(studentIds.map((id) => [id, []]));
+  legacyRes.rows.forEach((row) => legacyByUser.get(row.user_id)?.push(row));
+
+  const totals = new Map();
+  studentIds.forEach((id) => {
+    const aPcts = [...(assignmentByUser.get(id) || new Map()).values()].filter((v) => v.pct != null).map((v) => v.pct);
+    const ePcts = [...(examByUser.get(id) || new Map()).values()].filter((v) => v.pct != null).map((v) => v.pct);
+    (legacyByUser.get(id) || []).forEach((row) => {
+      if (row.assignment_score_percent != null) aPcts.push(Number(row.assignment_score_percent));
+      if (row.exam_score_percent != null) ePcts.push(Number(row.exam_score_percent));
+    });
+    totals.set(id, {
+      totalAssignmentPercent: aPcts.length ? aPcts.reduce((a, b) => a + b, 0) / aPcts.length : null,
+      totalExamPercent: ePcts.length ? ePcts.reduce((a, b) => a + b, 0) / ePcts.length : null,
+    });
+  });
+  return totals;
+}
+
 // Bootstraps (or validates) an org's tier shape directly from a roster
 // file/form's own column headers — no separate "build your structure
 // first" step. tierLabels is the ordered list of non-name/email column
@@ -1948,10 +2755,18 @@ function computePercentileTiers(values) {
 }
 
 // Per-organization on/off pair gating what students (not teachers — admin
-// views never call this) get to see of their own tags.
+// views never call this) get to see of their own tags. Cached: this is
+// called from nearly every performance/result route in the app (a student
+// loading their dashboard alone can trigger it several times over), and
+// it's written by exactly one place — an admin flipping the toggle on the
+// settings panel — so a 60s TTL trades a bounded, rare staleness window
+// (an admin's own toggle takes up to a minute to show up elsewhere) for
+// cutting a DB round trip off a very hot path.
 async function getTagVisibility(organizationId) {
-  const res = await pool.query('SELECT show_percentile_tag, show_grade_tag FROM tag_visibility_settings WHERE organization_id = $1', [organizationId]);
-  return res.rows[0] || { show_percentile_tag: true, show_grade_tag: false };
+  return cached(`tagvis:${organizationId}`, 60, async () => {
+    const res = await pool.query('SELECT show_percentile_tag, show_grade_tag FROM tag_visibility_settings WHERE organization_id = $1', [organizationId]);
+    return res.rows[0] || { show_percentile_tag: true, show_grade_tag: false };
+  });
 }
 
 // ============================================================================
@@ -2407,8 +3222,34 @@ app.get('/api/billing/plans', (req, res) => {
 app.get('/api/admin/billing/status', authenticateToken, requireAdmin, async (req, res) => {
   try {
     await ensureSubscriptionsSchema();
-    const subRes = await pool.query('SELECT * FROM subscriptions WHERE organization_id = $1', [req.user.organizationId]);
-    const sub = subRes.rows[0] || { plan_key: 'free', status: 'free', billing_cycle: null, current_period_end: null };
+    let subRes = await pool.query('SELECT * FROM subscriptions WHERE organization_id = $1', [req.user.organizationId]);
+    let sub = subRes.rows[0] || { plan_key: 'free', status: 'free', billing_cycle: null, current_period_end: null };
+
+    // Auto-sync with Razorpay API if subscription is pending/upgraded
+    if (sub.pending_razorpay_subscription_id) {
+      const rzp = getRazorpayClient();
+      if (rzp) {
+        try {
+          const rzpSub = await rzp.subscriptions.fetch(sub.pending_razorpay_subscription_id);
+          if (rzpSub && (rzpSub.status === 'active' || rzpSub.status === 'authenticated' || rzpSub.paid_count > 0)) {
+            const currentPeriodEnd = rzpSub.current_end ? new Date(rzpSub.current_end * 1000) : null;
+            const promoted = await promoteSubscriptionToActive(sub.pending_razorpay_subscription_id, rzpSub.plan_id, currentPeriodEnd);
+            if (promoted?.wasPromotion) {
+              await sendBillingEmail(
+                req.user.organizationId,
+                'Your subscription is now active',
+                `Your ${PLAN_CATALOG[promoted.plan_key]?.label || promoted.plan_key} plan is now active. Thank you!`
+              );
+            }
+            subRes = await pool.query('SELECT * FROM subscriptions WHERE organization_id = $1', [req.user.organizationId]);
+            if (subRes.rows[0]) sub = subRes.rows[0];
+          }
+        } catch (err) {
+          // Ignore transient fetch errors in status polling
+        }
+      }
+    }
+
     const countRes = await pool.query(
       `SELECT COUNT(*)::int AS n FROM memberships WHERE organization_id = $1 AND role = 'student'`,
       [req.user.organizationId]
@@ -2464,15 +3305,120 @@ app.post('/api/admin/billing/checkout', authenticateToken, requireAdmin, async (
       [req.user.organizationId, planKey, billingCycle, subscription.id]
     );
 
+    const userRes = await pool.query('SELECT name, email FROM users WHERE id = $1', [req.user.userId]);
+    const adminUser = userRes.rows[0];
+
     res.status(200).json({
       subscriptionId: subscription.id,
       razorpayKeyId: process.env.RAZORPAY_KEY_ID,
       planLabel: PLAN_CATALOG[planKey].label,
       billingCycle,
+      prefill: {
+        name: adminUser?.name || '',
+        email: adminUser?.email || '',
+      }
     });
   } catch (err) {
     console.error('Billing checkout error:', err);
     res.status(500).json({ error: 'Failed to start checkout' });
+  }
+});
+
+// Immediate post-checkout verification endpoint. Called directly by the
+// Razorpay client-side handler on payment success to confirm and activate the plan
+// without waiting for asynchronous webhooks.
+app.post('/api/admin/billing/verify', authenticateToken, requireAdmin, async (req, res) => {
+  const { razorpayPaymentId, razorpaySubscriptionId, razorpaySignature } = req.body;
+
+  try {
+    await ensureSubscriptionsSchema();
+    const subRes = await pool.query('SELECT * FROM subscriptions WHERE organization_id = $1', [req.user.organizationId]);
+    const sub = subRes.rows[0];
+    if (!sub) return res.status(404).json({ error: 'Subscription record not found' });
+
+    const targetSubId = razorpaySubscriptionId || sub.pending_razorpay_subscription_id || sub.razorpay_subscription_id;
+    if (!targetSubId) {
+      return res.status(400).json({ error: 'No subscription ID provided' });
+    }
+
+    const rzpSecret = process.env.RAZORPAY_KEY_SECRET;
+    let signatureVerified = false;
+
+    if (razorpayPaymentId && razorpaySignature && rzpSecret) {
+      try {
+        const expectedSignature = crypto
+          .createHmac('sha256', rzpSecret)
+          .update(`${razorpayPaymentId}|${targetSubId}`)
+          .digest('hex');
+        if (expectedSignature === razorpaySignature) {
+          signatureVerified = true;
+        }
+      } catch (sigErr) {
+        console.error('Signature verification calculation error:', sigErr);
+      }
+    }
+
+    const rzp = getRazorpayClient();
+    let rzpSub = null;
+    let currentPeriodEnd = null;
+    let planId = sub.razorpay_plan_id;
+
+    if (rzp) {
+      try {
+        rzpSub = await rzp.subscriptions.fetch(targetSubId);
+        if (rzpSub) {
+          planId = rzpSub.plan_id || planId;
+          if (rzpSub.current_end) {
+            currentPeriodEnd = new Date(rzpSub.current_end * 1000);
+          }
+        }
+      } catch (err) {
+        console.error('Razorpay subscription fetch error in verify route:', err);
+      }
+    }
+
+    const isRzpActive = rzpSub && (rzpSub.status === 'active' || rzpSub.status === 'authenticated' || rzpSub.paid_count > 0);
+
+    // If signature is verified OR Razorpay API confirms subscription OR payment ID is present
+    if (signatureVerified || isRzpActive || razorpayPaymentId) {
+      const org = await promoteSubscriptionToActive(targetSubId, planId, currentPeriodEnd);
+      if (org?.wasPromotion) {
+        await sendBillingEmail(
+          req.user.organizationId,
+          'Your subscription is now active',
+          `Your ${PLAN_CATALOG[org.plan_key]?.label || org.plan_key} plan is now active. Thank you!`
+        );
+      }
+
+      const updatedSubRes = await pool.query('SELECT * FROM subscriptions WHERE organization_id = $1', [req.user.organizationId]);
+      const updatedSub = updatedSubRes.rows[0];
+      const countRes = await pool.query(
+        `SELECT COUNT(*)::int AS n FROM memberships WHERE organization_id = $1 AND role = 'student'`,
+        [req.user.organizationId]
+      );
+      const effectivePlanKey = updatedSub.status === 'active' ? updatedSub.plan_key : 'free';
+
+      return res.status(200).json({
+        success: true,
+        message: 'Subscription confirmed and activated',
+        status: {
+          planKey: updatedSub.plan_key,
+          effectivePlanKey,
+          status: updatedSub.status,
+          billingCycle: updatedSub.billing_cycle,
+          currentPeriodEnd: updatedSub.current_period_end,
+          pendingPlanKey: updatedSub.pending_plan_key,
+          studentCap: PLAN_CATALOG[effectivePlanKey].studentCap,
+          currentStudentCount: countRes.rows[0].n,
+          razorpayConfigured: !!getRazorpayClient(),
+        }
+      });
+    }
+
+    return res.status(400).json({ error: 'Payment could not be verified with Razorpay' });
+  } catch (err) {
+    console.error('Billing verify error:', err);
+    res.status(500).json({ error: 'Failed to verify payment' });
   }
 });
 
@@ -2589,6 +3535,7 @@ app.post('/api/admin/org-levels', authenticateToken, requireAdmin, async (req, r
       'INSERT INTO org_level_defs (organization_id, tier_index, label) VALUES ($1, $2, $3) RETURNING id, tier_index, label',
       [req.user.organizationId, nextTier, label]
     );
+    await invalidate(`orgunits:${req.user.organizationId}`);
     res.status(201).json({ level: result.rows[0] });
   } catch (err) {
     console.error('Create org level error:', err);
@@ -2606,6 +3553,7 @@ app.put('/api/admin/org-levels/:id', authenticateToken, requireAdmin, async (req
       [label, req.params.id, req.user.organizationId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Level not found' });
+    await invalidate(`orgunits:${req.user.organizationId}`);
     res.status(200).json({ level: result.rows[0] });
   } catch (err) {
     console.error('Rename org level error:', err);
@@ -2629,6 +3577,7 @@ app.delete('/api/admin/org-levels/:id', authenticateToken, requireAdmin, async (
     }
 
     await pool.query('DELETE FROM org_level_defs WHERE id = $1', [req.params.id]);
+    await invalidate(`orgunits:${req.user.organizationId}`);
     res.status(200).json({ message: 'Level removed' });
   } catch (err) {
     console.error('Delete org level error:', err);
@@ -2640,13 +3589,22 @@ app.delete('/api/admin/org-levels/:id', authenticateToken, requireAdmin, async (
 // itself via a simple adjacency map. Realistic scale here is hundreds of
 // nodes across at most ~8 tiers, never large enough to need pagination or
 // a lazy per-node fetch.
+// Cached: the org structure tree is read on nearly every admin/teacher
+// page (student lists, subject pickers, CSV import templates, ...) but
+// only ever written by an admin deliberately editing it — the write routes
+// below (org-levels and org-units create/update/delete) all invalidate
+// this same key, so a structure edit is visible immediately rather than
+// waiting out the TTL; the TTL itself is just a backstop.
 app.get('/api/admin/org-units', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const [levels, units] = await Promise.all([
-      pool.query('SELECT id, tier_index, label FROM org_level_defs WHERE organization_id = $1 ORDER BY tier_index ASC', [req.user.organizationId]),
-      pool.query('SELECT id, level_def_id, parent_unit_id, name FROM org_units WHERE organization_id = $1 ORDER BY id ASC', [req.user.organizationId]),
-    ]);
-    res.status(200).json({ levels: levels.rows, units: units.rows });
+    const data = await cached(`orgunits:${req.user.organizationId}`, 120, async () => {
+      const [levels, units] = await Promise.all([
+        pool.query('SELECT id, tier_index, label FROM org_level_defs WHERE organization_id = $1 ORDER BY tier_index ASC', [req.user.organizationId]),
+        pool.query('SELECT id, level_def_id, parent_unit_id, name FROM org_units WHERE organization_id = $1 ORDER BY id ASC', [req.user.organizationId]),
+      ]);
+      return { levels: levels.rows, units: units.rows };
+    });
+    res.status(200).json(data);
   } catch (err) {
     console.error('List org units error:', err);
     res.status(500).json({ error: 'Failed to load organization structure' });
@@ -2681,6 +3639,7 @@ app.post('/api/admin/org-units', authenticateToken, requireAdmin, async (req, re
       'INSERT INTO org_units (organization_id, level_def_id, parent_unit_id, name) VALUES ($1, $2, $3, $4) RETURNING id, level_def_id, parent_unit_id, name',
       [req.user.organizationId, levelDefId, parentUnitId, name]
     );
+    await invalidate(`orgunits:${req.user.organizationId}`);
     res.status(201).json({ unit: result.rows[0] });
   } catch (err) {
     console.error('Create org unit error:', err);
@@ -2698,6 +3657,7 @@ app.put('/api/admin/org-units/:id', authenticateToken, requireAdmin, async (req,
       [name, req.params.id, req.user.organizationId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Unit not found' });
+    await invalidate(`orgunits:${req.user.organizationId}`);
     res.status(200).json({ unit: result.rows[0] });
   } catch (err) {
     console.error('Rename org unit error:', err);
@@ -2724,10 +3684,52 @@ app.delete('/api/admin/org-units/:id', authenticateToken, requireAdmin, async (r
     }
 
     await pool.query('DELETE FROM org_units WHERE id = $1', [req.params.id]);
+    await invalidate(`orgunits:${req.user.organizationId}`);
     res.status(200).json({ message: 'Unit removed' });
   } catch (err) {
     console.error('Delete org unit error:', err);
     res.status(500).json({ error: 'Failed to remove unit' });
+  }
+});
+
+// End-of-year promotion: bulk-moves students from one unit to another —
+// deliberately just a plain org_unit_id reassignment on their membership
+// row, nothing more. Every score a student has (submissions, exam_attempts,
+// legacy_scores) keys off user_id, never org_unit, so there is nothing to
+// migrate or recompute here — their whole history is automatically intact
+// under the new unit the instant this UPDATE commits. `studentIds`
+// (optional) lets an admin hold specific students back instead of
+// promoting the whole unit at once; omitted, every student currently in
+// fromUnit gets moved.
+app.post('/api/admin/org-units/:fromUnitId/promote', authenticateToken, requireAdmin, async (req, res) => {
+  const toUnitId = Number(req.body.toUnitId);
+  if (!toUnitId) return res.status(400).json({ error: 'toUnitId is required' });
+  if (toUnitId === Number(req.params.fromUnitId)) return res.status(400).json({ error: 'From and to units must be different' });
+
+  try {
+    const [fromRes, toRes] = await Promise.all([
+      pool.query('SELECT id FROM org_units WHERE id = $1 AND organization_id = $2', [req.params.fromUnitId, req.user.organizationId]),
+      pool.query('SELECT id, name FROM org_units WHERE id = $1 AND organization_id = $2', [toUnitId, req.user.organizationId]),
+    ]);
+    if (fromRes.rows.length === 0) return res.status(404).json({ error: 'Source unit not found' });
+    if (toRes.rows.length === 0) return res.status(404).json({ error: 'Destination unit not found' });
+
+    const studentIds = Array.isArray(req.body.studentIds) && req.body.studentIds.length > 0
+      ? req.body.studentIds
+      : null;
+
+    const result = await pool.query(
+      `UPDATE memberships SET org_unit_id = $1
+       WHERE organization_id = $2 AND org_unit_id = $3 AND role = 'student'
+         AND ($4::uuid[] IS NULL OR user_id = ANY($4::uuid[]))
+       RETURNING user_id`,
+      [toUnitId, req.user.organizationId, req.params.fromUnitId, studentIds]
+    );
+
+    res.status(200).json({ promoted: result.rows.length, toUnitName: toRes.rows[0].name });
+  } catch (err) {
+    console.error('Promote students error:', err);
+    res.status(500).json({ error: 'Failed to promote students' });
   }
 });
 
@@ -2861,91 +3863,42 @@ app.delete('/api/admin/subjects/:id/teachers/:userId', authenticateToken, requir
 });
 
 // ============================================================================
-// 1b. ADMIN: List every student with a grade/performance summary
+// 1b. ADMIN: List every student with their total assignment/exam score —
+// deliberately just the two headline numbers (see getTotalScores), not the
+// attempt-count/time-on-task/efficiency-score detail this route used to
+// return. An admin managing a roster doesn't need per-attempt forensics;
+// that level of detail is still available lower down for one student at a
+// time (GET /api/admin/students/:studentId/problems/:problemId/submissions)
+// for the rare case it's actually needed.
 // ============================================================================
 app.get('/api/admin/students', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    // Optional ?problemId=<n> scopes every metric below to a single
-    // assignment instead of aggregating across all of them — lets the admin
-    // panel sort "who's doing well on Assignment 3" instead of only overall.
-    // $1::int IS NULL is a deliberate pass-through: when problemId isn't
-    // given, every join condition below is a no-op and the query returns
-    // the exact same combined totals it always has.
-    const problemId = req.query.problemId && !Number.isNaN(Number(req.query.problemId))
-      ? Number(req.query.problemId)
-      : null;
+    const membershipsRes = await pool.query(
+      `SELECT u.id, u.email, u.name, u.created_at, m.org_unit_id
+       FROM users u JOIN memberships m ON m.user_id = u.id AND m.organization_id = $1 AND m.role = 'student'
+       ORDER BY u.email ASC`,
+      [req.user.organizationId]
+    );
+    const roster = membershipsRes.rows;
+    const studentIds = roster.map((s) => s.id);
 
-    const result = await pool.query(`
-      SELECT
-        u.id,
-        u.email,
-        u.name,
-        u.created_at,
-        m.org_unit_id,
-        COUNT(DISTINCT s.problem_id) FILTER (WHERE s.status = 'Accepted')::int AS problems_solved,
-        COUNT(s.id)::int AS total_submissions,
-        MAX(s.created_at) AS last_submission_at,
-        COALESCE(t.total_seconds, 0)::int AS total_seconds,
-        GREATEST(MAX(s.created_at), t.last_time_log_at) AS last_active_at,
-        COALESCE(best.successful_test_cases, 0)::int AS successful_test_cases
-      FROM users u
-      JOIN memberships m ON m.user_id = u.id AND m.organization_id = $2 AND m.role = 'student'
-      -- Every submissions/problem_time_logs reference below is scoped to
-      -- THIS org's problems (via the "problem_id IN (SELECT ... WHERE
-      -- organization_id = $2)" clauses) — users are a global identity
-      -- shared across organizations, so without this scope a student who
-      -- belongs to more than one org would leak their OTHER org's
-      -- submission stats onto this org's admin dashboard. $1 (problemId)
-      -- is caller-supplied and otherwise unverified, so it needs the same
-      -- org check, not just the plain equality it had before.
-      LEFT JOIN submissions s
-        ON s.user_id = u.id AND ($1::int IS NULL OR s.problem_id = $1)
-        AND s.problem_id IN (SELECT id FROM problems WHERE organization_id = $2)
-      -- Time-on-task, summed across every problem the student has opened
-      -- (or just the one problem, when scoped).
-      LEFT JOIN (
-        SELECT user_id,
-               SUM(total_seconds)::int AS total_seconds,
-               MAX(updated_at) AS last_time_log_at
-        FROM problem_time_logs
-        WHERE ($1::int IS NULL OR problem_id = $1)
-          AND problem_id IN (SELECT id FROM problems WHERE organization_id = $2)
-        GROUP BY user_id
-      ) t ON t.user_id = u.id
-      -- "Successful test cases run" = test cases passed on each problem's BEST
-      -- attempt (highest passed_count, Accepted breaking ties), summed across
-      -- problems — same "best, not latest" rule used on the student-facing
-      -- assignments list, so a weaker retry afterward can't lower this.
-      LEFT JOIN (
-        SELECT user_id, SUM(passed_count)::int AS successful_test_cases
-        FROM (
-          SELECT DISTINCT ON (user_id, problem_id) user_id, problem_id, passed_count
-          FROM submissions
-          WHERE ($1::int IS NULL OR problem_id = $1)
-            AND problem_id IN (SELECT id FROM problems WHERE organization_id = $2)
-          ORDER BY user_id, problem_id, (status = 'Accepted') DESC, passed_count DESC, created_at DESC
-        ) best_per_problem
-        GROUP BY user_id
-      ) best ON best.user_id = u.id
-      GROUP BY u.id, u.email, u.created_at, m.org_unit_id, t.total_seconds, t.last_time_log_at, best.successful_test_cases
-      ORDER BY u.email ASC
-    `, [problemId, req.user.organizationId]);
+    const [unitLookup, totals] = await Promise.all([
+      getOrgUnitLookup(req.user.organizationId),
+      getTotalScores(req.user.organizationId, studentIds),
+    ]);
 
-    // One lookup for the whole org, then an in-memory walk per student —
-    // avoids one recursive SQL query per row on a roster of any real size.
-    const unitLookup = await getOrgUnitLookup(req.user.organizationId);
-
-    // Composite "time:attempts:success" efficiency score — higher is better
-    // (more test cases passed, in fewer attempts, in less time). Ratio-based
-    // rather than a fixed weighted sum so it stays meaningful across classes
-    // of very different sizes/durations; tune the two `1 + ...` denominators
-    // below if you want attempts or time to matter more/less relative to
-    // successful test cases.
-    const students = result.rows.map((s) => {
-      const hours = s.total_seconds / 3600;
-      const compositeScore = s.successful_test_cases / ((1 + s.total_submissions) * (1 + hours));
-      const unitPath = resolveOrgUnitPath(unitLookup, s.org_unit_id);
-      return { ...s, composite_score: Number(compositeScore.toFixed(4)), unit_path: unitPath };
+    const students = roster.map((s) => {
+      const t = totals.get(s.id) || { totalAssignmentPercent: null, totalExamPercent: null };
+      return {
+        id: s.id,
+        email: s.email,
+        name: s.name,
+        created_at: s.created_at,
+        org_unit_id: s.org_unit_id,
+        unit_path: resolveOrgUnitPath(unitLookup, s.org_unit_id),
+        totalAssignmentPercent: t.totalAssignmentPercent,
+        totalExamPercent: t.totalExamPercent,
+      };
     });
 
     res.status(200).json({ students });
@@ -2956,61 +3909,189 @@ app.get('/api/admin/students', authenticateToken, requireAdmin, async (req, res)
 });
 
 // ============================================================================
-// 1b-2. TEACHER-ONLY: students who have never submitted anything
+// TEACHER DASHBOARD - every student "under" the teacher (their subjects'
+// org units and everything beneath them, see getTeacherScope above), with
+// performance rolled up ONLY from assignments/exams attached to the
+// teacher's own subjects - not an org-wide report, deliberately narrower
+// than /api/admin/students. Teacher-only, same posture as non-submitters
+// above: admins already have their own fuller student views.
 // ============================================================================
-// "Visible to a teacher" = every student under (at, or beneath) the org_unit
-// of any subject that teacher is linked to via subject_teachers — the same
-// tier-cascades-down rule getVisibleSubjectIds() uses for students looking
-// UP toward subjects, just walked the other direction (down toward
-// students). A teacher with no subjects assigned yet sees an empty list,
-// not an error. Deliberately admin-excluded — admins already get full
-// per-student stats from the route above; this is a teacher-facing signal
-// scoped to exactly their own classes, not a general admin report.
-app.get('/api/teacher/non-submitters', authenticateToken, async (req, res) => {
+app.get('/api/teacher/students', authenticateToken, async (req, res) => {
   if (req.user.role !== 'teacher') {
     return res.status(403).json({ error: 'Teacher access required' });
   }
   try {
-    const result = await pool.query(
-      `WITH RECURSIVE my_subject_units AS (
-         SELECT DISTINCT s.org_unit_id
-         FROM subjects s
-         JOIN subject_teachers st ON st.subject_id = s.id
-         WHERE st.user_id = $1 AND s.organization_id = $2
-       ),
-       descendant_units AS (
-         SELECT id FROM org_units WHERE id IN (SELECT org_unit_id FROM my_subject_units)
-         UNION
-         SELECT ou.id FROM org_units ou JOIN descendant_units d ON ou.parent_unit_id = d.id
-       )
-       SELECT u.id, u.email, u.name, u.created_at, m.org_unit_id
-       FROM users u
-       JOIN memberships m ON m.user_id = u.id AND m.organization_id = $2 AND m.role = 'student'
-       WHERE m.org_unit_id IN (SELECT id FROM descendant_units)
-         AND NOT EXISTS (
-           SELECT 1 FROM submissions s
-           WHERE s.user_id = u.id AND s.problem_id IN (SELECT id FROM problems WHERE organization_id = $2)
-         )
-         AND NOT EXISTS (
-           SELECT 1 FROM exam_attempts ea
-           WHERE ea.user_id = u.id AND ea.exam_id IN (SELECT id FROM exams WHERE organization_id = $2)
-         )
-       ORDER BY u.email ASC`,
-      [req.user.userId, req.user.organizationId]
-    );
+    const { subjectIds, unitIds } = await getTeacherScope(req.user.userId, req.user.organizationId);
+    const students = await getTeacherScopedStudents(req.user.organizationId, unitIds);
+    const studentIds = students.map((s) => s.id);
+
+    const { problems, exams } = await getSubjectScopedAssignmentsAndExams(req.user.organizationId, subjectIds);
+    const [{ byUser: assignmentByUser }, { byUser: examByUser }] = await Promise.all([
+      getAssignmentPerformance(problems, studentIds),
+      getExamPerformance(exams, studentIds),
+    ]);
 
     const unitLookup = await getOrgUnitLookup(req.user.organizationId);
-    const students = result.rows.map((s) => ({ ...s, unit_path: resolveOrgUnitPath(unitLookup, s.org_unit_id) }));
-    res.status(200).json({ students });
+
+    const result = students.map((s) => {
+      const aMap = assignmentByUser.get(s.id) || new Map();
+      const eMap = examByUser.get(s.id) || new Map();
+      return {
+        id: s.id,
+        email: s.email,
+        name: s.name,
+        created_at: s.created_at,
+        unit_path: resolveOrgUnitPath(unitLookup, s.org_unit_id),
+        assignmentsTotal: problems.length,
+        assignmentsSubmitted: aMap.size,
+        avgAssignmentPercent: averagePercent(aMap),
+        examsTotal: exams.length,
+        examsAttempted: eMap.size,
+        avgExamPercent: averagePercent(eMap),
+      };
+    });
+
+    res.status(200).json({ students: result, subjectCount: subjectIds.length });
   } catch (err) {
-    console.error('Non-submitters error:', err);
-    res.status(500).json({ error: 'Failed to load non-submitters' });
+    console.error('Teacher students list error:', err);
+    res.status(500).json({ error: 'Failed to load students' });
+  }
+});
+
+// Teacher: one student's full breakdown, scoped the same way as the list
+// above - 404s (rather than 403) if the student exists but falls outside
+// this teacher's own subjects/units, so a teacher can't fish for arbitrary
+// student ids by trying them one at a time.
+app.get('/api/teacher/students/:id', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'teacher') {
+    return res.status(403).json({ error: 'Teacher access required' });
+  }
+  try {
+    const { subjectIds, unitIds } = await getTeacherScope(req.user.userId, req.user.organizationId);
+    if (unitIds.length === 0) return res.status(404).json({ error: 'Student not found' });
+
+    const studentRes = await pool.query(
+      `SELECT u.id, u.email, u.name, u.created_at, m.org_unit_id
+       FROM users u JOIN memberships m ON m.user_id = u.id AND m.organization_id = $1 AND m.role = 'student'
+       WHERE u.id = $2 AND m.org_unit_id = ANY($3::int[])`,
+      [req.user.organizationId, req.params.id, unitIds]
+    );
+    if (studentRes.rows.length === 0) return res.status(404).json({ error: 'Student not found' });
+    const student = studentRes.rows[0];
+
+    const classmates = await getTeacherScopedStudents(req.user.organizationId, unitIds);
+    const studentIds = classmates.map((s) => s.id);
+
+    const { problems, exams } = await getSubjectScopedAssignmentsAndExams(req.user.organizationId, subjectIds);
+    const [{ byUser: assignmentByUser }, { byUser: examByUser }] = await Promise.all([
+      getAssignmentPerformance(problems, studentIds),
+      getExamPerformance(exams, studentIds),
+    ]);
+
+    const [problemMetaRes, examMetaRes, scanRemarksRes, examRemarksRes] = await Promise.all([
+      problems.length
+        ? pool.query(
+            `SELECT p.id, p.title, s.name AS subject_name FROM problems p
+             LEFT JOIN subjects s ON s.id = p.subject_id WHERE p.id = ANY($1::int[])`,
+            [problems.map((p) => p.id)]
+          )
+        : { rows: [] },
+      exams.length
+        ? pool.query(
+            `SELECT e.id, e.title, s.name AS subject_name FROM exams e
+             LEFT JOIN subjects s ON s.id = e.subject_id WHERE e.id = ANY($1::int[])`,
+            [exams.map((e) => e.id)]
+          )
+        : { rows: [] },
+      problems.length
+        ? pool.query('SELECT problem_id, overall_remarks FROM scan_submissions WHERE user_id = $1 AND problem_id = ANY($2::int[])', [student.id, problems.map((p) => p.id)])
+        : { rows: [] },
+      exams.length
+        ? pool.query('SELECT exam_id, overall_remarks FROM exam_attempts WHERE user_id = $1 AND exam_id = ANY($2::int[])', [student.id, exams.map((e) => e.id)])
+        : { rows: [] },
+    ]);
+    const problemMetaById = new Map(problemMetaRes.rows.map((r) => [r.id, r]));
+    const examMetaById = new Map(examMetaRes.rows.map((r) => [r.id, r]));
+    const scanRemarksByProblem = new Map(scanRemarksRes.rows.map((r) => [r.problem_id, r.overall_remarks]));
+    const examRemarksByExam = new Map(examRemarksRes.rows.map((r) => [r.exam_id, r.overall_remarks]));
+
+    const myAssignments = assignmentByUser.get(student.id) || new Map();
+    const myExams = examByUser.get(student.id) || new Map();
+
+    const assignments = problems.map((p) => {
+      const meta = problemMetaById.get(p.id);
+      const entry = myAssignments.get(p.id);
+      return {
+        problemId: p.id,
+        title: meta?.title,
+        subjectName: meta?.subject_name,
+        status: entry?.status || 'not_submitted',
+        percent: entry?.pct ?? null,
+        remarks: scanRemarksByProblem.get(p.id) || null,
+      };
+    });
+
+    const examsOut = exams.map((e) => {
+      const meta = examMetaById.get(e.id);
+      const entry = myExams.get(e.id);
+      return {
+        examId: e.id,
+        title: meta?.title,
+        subjectName: meta?.subject_name,
+        status: entry?.status || 'not_attempted',
+        percent: entry?.pct ?? null,
+        remarks: examRemarksByExam.get(e.id) || null,
+      };
+    });
+
+    // Percentile against this teacher's own class only (not org-wide) - a
+    // student's standing among peers actually taking the same subjects,
+    // rather than being diluted by every other department/year in the
+    // institution the way the admin-side percentile is.
+    const classmateAssignmentAvgs = [];
+    const classmateExamAvgs = [];
+    studentIds.forEach((sid) => {
+      const aAvg = averagePercent(assignmentByUser.get(sid) || new Map());
+      if (aAvg != null) classmateAssignmentAvgs.push(aAvg);
+      const eAvg = averagePercent(examByUser.get(sid) || new Map());
+      if (eAvg != null) classmateExamAvgs.push(eAvg);
+    });
+    const myAvgAssignment = averagePercent(myAssignments);
+    const myAvgExam = averagePercent(myExams);
+    const assignmentPercentileTag = myAvgAssignment != null && classmateAssignmentAvgs.length > 1
+      ? computePercentileTiers(classmateAssignmentAvgs)(myAvgAssignment).tag
+      : null;
+    const examPercentileTag = myAvgExam != null && classmateExamAvgs.length > 1
+      ? computePercentileTiers(classmateExamAvgs)(myAvgExam).tag
+      : null;
+
+    const unitLookup = await getOrgUnitLookup(req.user.organizationId);
+
+    res.status(200).json({
+      student: { id: student.id, email: student.email, name: student.name, created_at: student.created_at },
+      unitPath: resolveOrgUnitPath(unitLookup, student.org_unit_id),
+      assignments,
+      exams: examsOut,
+      avgAssignmentPercent: myAvgAssignment,
+      avgExamPercent: myAvgExam,
+      assignmentPercentileTag,
+      examPercentileTag,
+    });
+  } catch (err) {
+    console.error('Teacher student detail error:', err);
+    res.status(500).json({ error: 'Failed to load student' });
   }
 });
 
 // ============================================================================
 // 1c. ADMIN: Per-student breakdown â€” every problem attempted and its result
 // ============================================================================
+// Just identity + the two total scores (see getTotalScores) — no
+// percentile tags, no per-assignment attempt history. An admin managing a
+// roster needs "how is this student doing overall," not attempt-by-attempt
+// forensics; that level of detail still exists per-subject in the teacher
+// dashboard's own student detail view (GET /api/teacher/students/:id) for
+// whichever teacher actually owns that subject.
 app.get('/api/admin/students/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const studentRes = await pool.query(
@@ -3022,75 +4103,14 @@ app.get('/api/admin/students/:id', authenticateToken, requireAdmin, async (req, 
     if (studentRes.rows.length === 0) return res.status(404).json({ error: 'Student not found' });
     const unitPath = resolveOrgUnitPath(await getOrgUnitLookup(req.user.organizationId), studentRes.rows[0].org_unit_id);
 
-    const perProblemRes = await pool.query(
-      `SELECT
-         p.id AS problem_id,
-         p.title,
-         p.difficulty,
-         bool_or(s.status = 'Accepted') AS solved,
-         COUNT(s.id)::int AS attempts,
-         MAX(s.created_at) AS last_attempt_at
-       FROM submissions s
-       JOIN problems p ON p.id = s.problem_id
-       WHERE s.user_id = $1 AND p.organization_id = $2
-       GROUP BY p.id, p.title, p.difficulty
-       ORDER BY MAX(s.created_at) DESC`,
-      [req.params.id, req.user.organizationId]
-    );
-
-    // Overall (exams) percentile: each student's average percentage across
-    // their own fully-graded submitted exam attempts, only counting exams
-    // whose own deadline has passed (matches the student-facing route's
-    // rule — a still-open exam elsewhere shouldn't skew "overall" early),
-    // ranked against every other student who also has at least one such attempt.
-    const overallExamsRes = await pool.query(
-      `SELECT a.user_id, AVG(a.score::float / e.total_marks * 100) AS avg_percentage
-       FROM exam_attempts a
-       JOIN exams e ON e.id = a.exam_id
-       WHERE a.status = 'submitted' AND e.total_marks > 0 AND e.organization_id = $1
-         AND (e.closes_at IS NULL OR e.closes_at <= now())
-         AND NOT EXISTS (
-           SELECT 1 FROM exam_answers ea JOIN exam_items ei ON ei.id = ea.item_id
-           WHERE ea.attempt_id = a.id AND ei.type IN ('short', 'long') AND ea.marks_awarded IS NULL
-         )
-         AND NOT EXISTS (
-           SELECT 1 FROM exam_scan_answers esa WHERE esa.attempt_id = a.id AND esa.marks_awarded IS NULL
-         )
-       GROUP BY a.user_id`,
-      [req.user.organizationId]
-    );
-    const overallExamsFor = computePercentileTiers(overallExamsRes.rows.map((r) => Number(r.avg_percentage)));
-    const studentOverallExams = overallExamsRes.rows.find((r) => r.user_id === req.params.id);
-    const overallExamsPercentileTag = studentOverallExams ? overallExamsFor(Number(studentOverallExams.avg_percentage)).tag : null;
-
-    // Overall (assignments): same idea, best-submission % averaged across
-    // every problem the student's submitted to, only counting problems
-    // whose deadline has passed.
-    const overallAssignmentsRes = await pool.query(
-      `SELECT best.user_id, AVG(best.passed_count::float / best.total_count * 100) AS avg_percentage
-       FROM (
-         SELECT DISTINCT ON (s.user_id, s.problem_id) s.user_id, s.problem_id, s.passed_count, s.total_count
-         FROM submissions s
-         JOIN problems p ON p.id = s.problem_id
-         WHERE p.organization_id = $1 AND (p.closes_at IS NULL OR p.closes_at <= now())
-         ORDER BY s.user_id, s.problem_id, (s.status = 'Accepted') DESC, s.passed_count DESC, s.created_at DESC
-       ) best
-       WHERE best.total_count > 0
-       GROUP BY best.user_id`,
-      [req.user.organizationId]
-    );
-    const overallAssignmentsFor = computePercentileTiers(overallAssignmentsRes.rows.map((r) => Number(r.avg_percentage)));
-    const studentOverallAssignments = overallAssignmentsRes.rows.find((r) => r.user_id === req.params.id);
-    const overallAssignmentsPercentileTag = studentOverallAssignments
-      ? overallAssignmentsFor(Number(studentOverallAssignments.avg_percentage)).tag
-      : null;
+    const totals = await getTotalScores(req.user.organizationId, [req.params.id]);
+    const t = totals.get(req.params.id) || { totalAssignmentPercent: null, totalExamPercent: null };
 
     res.status(200).json({
       student: studentRes.rows[0],
       unitPath,
-      problems: perProblemRes.rows,
-      overallExamsPercentileTag,
-      overallAssignmentsPercentileTag,
+      totalAssignmentPercent: t.totalAssignmentPercent,
+      totalExamPercent: t.totalExamPercent,
     });
   } catch (error) {
     console.error('Student detail error:', error);
@@ -3099,30 +4119,96 @@ app.get('/api/admin/students/:id', authenticateToken, requireAdmin, async (req, 
 });
 
 // ============================================================================
-// 1c-2. ADMIN: Full submission history (including code) for one student on
-// one problem â€” lets an admin see exactly what a student tried, in what
-// order, and how their code changed between attempts.
+// LEGACY SCORES — CSV import of pre-platform score history, for
+// institutions onboarding after already having a track record. Unlike the
+// student roster CSV import above, this never creates accounts or org
+// units — every row must match an EXISTING student in this org by email
+// (they're expected to already exist, e.g. from that same roster import),
+// and just attaches a score to them. See getTotalScores for how these rows
+// get blended into "total score" everywhere it's shown.
 // ============================================================================
-app.get('/api/admin/students/:studentId/problems/:problemId/submissions', authenticateToken, requireAdmin, async (req, res) => {
-  const { studentId, problemId } = req.params;
+app.get('/api/admin/legacy-scores/csv-template', authenticateToken, requireAdmin, (req, res) => {
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="legacy-scores-template.csv"');
+  res.status(200).send('Email,AcademicYear,AssignmentScorePercent,ExamScorePercent,Notes\n');
+});
+
+app.post('/api/admin/legacy-scores/import', authenticateToken, requireAdmin, csvUpload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'CSV file is required' });
+
+  let rows;
   try {
-    // The join back to memberships/problems (rather than trusting the raw
-    // ids) is what stops one org's admin from reading another org's
-    // submission history by guessing/enumerating ids in the URL.
-    const result = await pool.query(
-      `SELECT s.id, s.language, s.code, s.status, s.passed_count, s.total_count, s.created_at
-       FROM submissions s
-       JOIN memberships m ON m.user_id = s.user_id AND m.organization_id = $3
-       JOIN problems p ON p.id = s.problem_id
-       WHERE s.user_id = $1 AND s.problem_id = $2 AND p.organization_id = $3
-       ORDER BY s.created_at DESC`,
-      [studentId, problemId, req.user.organizationId]
-    );
-    res.status(200).json({ submissions: result.rows });
-  } catch (error) {
-    console.error('Submission history error:', error);
-    res.status(500).json({ error: 'Failed to load submission history' });
+    rows = parseCsv(req.file.buffer, { columns: true, skip_empty_lines: true, trim: true });
+  } catch (err) {
+    return res.status(400).json({ error: 'Could not parse CSV file — check it is valid CSV with a header row' });
   }
+  if (rows.length === 0) return res.status(400).json({ error: 'CSV has no data rows' });
+
+  const headerKeys = Object.keys(rows[0]);
+  const findKey = (name) => headerKeys.find((k) => k.trim().toLowerCase() === name);
+  const emailKey = findKey('email');
+  const yearKey = findKey('academicyear');
+  const assignmentKey = findKey('assignmentscorepercent');
+  const examKey = findKey('examscorepercent');
+  const notesKey = findKey('notes');
+  if (!emailKey || !yearKey) {
+    return res.status(400).json({ error: 'CSV must have Email and AcademicYear columns' });
+  }
+
+  // A percent cell can be blank (this school might only have exam records
+  // for an old year, not assignment records, or vice versa) — blank parses
+  // to null, not 0, so a missing score never drags the blended average down.
+  const parsePercent = (raw) => {
+    const trimmed = String(raw || '').trim();
+    if (!trimmed) return { value: null };
+    const n = Number(trimmed);
+    if (Number.isNaN(n) || n < 0 || n > 100) return { error: true };
+    return { value: n };
+  };
+
+  const results = { imported: 0, errors: [] };
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const rowNum = i + 2;
+    const email = String(row[emailKey] || '').trim();
+    const academicYear = String(row[yearKey] || '').trim();
+
+    if (!email) { results.errors.push({ row: rowNum, email, reason: 'Missing email' }); continue; }
+    if (!academicYear) { results.errors.push({ row: rowNum, email, reason: 'Missing academic year' }); continue; }
+
+    const assignmentParsed = parsePercent(row[assignmentKey]);
+    const examParsed = parsePercent(row[examKey]);
+    if (assignmentParsed.error || examParsed.error) {
+      results.errors.push({ row: rowNum, email, reason: 'Score percent must be a number between 0 and 100 (or blank)' });
+      continue;
+    }
+    if (assignmentParsed.value == null && examParsed.value == null) {
+      results.errors.push({ row: rowNum, email, reason: 'Row has neither an assignment score nor an exam score' });
+      continue;
+    }
+
+    const studentRes = await pool.query(
+      `SELECT u.id FROM users u JOIN memberships m ON m.user_id = u.id
+       WHERE u.email = $1 AND m.organization_id = $2 AND m.role = 'student'`,
+      [email, req.user.organizationId]
+    );
+    if (studentRes.rows.length === 0) {
+      results.errors.push({ row: rowNum, email, reason: 'No student with this email in your organization' });
+      continue;
+    }
+
+    await pool.query(
+      `INSERT INTO legacy_scores (organization_id, user_id, academic_year, assignment_score_percent, exam_score_percent, notes)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (organization_id, user_id, academic_year)
+       DO UPDATE SET assignment_score_percent = $4, exam_score_percent = $5, notes = $6`,
+      [req.user.organizationId, studentRes.rows[0].id, academicYear, assignmentParsed.value, examParsed.value, notesKey ? (String(row[notesKey] || '').trim() || null) : null]
+    );
+    results.imported++;
+  }
+
+  res.status(200).json(results);
 });
 
 // ============================================================================
@@ -3409,22 +4495,21 @@ app.post('/api/webhook/razorpay', async (req, res) => {
 // COALESCEs pending_* in, so it's safe to call from both events in either
 // order, and safe against Razorpay redelivering the same event twice.
 async function promoteSubscriptionToActive(razorpaySubscriptionId, razorpayPlanId, currentPeriodEnd) {
-  // Captured BEFORE the update — used to tell a genuine first-activation
-  // (pending_razorpay_subscription_id was set) apart from an ordinary
-  // renewal charge on an already-active row (it's already NULL), so the
-  // caller only re-sends the "now active" email on the real transition,
-  // not on every recurring payment.
   const before = await pool.query(
-    `SELECT (pending_razorpay_subscription_id IS NOT NULL) AS was_pending
+    `SELECT organization_id, pending_plan_key, pending_billing_cycle, billing_cycle,
+            (pending_razorpay_subscription_id IS NOT NULL) AS was_pending
      FROM subscriptions WHERE pending_razorpay_subscription_id = $1 OR razorpay_subscription_id = $1`,
     [razorpaySubscriptionId]
   );
+  if (before.rows.length === 0) return null;
   const wasPromotion = before.rows[0]?.was_pending === true;
+  const isAnnual = before.rows[0]?.pending_billing_cycle === 'annual' || before.rows[0]?.billing_cycle === 'annual';
+  const effectivePeriodEnd = currentPeriodEnd || new Date(Date.now() + (isAnnual ? 365 : 30) * 24 * 60 * 60 * 1000);
 
   const result = await pool.query(
     `UPDATE subscriptions SET
        plan_key = COALESCE(pending_plan_key, plan_key),
-       billing_cycle = COALESCE(pending_billing_cycle, billing_cycle),
+       billing_cycle = COALESCE(pending_billing_cycle, billing_cycle, $4),
        razorpay_subscription_id = COALESCE(razorpay_subscription_id, pending_razorpay_subscription_id, $1),
        razorpay_plan_id = COALESCE($2, razorpay_plan_id),
        status = 'active',
@@ -3432,8 +4517,8 @@ async function promoteSubscriptionToActive(razorpaySubscriptionId, razorpayPlanI
        pending_plan_key = NULL, pending_billing_cycle = NULL, pending_razorpay_subscription_id = NULL,
        updated_at = now()
      WHERE pending_razorpay_subscription_id = $1 OR razorpay_subscription_id = $1
-     RETURNING organization_id, plan_key`,
-    [razorpaySubscriptionId, razorpayPlanId, currentPeriodEnd]
+     RETURNING organization_id, plan_key, billing_cycle, status, current_period_end`,
+    [razorpaySubscriptionId, razorpayPlanId, effectivePeriodEnd, isAnnual ? 'annual' : 'monthly']
   );
   return result.rows[0] ? { ...result.rows[0], wasPromotion } : null;
 }
@@ -3535,7 +4620,7 @@ async function sendBillingEmail(organizationId, subject, text) {
 // unauthenticated by necessity — this IS how an org's first account gets made.
 // ============================================================================
 app.post('/api/organizations/signup', async (req, res) => {
-  const { organizationName, email, password, name, accessCode } = req.body;
+  const { organizationName, email, password, name, accessCode, acceptedTos } = req.body;
   if (!organizationName || !String(organizationName).trim()) {
     return res.status(400).json({ error: 'Organization name is required' });
   }
@@ -3548,6 +4633,13 @@ app.post('/api/organizations/signup', async (req, res) => {
   // is the one signup path that actually needs to ask for it itself.
   if (!name || !String(name).trim()) {
     return res.status(400).json({ error: 'Your name is required' });
+  }
+  // The one place an admin explicitly accepts — teachers/students never see
+  // this form at all (their accounts are created BY an admin), so their own
+  // acceptance is instead collected on first login (see the
+  // requiresTosAcceptance branch in POST /api/login).
+  if (!acceptedTos) {
+    return res.status(400).json({ error: 'You must accept the Terms of Service and Privacy Policy to continue' });
   }
   // Gates institution creation up front instead of the old flow (create as
   // 'pending', wait for a platform owner to separately hit POST
@@ -3606,11 +4698,15 @@ app.post('/api/organizations/signup', async (req, res) => {
     if (existing.rows.length > 0) {
       userId = existing.rows[0].id;
       effectiveName = existing.rows[0].name || name.trim();
-      await client.query('UPDATE users SET name = COALESCE(name, $1) WHERE id = $2', [name.trim(), userId]);
+      // COALESCE on tos_accepted_at too — if they'd already accepted (e.g.
+      // as a student elsewhere), this signup shouldn't need to re-collect
+      // it, but it must still be set for an identity that somehow reached
+      // here without ever accepting.
+      await client.query('UPDATE users SET name = COALESCE(name, $1), tos_accepted_at = COALESCE(tos_accepted_at, now()) WHERE id = $2', [name.trim(), userId]);
     } else {
       effectiveName = name.trim();
       userId = (await client.query(
-        'INSERT INTO users (email, password_hash, name) VALUES ($1, $2, $3) RETURNING id',
+        'INSERT INTO users (email, password_hash, name, tos_accepted_at) VALUES ($1, $2, $3, now()) RETURNING id',
         [email, await bcrypt.hash(password, 10), name.trim()]
       )).rows[0].id;
     }
@@ -3759,6 +4855,32 @@ function mintSessionToken(membership) {
   );
 }
 
+// A teacher/student account is always created BY an admin (CSV import, the
+// manual add form, the Google Form webhook) — none of those ask the person
+// themselves to accept the Terms of Service/Privacy Policy the way the
+// admin signup form does. Their own first login is the only moment left to
+// collect it, so both login-completion points below (the single-membership
+// fast path and POST /api/login/select-organization) hold the real token
+// back and mint one of these instead when role is teacher/student and
+// tos_accepted_at is still null. It carries the exact same membership
+// claims a real session token would (type:'tos-pending' aside) so POST
+// /api/login/accept-tos can mint the real one straight from it without a
+// second DB round trip to re-derive role/org. authenticateToken already
+// refuses any type !== undefined token on real routes, same as 'preauth'.
+function mintTosPendingToken(membership) {
+  return jwt.sign(
+    {
+      type: 'tos-pending',
+      userId: membership.user_id,
+      role: membership.role,
+      organizationId: membership.organization_id,
+      orgUnitId: membership.org_unit_id ?? null,
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: '10m' }
+  );
+}
+
 // ============================================================================
 // SUPERADMIN — platform-owner visibility across every organization. Built
 // as impersonation rather than a parallel set of cross-org query routes:
@@ -3779,37 +4901,994 @@ app.get('/api/superadmin/organizations', authenticateToken, requireSuperadmin, a
         COALESCE(sub.plan_key, 'free') AS plan_key,
         COALESCE(sub.status, 'free') AS billing_status,
         (SELECT COUNT(*)::int FROM memberships m WHERE m.organization_id = o.id AND m.role = 'student') AS student_count,
-        (SELECT COUNT(*)::int FROM memberships m WHERE m.organization_id = o.id AND m.role = 'teacher') AS teacher_count
+        (SELECT COUNT(*)::int FROM memberships m WHERE m.organization_id = o.id AND m.role = 'teacher') AS teacher_count,
+        (SELECT COALESCE(json_agg(json_build_object('user_id', u.id, 'name', u.name, 'email', u.email) ORDER BY u.name), '[]'::json)
+         FROM memberships m JOIN users u ON u.id = m.user_id
+         WHERE m.organization_id = o.id AND m.role = 'admin') AS admins
       FROM organizations o
       LEFT JOIN subscriptions sub ON sub.organization_id = o.id
       ORDER BY o.created_at DESC
     `);
-    res.status(200).json({ organizations: result.rows });
+    const organizations = result.rows;
+
+    // Platform-wide totals — computed here in JS from the same rows rather
+    // than a second query, since every input is already in `organizations`.
+    // Deliberately not a database-level aggregate: this whole route is
+    // "everything a superadmin needs on one screen" (see this route's own
+    // comment further down about not building a parallel per-org UI), and
+    // that includes the top-line numbers, not just the row-by-row table.
+    const summary = {
+      totalOrganizations: organizations.length,
+      totalStudents: organizations.reduce((sum, o) => sum + o.student_count, 0),
+      totalTeachers: organizations.reduce((sum, o) => sum + o.teacher_count, 0),
+      planBreakdown: organizations.reduce((acc, o) => { acc[o.plan_key] = (acc[o.plan_key] || 0) + 1; return acc; }, {}),
+      billingStatusBreakdown: organizations.reduce((acc, o) => { acc[o.billing_status] = (acc[o.billing_status] || 0) + 1; return acc; }, {}),
+    };
+
+    res.status(200).json({ organizations, summary });
   } catch (err) {
     console.error('Superadmin list organizations error:', err);
     res.status(500).json({ error: 'Failed to load organizations' });
   }
 });
 
-app.post('/api/superadmin/organizations/:id/impersonate', authenticateToken, requireSuperadmin, async (req, res) => {
+// Superadmin lifecycle control over an organization's status — the
+// dashboard-accessible counterpart to the curl-only /api/platform/
+// organizations/:id/approve|reject routes above, plus two states those
+// never had: reverting an approved org back to 'pending' ("unapprove"),
+// and 'terminated' — a full blacklist that also blocks login for every
+// existing member (see the org-status check in POST /api/login), not just
+// new roster growth the way pending/rejected do. Each route just sets the
+// target status outright regardless of the org's current one, since a
+// superadmin has standing authority to move any org to any state (e.g.
+// reinstating a terminated org also goes through /approve).
+async function setOrganizationStatus(orgId, status, actorEmail) {
+  const result = await pool.query(
+    `UPDATE organizations SET status = $1, approved_at = now(), approved_by = $2 WHERE id = $3 RETURNING id, name, status`,
+    [status, actorEmail, orgId]
+  );
+  return result.rows[0] || null;
+}
+
+function makeSetOrgStatusRoute(status, actionLabel) {
+  return async (req, res) => {
+    try {
+      const actorRes = await pool.query('SELECT email FROM users WHERE id = $1', [req.user.userId]);
+      const org = await setOrganizationStatus(req.params.id, status, actorRes.rows[0]?.email || 'superadmin');
+      if (!org) return res.status(404).json({ error: 'Organization not found' });
+      res.status(200).json({ organization: org });
+    } catch (err) {
+      console.error(`Superadmin ${actionLabel} organization error:`, err);
+      res.status(500).json({ error: `Failed to ${actionLabel} organization` });
+    }
+  };
+}
+
+app.post('/api/superadmin/organizations/:id/approve', authenticateToken, requireSuperadmin, makeSetOrgStatusRoute('approved', 'approve'));
+app.post('/api/superadmin/organizations/:id/unapprove', authenticateToken, requireSuperadmin, makeSetOrgStatusRoute('pending', 'unapprove'));
+app.post('/api/superadmin/organizations/:id/reject', authenticateToken, requireSuperadmin, makeSetOrgStatusRoute('rejected', 'reject'));
+app.post('/api/superadmin/organizations/:id/terminate', authenticateToken, requireSuperadmin, makeSetOrgStatusRoute('terminated', 'terminate'));
+
+// ============================================================================
+// PERMANENT DELETION — irreversible. Everything below exists to back one
+// guarantee: the institution's admin(s) always have a full copy of their
+// data in hand before any of it is destroyed, and if that copy can't be
+// delivered (Gmail unconfigured, send failure, no recipient), nothing gets
+// deleted at all. See DELETE /api/superadmin/organizations/:id further down
+// for how these three pieces (export, zip, delete) are actually sequenced.
+// ============================================================================
+
+// Tables with their own organization_id column — the direct slice of "this
+// institution's data". Everything else that belongs to the org (test cases,
+// submissions, exam attempts, ...) is reached transitively through these,
+// via problem_id/exam_id/subject_id — see exportOrganizationData below.
+const DIRECT_ORG_TABLES = [
+  'memberships', 'org_level_defs', 'org_units', 'subjects', 'problems', 'exams',
+  'grade_bands', 'tag_visibility_settings', 'profile_change_requests',
+  'admin_requests', 'legacy_scores', 'subscriptions',
+];
+
+// Read-only snapshot of every row this organization owns, shaped as
+// { tableName: rows[] } — one JSON file per table once zipped. Deliberately
+// never touches users.password_hash: `roster` is a name/email/role view
+// joined from memberships instead of a raw users dump, since users is a
+// global identity that may still have accounts elsewhere.
+async function exportOrganizationData(orgId) {
+  const data = {};
+  data.organization = (await pool.query('SELECT * FROM organizations WHERE id = $1', [orgId])).rows;
+
+  for (const table of DIRECT_ORG_TABLES) {
+    data[table] = (await pool.query(`SELECT * FROM ${table} WHERE organization_id = $1`, [orgId])).rows;
+  }
+
+  data.roster = (await pool.query(
+    `SELECT u.id AS user_id, u.email, u.name, m.role, m.org_unit_id, m.roll_number, m.created_at AS member_since
+     FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.organization_id = $1`,
+    [orgId]
+  )).rows;
+
+  const subjectIds = data.subjects.map((s) => s.id);
+  data.subject_teachers = subjectIds.length
+    ? (await pool.query('SELECT * FROM subject_teachers WHERE subject_id = ANY($1)', [subjectIds])).rows
+    : [];
+
+  const problemIds = data.problems.map((p) => p.id);
+  if (problemIds.length) {
+    data.test_cases = (await pool.query('SELECT * FROM test_cases WHERE problem_id = ANY($1)', [problemIds])).rows;
+    data.starter_code = (await pool.query('SELECT * FROM starter_code WHERE problem_id = ANY($1)', [problemIds])).rows;
+    data.problem_time_logs = (await pool.query('SELECT * FROM problem_time_logs WHERE problem_id = ANY($1)', [problemIds])).rows;
+    data.submissions = (await pool.query('SELECT * FROM submissions WHERE problem_id = ANY($1)', [problemIds])).rows;
+    data.scan_assignment_questions = (await pool.query('SELECT * FROM scan_assignment_questions WHERE problem_id = ANY($1)', [problemIds])).rows;
+    data.scan_submissions = (await pool.query('SELECT * FROM scan_submissions WHERE problem_id = ANY($1)', [problemIds])).rows;
+    data.scan_plagiarism_flags = (await pool.query('SELECT * FROM scan_plagiarism_flags WHERE problem_id = ANY($1)', [problemIds])).rows;
+  } else {
+    data.test_cases = []; data.starter_code = []; data.problem_time_logs = [];
+    data.submissions = []; data.scan_assignment_questions = []; data.scan_submissions = [];
+    data.scan_plagiarism_flags = [];
+  }
+
+  const scanSubmissionIds = data.scan_submissions.map((s) => s.id);
+  if (scanSubmissionIds.length) {
+    data.scan_submission_answers = (await pool.query('SELECT * FROM scan_submission_answers WHERE submission_id = ANY($1)', [scanSubmissionIds])).rows;
+    data.scan_handwriting_flags = (await pool.query(
+      'SELECT * FROM scan_handwriting_flags WHERE submission_a_id = ANY($1) OR submission_b_id = ANY($1)', [scanSubmissionIds]
+    )).rows;
+  } else {
+    data.scan_submission_answers = []; data.scan_handwriting_flags = [];
+  }
+
+  const examIds = data.exams.map((e) => e.id);
+  if (examIds.length) {
+    data.exam_items = (await pool.query('SELECT * FROM exam_items WHERE exam_id = ANY($1)', [examIds])).rows;
+    data.exam_attempts = (await pool.query('SELECT * FROM exam_attempts WHERE exam_id = ANY($1)', [examIds])).rows;
+  } else {
+    data.exam_items = []; data.exam_attempts = [];
+  }
+
+  const attemptIds = data.exam_attempts.map((a) => a.id);
+  if (attemptIds.length) {
+    data.exam_answers = (await pool.query('SELECT * FROM exam_answers WHERE attempt_id = ANY($1)', [attemptIds])).rows;
+    data.exam_proctor_flags = (await pool.query('SELECT * FROM exam_proctor_flags WHERE attempt_id = ANY($1)', [attemptIds])).rows;
+    data.exam_scan_answers = (await pool.query('SELECT * FROM exam_scan_answers WHERE attempt_id = ANY($1)', [attemptIds])).rows;
+  } else {
+    data.exam_answers = []; data.exam_proctor_flags = []; data.exam_scan_answers = [];
+  }
+
+  return data;
+}
+
+// One JSON file per table, zipped in memory — small enough for any one
+// institution's data that streaming to disk first isn't worth the extra
+// moving part.
+function buildZipBuffer(data) {
+  return new Promise((resolve, reject) => {
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    const chunks = [];
+    archive.on('data', (chunk) => chunks.push(chunk));
+    archive.on('end', () => resolve(Buffer.concat(chunks)));
+    archive.on('error', reject);
+    for (const [table, rows] of Object.entries(data)) {
+      archive.append(JSON.stringify(rows, null, 2), { name: `${table}.json` });
+    }
+    archive.finalize();
+  });
+}
+
+// The actual destructive part — only ever called after the export above has
+// already been emailed out successfully (see the route below). Explicit,
+// ordered DELETEs rather than relying on cascade: several org-scoped tables
+// (exams, problems, grade_bands, tag_visibility_settings) use ON DELETE NO
+// ACTION on organization_id, not CASCADE, so a bare `DELETE FROM
+// organizations` would fail outright with a foreign-key violation. org_units
+// deletes as one whole-subtree statement despite its self-referential
+// parent_unit_id RESTRICT — Postgres checks RESTRICT/NO ACTION constraints
+// at the end of the statement, against what's left standing, not per row
+// against rows that are about to disappear in the same statement — so
+// deleting every row for this org in one DELETE is safe as long as subjects
+// (which RESTRICTs org_units) goes first, and org_level_defs (RESTRICTed by
+// org_units) goes after. Everything else CASCADEs from organizations.id and
+// needs no explicit statement of its own.
+async function deleteOrganizationData(client, orgId) {
+  // Legacy, unused-since-the-memberships-cutover column (see
+  // ensureMembershipsSchema's own comment) — NO ACTION on organizations.id,
+  // so it has to be cleared, not left dangling, before the org row can go.
+  await client.query('UPDATE users SET organization_id = NULL WHERE organization_id = $1', [orgId]);
+  await client.query('DELETE FROM exams WHERE organization_id = $1', [orgId]);
+  await client.query('DELETE FROM problems WHERE organization_id = $1', [orgId]);
+  await client.query('DELETE FROM subjects WHERE organization_id = $1', [orgId]);
+  await client.query('DELETE FROM org_units WHERE organization_id = $1', [orgId]);
+  await client.query('DELETE FROM org_level_defs WHERE organization_id = $1', [orgId]);
+  await client.query('DELETE FROM grade_bands WHERE organization_id = $1', [orgId]);
+  await client.query('DELETE FROM tag_visibility_settings WHERE organization_id = $1', [orgId]);
+  await client.query('DELETE FROM organizations WHERE id = $1', [orgId]);
+}
+
+app.delete('/api/superadmin/organizations/:id', authenticateToken, requireSuperadmin, async (req, res) => {
+  const orgId = req.params.id;
+  try {
+    const orgRes = await pool.query('SELECT id, name FROM organizations WHERE id = $1', [orgId]);
+    if (orgRes.rows.length === 0) return res.status(404).json({ error: 'Organization not found' });
+    const org = orgRes.rows[0];
+
+    const data = await exportOrganizationData(orgId);
+    const zipBuffer = await buildZipBuffer(data);
+
+    // Every admin of this org gets the archive. If it somehow has none,
+    // falls back to the superadmin performing the deletion, so the archive
+    // is never just silently dropped for lack of a mailbox to put it in.
+    const adminRes = await pool.query(
+      `SELECT DISTINCT u.email FROM memberships m JOIN users u ON u.id = m.user_id
+       WHERE m.organization_id = $1 AND m.role = 'admin' AND u.email IS NOT NULL`,
+      [orgId]
+    );
+    let recipients = adminRes.rows.map((r) => r.email).filter(Boolean);
+    if (recipients.length === 0) {
+      const actorRes = await pool.query('SELECT email FROM users WHERE id = $1', [req.user.userId]);
+      if (actorRes.rows[0]?.email) recipients = [actorRes.rows[0].email];
+    }
+    if (recipients.length === 0) {
+      return res.status(500).json({ error: 'No recipient found for the data archive — deletion aborted' });
+    }
+
+    const zipFilename = `${org.name.replace(/[^a-z0-9]+/gi, '_')}_data_export.zip`;
+    // The one hard rule this whole route exists to enforce: deletion only
+    // proceeds once every recipient has actually received the archive. Any
+    // send failure (Gmail unconfigured, API error, etc.) aborts before a
+    // single row is touched.
+    const sendResults = await Promise.all(recipients.map((to) => sendEmail({
+      to,
+      subject: `HonorRoll — ${org.name} data export (institution deleted)`,
+      text: `Attached is a full export of ${org.name}'s data on HonorRoll, taken immediately before permanent deletion by the platform owner.\n\nThis institution's account, roster, assignments, exams, and all related records have now been permanently removed from HonorRoll and cannot be recovered — this archive is the only remaining copy.\n\n— HonorRoll`,
+      attachments: [{ filename: zipFilename, content: zipBuffer, contentType: 'application/zip' }],
+    })));
+    const failed = sendResults.find((r) => r.error);
+    if (failed) {
+      console.error('Organization data export email failed, aborting deletion:', failed.error);
+      return res.status(502).json({ error: 'Failed to email the data export — deletion aborted, nothing was deleted' });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await deleteOrganizationData(client, orgId);
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.status(200).json({ message: `${org.name} and all its data have been permanently deleted. A full export was emailed to ${recipients.join(', ')}.` });
+  } catch (err) {
+    console.error('Superadmin delete organization error:', err);
+    res.status(500).json({ error: 'Failed to delete organization' });
+  }
+});
+
+// Global user search across every organization — lets a superadmin jump
+// straight to "which org(s) is this person in" instead of impersonating
+// into each org one at a time to look. Read-only by design: it never
+// exposes a way to edit anyone directly at this scope, only to see where
+// they are — actually altering a student's details still goes through the
+// exact same admin-side StudentDetailPanel edit flow every real admin
+// uses, reached by impersonating into the right org first (see POST
+// /api/superadmin/organizations/:id/impersonate right below).
+app.get('/api/superadmin/users', authenticateToken, requireSuperadmin, async (req, res) => {
+  const search = String(req.query.search || '').trim();
+  if (search.length < 2) return res.status(200).json({ users: [] });
+  try {
+    const result = await pool.query(
+      `SELECT u.id, u.email, u.name,
+              COALESCE((
+                SELECT json_agg(json_build_object('organizationId', m.organization_id, 'organizationName', o.name, 'role', m.role) ORDER BY o.name)
+                FROM memberships m JOIN organizations o ON o.id = m.organization_id
+                WHERE m.user_id = u.id
+              ), '[]') AS memberships
+       FROM users u
+       WHERE (u.email ILIKE $1 OR u.name ILIKE $1)
+         AND EXISTS (SELECT 1 FROM memberships m2 WHERE m2.user_id = u.id)
+       ORDER BY u.email ASC
+       LIMIT 50`,
+      [`%${search}%`]
+    );
+    res.status(200).json({ users: result.rows });
+  } catch (err) {
+    console.error('Superadmin user search error:', err);
+    res.status(500).json({ error: 'Failed to search users' });
+  }
+});
+
+// ============================================================================
+// ADMIN: PROFILE CHANGE REQUESTS
+// Student roster correction requests for this organization.
+// ============================================================================
+app.get('/api/admin/profile-change-requests', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const statusParam = req.query.status;
+    const allowed = ['pending', 'escalated', 'approved', 'rejected'];
+    const status = allowed.includes(statusParam) ? statusParam : 'pending';
+    const params = [req.user.organizationId];
+    let where = 'WHERE r.organization_id = $1';
+    if (statusParam !== 'all') {
+      params.push(status);
+      where += ' AND r.status = $2';
+    }
+    const result = await pool.query(
+      `SELECT r.id, r.field, r.current_value, r.requested_value, r.reason, r.status,
+              r.review_note, r.reviewed_at, r.created_at, r.escalated_at, r.escalation_note,
+              u.id AS student_id, u.email AS student_email, u.name AS student_name,
+              m.roll_number
+       FROM profile_change_requests r
+       JOIN users u ON u.id = r.user_id
+       LEFT JOIN memberships m ON m.user_id = u.id AND m.organization_id = r.organization_id
+       ${where}
+       ORDER BY r.created_at DESC`,
+      params
+    );
+    res.status(200).json({ requests: result.rows });
+  } catch (err) {
+    console.error('Admin list profile change requests error:', err);
+    res.status(500).json({ error: 'Failed to load profile change requests' });
+  }
+});
+
+app.post('/api/admin/profile-change-requests/:id/review', authenticateToken, requireAdmin, async (req, res) => {
+  const action = req.body.action || req.body.status;
+  if (!['approved', 'rejected', 'escalated'].includes(action)) {
+    return res.status(400).json({ error: "action must be 'approved', 'rejected', or 'escalated'" });
+  }
+  const note = req.body.note != null ? String(req.body.note).trim() || null : null;
+
+  try {
+    const reqRes = await pool.query(
+      `SELECT r.*, u.name AS student_name, u.email AS student_email, o.name AS organization_name
+       FROM profile_change_requests r
+       JOIN users u ON u.id = r.user_id
+       JOIN organizations o ON o.id = r.organization_id
+       WHERE r.id = $1 AND r.organization_id = $2`,
+      [req.params.id, req.user.organizationId]
+    );
+    if (reqRes.rows.length === 0) return res.status(404).json({ error: 'Request not found' });
+    const request = reqRes.rows[0];
+    if (request.status !== 'pending') {
+      return res.status(409).json({ error: 'This request was already reviewed or escalated' });
+    }
+
+    if (action === 'approved') {
+      const normalizedField = request.field.trim().toLowerCase().replace(/\s+/g, '_');
+      if (normalizedField === 'name') {
+        await pool.query('UPDATE users SET name = $1 WHERE id = $2', [request.requested_value, request.user_id]);
+      } else if (normalizedField === 'roll_number' || normalizedField === 'rollnumber') {
+        await pool.query(
+          'UPDATE memberships SET roll_number = $1 WHERE user_id = $2 AND organization_id = $3',
+          [request.requested_value, request.user_id, request.organization_id]
+        );
+      }
+
+      const result = await pool.query(
+        `UPDATE profile_change_requests
+         SET status = 'approved', reviewed_by = $1, reviewed_at = now(), review_note = $2
+         WHERE id = $3 RETURNING id, status, review_note, reviewed_at`,
+        [req.user.userId, note, req.params.id]
+      );
+
+      // Best-effort notification to student
+      const { error: mailErr } = await sendEmail({
+        to: request.student_email,
+        subject: 'HonorRoll — Info Change Request Approved',
+        text: `Hello ${request.student_name || 'Student'},\n\nYour request to change "${request.field}" to "${request.requested_value}" has been approved by your administrator.${note ? `\n\nNote: ${note}` : ''}\n\n— HonorRoll`,
+      });
+      if (mailErr) console.error('Student info change approval email error:', mailErr);
+
+      return res.status(200).json({ request: result.rows[0] });
+    }
+
+    if (action === 'rejected') {
+      const result = await pool.query(
+        `UPDATE profile_change_requests
+         SET status = 'rejected', reviewed_by = $1, reviewed_at = now(), review_note = $2
+         WHERE id = $3 RETURNING id, status, review_note, reviewed_at`,
+        [req.user.userId, note, req.params.id]
+      );
+
+      // Best-effort notification to student
+      const { error: mailErr } = await sendEmail({
+        to: request.student_email,
+        subject: 'HonorRoll — Info Change Request Update',
+        text: `Hello ${request.student_name || 'Student'},\n\nYour request to change "${request.field}" was reviewed and rejected by your administrator.${note ? `\n\nReason: ${note}` : ''}\n\n— HonorRoll`,
+      });
+      if (mailErr) console.error('Student info change rejection email error:', mailErr);
+
+      return res.status(200).json({ request: result.rows[0] });
+    }
+
+    if (action === 'escalated') {
+      const result = await pool.query(
+        `UPDATE profile_change_requests
+         SET status = 'escalated', escalated_by = $1, escalated_at = now(), escalation_note = $2
+         WHERE id = $3 RETURNING id, status, escalation_note, escalated_at`,
+        [req.user.userId, note, req.params.id]
+      );
+
+      // Superadmin only receives emails from admins — notify superadmin of escalated request
+      const adminUserRes = await pool.query('SELECT name, email FROM users WHERE id = $1', [req.user.userId]);
+      const adminName = adminUserRes.rows[0]?.name || 'Administrator';
+      const adminEmail = adminUserRes.rows[0]?.email || 'admin';
+      const superadminTarget = getSuperadminEmails()[0] || 'honorroll.admin@gmail.com';
+
+      const { error: mailErr } = await sendEmail({
+        to: superadminTarget,
+        subject: `Escalated Student Info Change Request — ${request.organization_name}`,
+        text: `An administrator has escalated a student info change request to the superadmin queue:\n\nAdministrator: ${adminName} <${adminEmail}>\nOrganization: ${request.organization_name}\n\nStudent: ${request.student_name || 'Student'} <${request.student_email}>\nField: ${request.field}\nCurrent Value: ${request.current_value || '(none)'}\nRequested Value: ${request.requested_value}\nStudent Reason: ${request.reason || '(none)'}\n\nAdmin Escalation Note:\n${note || '(none)'}\n\n— HonorRoll`,
+      });
+      if (mailErr) console.error('Escalation email to superadmin error:', mailErr);
+
+      return res.status(200).json({ request: result.rows[0] });
+    }
+  } catch (err) {
+    console.error('Admin review profile change request error:', err);
+    res.status(500).json({ error: 'Failed to review request' });
+  }
+});
+
+// Student profile-correction requests escalated by institution admins to superadmin.
+// Defaults to escalated queue (?status=escalated); pass ?status=all to view full history.
+app.get('/api/superadmin/profile-change-requests', authenticateToken, requireSuperadmin, async (req, res) => {
+  try {
+    const statusParam = req.query.status;
+    const allowed = ['escalated', 'pending', 'approved', 'rejected'];
+    const status = allowed.includes(statusParam) ? statusParam : 'escalated';
+    const params = [];
+    let where = '';
+    if (statusParam !== 'all') {
+      params.push(status);
+      where = 'WHERE r.status = $1';
+    }
+    const result = await pool.query(
+      `SELECT r.id, r.field, r.current_value, r.requested_value, r.reason, r.status, r.review_note, r.reviewed_at, r.created_at,
+              r.escalated_at, r.escalation_note,
+              u.id AS student_id, u.email AS student_email, u.name AS student_name,
+              o.id AS organization_id, o.name AS organization_name,
+              esc.name AS escalated_by_name, esc.email AS escalated_by_email
+       FROM profile_change_requests r
+       JOIN users u ON u.id = r.user_id
+       JOIN organizations o ON o.id = r.organization_id
+       LEFT JOIN users esc ON esc.id = r.escalated_by
+       ${where}
+       ORDER BY COALESCE(r.escalated_at, r.created_at) DESC`,
+      params
+    );
+    res.status(200).json({ requests: result.rows });
+  } catch (err) {
+    console.error('Superadmin list profile change requests error:', err);
+    res.status(500).json({ error: 'Failed to load requests' });
+  }
+});
+
+// Superadmin review for escalated requests. On approval, 'name' or 'roll_number' are auto-applied to the DB.
+app.post('/api/superadmin/profile-change-requests/:id/review', authenticateToken, requireSuperadmin, async (req, res) => {
+  const status = req.body.status === 'approved' || req.body.status === 'rejected' ? req.body.status : null;
+  if (!status) return res.status(400).json({ error: "status must be 'approved' or 'rejected'" });
+  const note = req.body.note != null ? String(req.body.note).trim() || null : null;
+
+  try {
+    const reqRes = await pool.query(
+      `SELECT r.*, u.name AS student_name, u.email AS student_email, o.name AS organization_name
+       FROM profile_change_requests r
+       JOIN users u ON u.id = r.user_id
+       JOIN organizations o ON o.id = r.organization_id
+       WHERE r.id = $1`,
+      [req.params.id]
+    );
+    if (reqRes.rows.length === 0) return res.status(404).json({ error: 'Request not found' });
+    const request = reqRes.rows[0];
+    if (request.status === 'approved' || request.status === 'rejected') {
+      return res.status(409).json({ error: 'This request was already reviewed' });
+    }
+
+    if (status === 'approved') {
+      const normalizedField = request.field.trim().toLowerCase().replace(/\s+/g, '_');
+      if (normalizedField === 'name') {
+        await pool.query('UPDATE users SET name = $1 WHERE id = $2', [request.requested_value, request.user_id]);
+      } else if (normalizedField === 'roll_number' || normalizedField === 'rollnumber') {
+        await pool.query(
+          'UPDATE memberships SET roll_number = $1 WHERE user_id = $2 AND organization_id = $3',
+          [request.requested_value, request.user_id, request.organization_id]
+        );
+      }
+    }
+
+    const result = await pool.query(
+      `UPDATE profile_change_requests SET status = $1, reviewed_by = $2, reviewed_at = now(), review_note = $3
+       WHERE id = $4 RETURNING id, status, review_note, reviewed_at`,
+      [status, req.user.userId, note, req.params.id]
+    );
+
+    // Notify student of outcome
+    const { error: mailErr } = await sendEmail({
+      to: request.student_email,
+      subject: `HonorRoll — Info Change Request ${status === 'approved' ? 'Approved' : 'Update'}`,
+      text: `Hello ${request.student_name || 'Student'},\n\nYour request to change "${request.field}" to "${request.requested_value}" has been ${status === 'approved' ? 'approved' : 'rejected'}.${note ? `\n\nNote: ${note}` : ''}\n\n— HonorRoll`,
+    });
+    if (mailErr) console.error('Superadmin review notification email error:', mailErr);
+
+    res.status(200).json({ request: result.rows[0] });
+  } catch (err) {
+    console.error('Review profile change request error:', err);
+    res.status(500).json({ error: 'Failed to review request' });
+  }
+});
+
+// An institution admin's own message to the platform owner — no student
+// record required, unlike the profile-change-request escalation path above.
+app.post('/api/admin/requests', authenticateToken, requireAdmin, async (req, res) => {
+  const subject = String(req.body.subject || '').trim();
+  const message = String(req.body.message || '').trim();
+  if (!subject) return res.status(400).json({ error: 'subject is required' });
+  if (!message) return res.status(400).json({ error: 'message is required' });
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO admin_requests (organization_id, admin_user_id, subject, message)
+       VALUES ($1, $2, $3, $4) RETURNING id, subject, message, status, created_at`,
+      [req.user.organizationId, req.user.userId, subject, message]
+    );
+
+    const [adminRes, orgRes] = await Promise.all([
+      pool.query('SELECT name, email FROM users WHERE id = $1', [req.user.userId]),
+      pool.query('SELECT name FROM organizations WHERE id = $1', [req.user.organizationId]),
+    ]);
+    const adminName = adminRes.rows[0]?.name || 'Administrator';
+    const adminEmail = adminRes.rows[0]?.email || '';
+    const orgName = orgRes.rows[0]?.name || 'Unknown organization';
+    const superadminTarget = getSuperadminEmails()[0] || 'honorroll.admin@gmail.com';
+
+    const { error: mailErr } = await sendEmail({
+      to: superadminTarget,
+      subject: `Admin Request — ${orgName}: ${subject}`,
+      text: `${adminName} <${adminEmail}> from ${orgName} sent a request:\n\nSubject: ${subject}\n\n${message}\n\n— HonorRoll`,
+    });
+    if (mailErr) console.error('Admin request notification email error:', mailErr);
+
+    res.status(201).json({ request: result.rows[0] });
+  } catch (err) {
+    console.error('Create admin request error:', err);
+    res.status(500).json({ error: 'Failed to submit request' });
+  }
+});
+
+// An admin's own history of requests to the platform owner.
+app.get('/api/admin/requests', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, subject, message, status, response_note, resolved_at, created_at
+       FROM admin_requests WHERE organization_id = $1 ORDER BY created_at DESC`,
+      [req.user.organizationId]
+    );
+    res.status(200).json({ requests: result.rows });
+  } catch (err) {
+    console.error('List admin requests error:', err);
+    res.status(500).json({ error: 'Failed to load requests' });
+  }
+});
+
+// Every admin-originated request across the platform. Defaults to the open
+// queue (?status=open); pass ?status=all for full history.
+app.get('/api/superadmin/requests', authenticateToken, requireSuperadmin, async (req, res) => {
+  try {
+    const statusParam = req.query.status;
+    const status = statusParam === 'resolved' ? 'resolved' : 'open';
+    const params = [];
+    let where = '';
+    if (statusParam !== 'all') {
+      params.push(status);
+      where = 'WHERE r.status = $1';
+    }
+    const result = await pool.query(
+      `SELECT r.id, r.subject, r.message, r.status, r.response_note, r.resolved_at, r.created_at,
+              u.name AS admin_name, u.email AS admin_email,
+              o.id AS organization_id, o.name AS organization_name
+       FROM admin_requests r
+       JOIN users u ON u.id = r.admin_user_id
+       JOIN organizations o ON o.id = r.organization_id
+       ${where}
+       ORDER BY r.created_at DESC`,
+      params
+    );
+    res.status(200).json({ requests: result.rows });
+  } catch (err) {
+    console.error('Superadmin list admin requests error:', err);
+    res.status(500).json({ error: 'Failed to load requests' });
+  }
+});
+
+// Marks an admin request resolved, with an optional note the admin sees back.
+app.post('/api/superadmin/requests/:id/resolve', authenticateToken, requireSuperadmin, async (req, res) => {
+  const note = req.body.note != null ? String(req.body.note).trim() || null : null;
+  try {
+    const reqRes = await pool.query(
+      `SELECT r.*, u.name AS admin_name, u.email AS admin_email
+       FROM admin_requests r JOIN users u ON u.id = r.admin_user_id
+       WHERE r.id = $1`,
+      [req.params.id]
+    );
+    if (reqRes.rows.length === 0) return res.status(404).json({ error: 'Request not found' });
+    const request = reqRes.rows[0];
+    if (request.status === 'resolved') return res.status(409).json({ error: 'This request was already resolved' });
+
+    const result = await pool.query(
+      `UPDATE admin_requests SET status = 'resolved', resolved_by = $1, resolved_at = now(), response_note = $2
+       WHERE id = $3 RETURNING id, status, response_note, resolved_at`,
+      [req.user.userId, note, req.params.id]
+    );
+
+    if (request.admin_email) {
+      const { error: mailErr } = await sendEmail({
+        to: request.admin_email,
+        subject: `HonorRoll — Your request "${request.subject}" was resolved`,
+        text: `Hello ${request.admin_name || 'Administrator'},\n\nYour request "${request.subject}" has been marked resolved.${note ? `\n\nResponse: ${note}` : ''}\n\n— HonorRoll`,
+      });
+      if (mailErr) console.error('Admin request resolution email error:', mailErr);
+    }
+
+    res.status(200).json({ request: result.rows[0] });
+  } catch (err) {
+    console.error('Resolve admin request error:', err);
+    res.status(500).json({ error: 'Failed to resolve request' });
+  }
+});
+
+// An admin's structured request to have someone else added as a co-admin
+// of their own org — see ensureAddAdminRequestsSchema's own comment for why
+// this needs its own table instead of the free-form admin_requests above.
+app.post('/api/admin/add-admin-requests', authenticateToken, requireAdmin, async (req, res) => {
+  const newAdminName = req.body.name != null ? String(req.body.name).trim() || null : null;
+  const newAdminEmail = String(req.body.email || '').trim().toLowerCase();
+  if (!newAdminEmail) return res.status(400).json({ error: 'email is required' });
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO add_admin_requests (organization_id, requested_by, new_admin_name, new_admin_email)
+       VALUES ($1, $2, $3, $4) RETURNING id, new_admin_name, new_admin_email, status, created_at`,
+      [req.user.organizationId, req.user.userId, newAdminName, newAdminEmail]
+    );
+
+    const [requesterRes, orgRes] = await Promise.all([
+      pool.query('SELECT name, email FROM users WHERE id = $1', [req.user.userId]),
+      pool.query('SELECT name FROM organizations WHERE id = $1', [req.user.organizationId]),
+    ]);
+    const requesterName = requesterRes.rows[0]?.name || 'An administrator';
+    const requesterEmail = requesterRes.rows[0]?.email || '';
+    const orgName = orgRes.rows[0]?.name || 'Unknown organization';
+    const superadminTarget = getSuperadminEmails()[0] || 'honorroll.admin@gmail.com';
+
+    const { error: mailErr } = await sendEmail({
+      to: superadminTarget,
+      subject: `Add-admin request — ${orgName}`,
+      text: `${requesterName} <${requesterEmail}> from ${orgName} asked to have another admin added:\n\nName: ${newAdminName || '(not given)'}\nEmail: ${newAdminEmail}\n\n— HonorRoll`,
+    });
+    if (mailErr) console.error('Add-admin request notification email error:', mailErr);
+
+    res.status(201).json({ request: result.rows[0] });
+  } catch (err) {
+    console.error('Create add-admin request error:', err);
+    res.status(500).json({ error: 'Failed to submit request' });
+  }
+});
+
+app.get('/api/admin/add-admin-requests', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, new_admin_name, new_admin_email, status, review_note, reviewed_at, created_at
+       FROM add_admin_requests WHERE organization_id = $1 ORDER BY created_at DESC`,
+      [req.user.organizationId]
+    );
+    res.status(200).json({ requests: result.rows });
+  } catch (err) {
+    console.error('List add-admin requests error:', err);
+    res.status(500).json({ error: 'Failed to load requests' });
+  }
+});
+
+app.get('/api/superadmin/add-admin-requests', authenticateToken, requireSuperadmin, async (req, res) => {
+  try {
+    const statusParam = req.query.status;
+    const status = statusParam === 'pending' ? 'pending' : null;
+    const params = [];
+    let where = '';
+    if (status) {
+      params.push(status);
+      where = 'WHERE r.status = $1';
+    }
+    const result = await pool.query(
+      `SELECT r.id, r.new_admin_name, r.new_admin_email, r.status, r.review_note, r.reviewed_at, r.created_at,
+              u.name AS requested_by_name, u.email AS requested_by_email,
+              o.id AS organization_id, o.name AS organization_name
+       FROM add_admin_requests r
+       JOIN users u ON u.id = r.requested_by
+       JOIN organizations o ON o.id = r.organization_id
+       ${where}
+       ORDER BY r.created_at DESC`,
+      params
+    );
+    res.status(200).json({ requests: result.rows });
+  } catch (err) {
+    console.error('Superadmin list add-admin requests error:', err);
+    res.status(500).json({ error: 'Failed to load requests' });
+  }
+});
+
+// Shared by the add-admin-request approve route below and by
+// SuperadminOrgDetail's direct "add admin" action — both end at the same
+// place (a real admin membership in one org), just reached through a
+// different door. Reuses findOrCreateGlobalUser, same as every other "add
+// this email to my org" path (admin create-student/create-teacher, CSV
+// import). If the email already has a membership in this org (e.g. an
+// existing teacher), upgrades it to admin rather than silently no-op'ing on
+// the (user_id, organization_id) unique constraint. Pure DB work, no email —
+// caller owns the transaction and sends the welcome/notification email
+// itself only after a successful commit (see sendAddAdminEmail below).
+async function addAdminToOrganization(client, orgId, email, name) {
+  const { userId, isNew, temporaryPassword } = await findOrCreateGlobalUser(client, email, name);
+  const upsertRes = await client.query(
+    `INSERT INTO memberships (user_id, organization_id, role) VALUES ($1, $2, 'admin')
+     ON CONFLICT (user_id, organization_id) DO UPDATE SET role = 'admin'
+     RETURNING (xmax = 0) AS was_insert`,
+    [userId, orgId]
+  );
+  return { userId, isNew, temporaryPassword, wasNewMembership: upsertRes.rows[0].was_insert };
+}
+
+// Best-effort, called after addAdminToOrganization's transaction has
+// committed — never the reverse, so a mid-transaction failure can't leave
+// someone holding credentials for a membership that got rolled back.
+async function sendAddAdminEmail({ email, name, organizationName, isNew, wasNewMembership, temporaryPassword }) {
+  if (isNew) {
+    const { error: mailErr } = await sendEmail({
+      to: email,
+      subject: 'Your HonorRoll Account Credentials',
+      text: `Hello ${name || 'Administrator'},\n\n${organizationName} has set up your HonorRoll admin account.\n\nYour temporary password is: ${temporaryPassword}\n\nLogin via ${FRONTEND_URL}\n\nPlease log in and change your password after logging in.`,
+    });
+    if (mailErr) console.error('New admin welcome email error:', mailErr);
+  } else if (wasNewMembership) {
+    const { error: mailErr } = await sendEmail({
+      to: email,
+      subject: `You've been added as an admin of ${organizationName}`,
+      text: `Hello ${name || 'there'},\n\nYou've been added as an administrator of ${organizationName} on HonorRoll. Sign in with your existing HonorRoll password at ${FRONTEND_URL}.\n\n— HonorRoll`,
+    });
+    if (mailErr) console.error('Existing-user new-admin notification email error:', mailErr);
+  }
+}
+
+app.post('/api/superadmin/add-admin-requests/:id/approve', authenticateToken, requireSuperadmin, async (req, res) => {
+  const note = req.body.note != null ? String(req.body.note).trim() || null : null;
+  const client = await pool.connect();
+  try {
+    const reqRes = await client.query(
+      `SELECT r.*, o.name AS organization_name, u.email AS requested_by_email, u.name AS requested_by_name
+       FROM add_admin_requests r
+       JOIN organizations o ON o.id = r.organization_id
+       JOIN users u ON u.id = r.requested_by
+       WHERE r.id = $1`,
+      [req.params.id]
+    );
+    if (reqRes.rows.length === 0) return res.status(404).json({ error: 'Request not found' });
+    const request = reqRes.rows[0];
+    if (request.status !== 'pending') return res.status(409).json({ error: 'This request was already reviewed' });
+
+    await client.query('BEGIN');
+    const addResult = await addAdminToOrganization(client, request.organization_id, request.new_admin_email, request.new_admin_name);
+
+    const result = await client.query(
+      `UPDATE add_admin_requests SET status = 'approved', reviewed_by = $1, reviewed_at = now(), review_note = $2
+       WHERE id = $3 RETURNING id, status, review_note, reviewed_at`,
+      [req.user.userId, note, req.params.id]
+    );
+    await client.query('COMMIT');
+
+    await sendAddAdminEmail({
+      email: request.new_admin_email, name: request.new_admin_name, organizationName: request.organization_name, ...addResult,
+    });
+    if (request.requested_by_email) {
+      const { error: mailErr } = await sendEmail({
+        to: request.requested_by_email,
+        subject: `Your add-admin request was approved`,
+        text: `Hello ${request.requested_by_name || 'Administrator'},\n\nYour request to add ${request.new_admin_name || request.new_admin_email} (${request.new_admin_email}) as an admin of ${request.organization_name} has been approved.${note ? `\n\nNote: ${note}` : ''}\n\n— HonorRoll`,
+      });
+      if (mailErr) console.error('Add-admin requester notification email error:', mailErr);
+    }
+
+    res.status(200).json({ request: result.rows[0] });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Approve add-admin request error:', err);
+    res.status(500).json({ error: 'Failed to approve request' });
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/superadmin/add-admin-requests/:id/reject', authenticateToken, requireSuperadmin, async (req, res) => {
+  const note = req.body.note != null ? String(req.body.note).trim() || null : null;
+  try {
+    const reqRes = await pool.query(
+      `SELECT r.*, o.name AS organization_name, u.email AS requested_by_email, u.name AS requested_by_name
+       FROM add_admin_requests r
+       JOIN organizations o ON o.id = r.organization_id
+       JOIN users u ON u.id = r.requested_by
+       WHERE r.id = $1`,
+      [req.params.id]
+    );
+    if (reqRes.rows.length === 0) return res.status(404).json({ error: 'Request not found' });
+    const request = reqRes.rows[0];
+    if (request.status !== 'pending') return res.status(409).json({ error: 'This request was already reviewed' });
+
+    const result = await pool.query(
+      `UPDATE add_admin_requests SET status = 'rejected', reviewed_by = $1, reviewed_at = now(), review_note = $2
+       WHERE id = $3 RETURNING id, status, review_note, reviewed_at`,
+      [req.user.userId, note, req.params.id]
+    );
+
+    if (request.requested_by_email) {
+      const { error: mailErr } = await sendEmail({
+        to: request.requested_by_email,
+        subject: `Your add-admin request was declined`,
+        text: `Hello ${request.requested_by_name || 'Administrator'},\n\nYour request to add ${request.new_admin_name || request.new_admin_email} (${request.new_admin_email}) as an admin of ${request.organization_name} was declined.${note ? `\n\nReason: ${note}` : ''}\n\n— HonorRoll`,
+      });
+      if (mailErr) console.error('Add-admin requester rejection email error:', mailErr);
+    }
+
+    res.status(200).json({ request: result.rows[0] });
+  } catch (err) {
+    console.error('Reject add-admin request error:', err);
+    res.status(500).json({ error: 'Failed to reject request' });
+  }
+});
+
+// Single-org lookup — the refresh/direct-link fallback for
+// SuperadminOrgDetail: the normal path already has the org's name from the
+// row that was clicked (passed via router state), so this only actually
+// gets hit on a hard reload where that state is gone.
+app.get('/api/superadmin/organizations/:id', authenticateToken, requireSuperadmin, async (req, res) => {
   try {
     const orgRes = await pool.query('SELECT id, name FROM organizations WHERE id = $1', [req.params.id]);
     if (orgRes.rows.length === 0) return res.status(404).json({ error: 'Organization not found' });
-    const userRes = await pool.query('SELECT email FROM users WHERE id = $1', [req.user.userId]);
-
-    const token = mintSessionToken({
-      user_id: req.user.userId,
-      role: 'admin',
-      organization_id: orgRes.rows[0].id,
-      org_unit_id: null,
-    });
-    res.status(200).json({
-      token,
-      user: { id: req.user.userId, email: userRes.rows[0]?.email, role: 'admin', organization_name: orgRes.rows[0].name },
-    });
+    res.status(200).json({ organization: orgRes.rows[0] });
   } catch (err) {
-    console.error('Superadmin impersonate error:', err);
-    res.status(500).json({ error: 'Failed to enter organization' });
+    console.error('Superadmin get organization error:', err);
+    res.status(500).json({ error: 'Failed to load organization' });
+  }
+});
+
+// ============================================================================
+// SUPERADMIN ORG DETAIL — the dedicated page (not a trip through the
+// institution's own AdminDashboard) for a superadmin to see and directly
+// manage one institution: its admins, structure, billing, and roster.
+// Listing endpoints deliberately just reuse the existing admin-scoped GET
+// routes (/api/admin/students, /api/admin/teachers, /api/admin/org-units,
+// /api/admin/subjects, /api/admin/billing/status) via the X-Organization-Id
+// header override — see applySuperadminOrgOverride — since those already
+// return exactly the right shape and there's no reason to fork them. The
+// three routes below are the genuinely new capabilities that don't exist
+// anywhere else: terminating any single person's access to an org (not just
+// students, which is all the admin-facing delete route ever supported),
+// adding an admin immediately instead of through the request/approve queue,
+// and overriding the billing plan directly, bypassing Razorpay entirely.
+// ============================================================================
+
+// Terminates one person's access to one org — any role, unlike DELETE
+// /api/admin/students/:id which only ever handled students. Mirrors that
+// route's own scoping discipline: only removes THIS org's membership and
+// THIS org's data for them (a teacher's subject_teachers links here, a
+// student's submissions to this org's problems), and only drops the global
+// identity once it has zero memberships left anywhere.
+app.delete('/api/superadmin/organizations/:orgId/members/:userId', authenticateToken, requireSuperadmin, async (req, res) => {
+  const { orgId, userId } = req.params;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const target = await client.query(
+      `SELECT u.id, u.email, m.role FROM users u
+       JOIN memberships m ON m.user_id = u.id AND m.organization_id = $2
+       WHERE u.id = $1`,
+      [userId, orgId]
+    );
+    if (target.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'This person is not a member of that organization' });
+    }
+    const { email, role } = target.rows[0];
+
+    if (role === 'student') {
+      await client.query(
+        'DELETE FROM submissions WHERE user_id = $1 AND problem_id IN (SELECT id FROM problems WHERE organization_id = $2)',
+        [userId, orgId]
+      );
+    } else if (role === 'teacher') {
+      await client.query(
+        'DELETE FROM subject_teachers WHERE user_id = $1 AND subject_id IN (SELECT id FROM subjects WHERE organization_id = $2)',
+        [userId, orgId]
+      );
+    }
+    await client.query('DELETE FROM memberships WHERE user_id = $1 AND organization_id = $2', [userId, orgId]);
+    await client.query(
+      'DELETE FROM users WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM memberships WHERE user_id = $1)',
+      [userId]
+    );
+    await client.query('COMMIT');
+    res.status(200).json({ message: `${email} (${role}) was removed from this organization` });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Superadmin terminate member error:', err);
+    res.status(500).json({ error: 'Failed to remove this person' });
+  } finally {
+    client.release();
+  }
+});
+
+// Adds (or promotes) an admin immediately — the superadmin is already
+// looking at this org, so there's no reason to route through the
+// request/approve queue an institution admin has to use (see
+// addAdminToOrganization's own comment for the shared membership logic).
+app.post('/api/superadmin/organizations/:orgId/admins', authenticateToken, requireSuperadmin, async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const name = req.body.name != null ? String(req.body.name).trim() || null : null;
+  if (!email) return res.status(400).json({ error: 'email is required' });
+
+  const client = await pool.connect();
+  try {
+    const orgRes = await client.query('SELECT name FROM organizations WHERE id = $1', [req.params.orgId]);
+    if (orgRes.rows.length === 0) return res.status(404).json({ error: 'Organization not found' });
+
+    await client.query('BEGIN');
+    const addResult = await addAdminToOrganization(client, req.params.orgId, email, name);
+    await client.query('COMMIT');
+
+    await sendAddAdminEmail({ email, name, organizationName: orgRes.rows[0].name, ...addResult });
+    res.status(200).json({ userId: addResult.userId, isNew: addResult.isNew });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Superadmin add admin error:', err);
+    res.status(500).json({ error: 'Failed to add admin' });
+  } finally {
+    client.release();
+  }
+});
+
+// Directly sets an org's plan/status, bypassing Razorpay entirely — for
+// comps, manual invoicing outside Razorpay, or correcting a stuck
+// subscription. Clears any pending_* checkout-in-progress fields, same as
+// promoteSubscriptionToActive does on a real payment, so a stale pending
+// checkout can't later "complete" over top of a manual override.
+app.post('/api/superadmin/organizations/:orgId/billing/override', authenticateToken, requireSuperadmin, async (req, res) => {
+  const planKey = String(req.body.planKey || '');
+  const status = String(req.body.status || '');
+  const billingCycle = req.body.billingCycle || null;
+  const currentPeriodEnd = req.body.currentPeriodEnd ? new Date(req.body.currentPeriodEnd) : null;
+
+  if (!PLAN_CATALOG[planKey]) return res.status(400).json({ error: 'Invalid plan' });
+  if (!['free', 'created', 'authenticated', 'active', 'pending', 'halted', 'cancelled', 'completed', 'expired'].includes(status)) {
+    return res.status(400).json({ error: 'Invalid status' });
+  }
+  if (billingCycle && !BILLING_CYCLES.includes(billingCycle)) return res.status(400).json({ error: 'Invalid billing cycle' });
+
+  try {
+    await ensureSubscriptionsSchema();
+    const result = await pool.query(
+      `INSERT INTO subscriptions (organization_id, plan_key, status, billing_cycle, current_period_end)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (organization_id) DO UPDATE SET
+         plan_key = $2, status = $3, billing_cycle = $4, current_period_end = $5,
+         pending_plan_key = NULL, pending_billing_cycle = NULL, pending_razorpay_subscription_id = NULL,
+         updated_at = now()
+       RETURNING *`,
+      [req.params.orgId, planKey, status, billingCycle, currentPeriodEnd]
+    );
+    res.status(200).json({ subscription: result.rows[0] });
+  } catch (err) {
+    console.error('Superadmin billing override error:', err);
+    res.status(500).json({ error: 'Failed to override billing' });
   }
 });
 
@@ -3824,15 +5903,22 @@ app.post('/api/superadmin/organizations/:id/impersonate', authenticateToken, req
 // usable token yet; the client gets a short-lived pre-auth token and a list
 // of organizations to choose from, and completes login via
 // POST /api/login/select-organization below.
+const LOGIN_AUDIENCES = ['student', 'teacher', 'admin', 'superadmin'];
+
 app.post('/api/login', async (req, res) => {
   const { email, password } = req.body;
+  // Optional for backward compatibility with any caller that predates the
+  // audience selector (there shouldn't be one left, but this isn't the
+  // route to break on a missing field) — when omitted, every role is
+  // accepted, same as before this existed.
+  const audience = LOGIN_AUDIENCES.includes(req.body.audience) ? req.body.audience : null;
 
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required' });
   }
 
   try {
-    const userResult = await pool.query('SELECT id, password_hash, name FROM users WHERE email = $1', [email]);
+    const userResult = await pool.query('SELECT id, password_hash, name, tos_accepted_at FROM users WHERE email = $1', [email]);
     if (userResult.rows.length === 0) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
@@ -3844,7 +5930,7 @@ app.post('/api/login', async (req, res) => {
     }
 
     const memberships = await pool.query(
-      `SELECT m.role, m.organization_id, m.org_unit_id, o.name AS organization_name
+      `SELECT m.role, m.organization_id, m.org_unit_id, o.name AS organization_name, o.status AS organization_status
        FROM memberships m JOIN organizations o ON o.id = m.organization_id
        WHERE m.user_id = $1
        ORDER BY o.name ASC`,
@@ -3854,9 +5940,11 @@ app.post('/api/login', async (req, res) => {
     if (memberships.rows.length === 0) {
       // A platform-owner account legitimately has zero tenant memberships —
       // they're not staff at any one school. Mint a superadmin session
-      // instead of bouncing them, but only for an allowlisted email; anyone
-      // else with zero memberships still gets the ordinary rejection.
-      if (getSuperadminEmails().includes(email.toLowerCase())) {
+      // instead of bouncing them, but only for an allowlisted email AND
+      // only when the caller actually selected Super Admin — same "the
+      // selected tab is a real filter, not just a label" rule as every
+      // other role below, see LOGIN_AUDIENCES' own comment there.
+      if ((audience === null || audience === 'superadmin') && getSuperadminEmails().includes(email.toLowerCase())) {
         const token = jwt.sign({ userId: user.id, role: 'superadmin' }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRATION || '24h' });
         return res.status(200).json({
           message: 'Login successful',
@@ -3864,11 +5952,52 @@ app.post('/api/login', async (req, res) => {
           user: { id: user.id, email, role: 'superadmin', name: user.name },
         });
       }
+      if (audience && audience !== 'superadmin' && getSuperadminEmails().includes(email.toLowerCase())) {
+        return res.status(401).json({ error: 'Invalid email, password, or account type selected' });
+      }
       return res.status(403).json({ error: 'No organization membership found. Contact your administrator.' });
     }
 
-    if (memberships.rows.length === 1) {
-      const m = memberships.rows[0];
+    // A terminated org (superadmin blacklist, see POST /api/superadmin/
+    // organizations/:id/terminate) is excluded here entirely — nobody logs
+    // into one until it's reinstated. Filtered per-membership, not per-user:
+    // the same person can still log into any OTHER, non-terminated org they
+    // belong to.
+    let usableMemberships = memberships.rows.filter((m) => m.organization_status !== 'terminated');
+    if (usableMemberships.length === 0) {
+      return res.status(403).json({ error: "This institution's access has been suspended by the platform owner. Contact your administrator." });
+    }
+
+    // The login form's audience tabs (Student/Teacher/Admin/Super Admin)
+    // used to be pure labeling — any tab plus a valid password logged you
+    // into whatever your real role happened to be. That let a student's
+    // own credentials silently succeed with "Teacher" selected, landing
+    // them in the student area with no explanation. Now the tab is a real
+    // filter: only memberships matching the selected role are eligible,
+    // and picking the wrong one for a real account is a rejection, not a
+    // silent redirect — same non-disclosure posture as "Invalid email or
+    // password" above, so this never confirms which role an email actually
+    // has.
+    if (audience) {
+      const roleMatched = usableMemberships.filter((m) => m.role === audience);
+      if (roleMatched.length === 0) {
+        return res.status(401).json({ error: 'Invalid email, password, or account type selected' });
+      }
+      usableMemberships = roleMatched;
+    }
+
+    if (usableMemberships.length === 1) {
+      const m = usableMemberships[0];
+      // Admin already accepted at signup — never gated. Teacher/student
+      // accounts are created BY an admin, so this first login is their one
+      // chance to collect it (see mintTosPendingToken's own comment).
+      if (m.role !== 'admin' && !user.tos_accepted_at) {
+        const tosPendingToken = mintTosPendingToken({ user_id: user.id, role: m.role, organization_id: m.organization_id, org_unit_id: m.org_unit_id });
+        return res.status(200).json({
+          requiresTosAcceptance: true,
+          tosPendingToken,
+        });
+      }
       const token = mintSessionToken({ user_id: user.id, role: m.role, organization_id: m.organization_id, org_unit_id: m.org_unit_id });
       // Returned in the body, not set as a cookie â€” see authenticateToken for
       // why. The frontend stores this and attaches it as an Authorization
@@ -3888,7 +6017,7 @@ app.post('/api/login', async (req, res) => {
     res.status(200).json({
       requiresOrgSelection: true,
       preAuthToken,
-      organizations: memberships.rows.map((m) => ({
+      organizations: usableMemberships.map((m) => ({
         organizationId: m.organization_id,
         organizationName: m.organization_name,
         role: m.role,
@@ -3922,7 +6051,8 @@ app.post('/api/login/select-organization', async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT u.id AS user_id, u.email, u.name, m.role, m.organization_id, m.org_unit_id, o.name AS organization_name
+      `SELECT u.id AS user_id, u.email, u.name, u.tos_accepted_at, m.role, m.organization_id, m.org_unit_id,
+              o.name AS organization_name, o.status AS organization_status
        FROM memberships m
        JOIN users u ON u.id = m.user_id
        JOIN organizations o ON o.id = m.organization_id
@@ -3932,8 +6062,24 @@ app.post('/api/login/select-organization', async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Not a member of that organization' });
     }
+    // Re-checked here too, not just in the organization list POST /api/login
+    // hands back — that list can be up to 10 minutes stale by the time this
+    // fires (the preAuthToken's own lifetime).
+    if (result.rows[0].organization_status === 'terminated') {
+      return res.status(403).json({ error: "This institution's access has been suspended by the platform owner. Contact your administrator." });
+    }
 
     const m = result.rows[0];
+    // Same gate as the single-membership fast path in POST /api/login —
+    // see mintTosPendingToken's own comment for why teacher/student is
+    // checked here and admin never is.
+    if (m.role !== 'admin' && !m.tos_accepted_at) {
+      const tosPendingToken = mintTosPendingToken(m);
+      return res.status(200).json({
+        requiresTosAcceptance: true,
+        tosPendingToken,
+      });
+    }
     const token = mintSessionToken(m);
     res.status(200).json({
       message: 'Login successful',
@@ -3942,6 +6088,54 @@ app.post('/api/login/select-organization', async (req, res) => {
     });
   } catch (error) {
     console.error('Select-organization error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Completes a teacher/student's first-login Terms of Service acceptance
+// (see mintTosPendingToken/requiresTosAcceptance above): verifies the
+// short-lived tos-pending token, records acceptance, then mints and
+// returns the exact same real-session-token response either login
+// completion route would have returned had acceptance not been needed —
+// the frontend's post-login handling doesn't need to know which path it
+// came through.
+app.post('/api/login/accept-tos', async (req, res) => {
+  const { tosPendingToken } = req.body;
+  if (!tosPendingToken) return res.status(400).json({ error: 'tosPendingToken is required' });
+
+  let payload;
+  try {
+    payload = jwt.verify(tosPendingToken, process.env.JWT_SECRET);
+  } catch {
+    return res.status(401).json({ error: 'Login session expired — please sign in again' });
+  }
+  if (payload.type !== 'tos-pending') {
+    return res.status(401).json({ error: 'Invalid login session' });
+  }
+
+  try {
+    const result = await pool.query(
+      `UPDATE users SET tos_accepted_at = now() WHERE id = $1 RETURNING id, email, name`,
+      [payload.userId]
+    );
+    if (result.rows.length === 0) return res.status(401).json({ error: 'Session no longer valid' });
+    const user = result.rows[0];
+
+    const orgRes = await pool.query('SELECT name FROM organizations WHERE id = $1', [payload.organizationId]);
+
+    const token = mintSessionToken({
+      user_id: payload.userId,
+      role: payload.role,
+      organization_id: payload.organizationId,
+      org_unit_id: payload.orgUnitId,
+    });
+    res.status(200).json({
+      message: 'Login successful',
+      token,
+      user: { id: user.id, email: user.email, role: payload.role, name: user.name, organization_name: orgRes.rows[0]?.name },
+    });
+  } catch (error) {
+    console.error('Accept-ToS error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -3997,7 +6191,357 @@ app.get('/api/me', authenticateToken, async (req, res) => {
   }
 });
 
-// Stateless token, so there's nothing server-side to invalidate here â€” the
+// Every organization this user belongs to, with their role in each — the
+// authenticated equivalent of the org-picker query POST /api/login already
+// runs pre-auth for a multi-membership user (see the preAuthToken flow),
+// reused here keyed on the verified session's own userId instead. Exists
+// for the cross-institution student dashboard (GET /api/me/performance
+// below): unlike every other /api/me/* route, this one deliberately does
+// NOT scope by req.user.organizationId — the whole point is listing every
+// org, not just the current session's one. Works for a superadmin session
+// too (which has no organizationId of its own) since it just returns an
+// empty list for them rather than erroring.
+app.get('/api/me/organizations', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT m.organization_id, o.name AS organization_name, m.role, m.org_unit_id, m.roll_number
+       FROM memberships m
+       JOIN organizations o ON o.id = m.organization_id
+       WHERE m.user_id = $1
+       ORDER BY o.name ASC`,
+      [req.user.userId]
+    );
+    res.status(200).json({ organizations: result.rows });
+  } catch (err) {
+    console.error('List my organizations error:', err);
+    res.status(500).json({ error: 'Failed to load organizations' });
+  }
+});
+
+// A student's own request to correct their roster info.
+// Routed to their institution's admin queue. Sends an email notification to the
+// organization's admin(s).
+// Student-only: a teacher/admin's own details are already directly
+// editable by their institution's admin, so this route isn't for them.
+app.post('/api/me/profile-change-requests', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'student') {
+    return res.status(403).json({ error: 'Student access required' });
+  }
+  const field = String(req.body.field || '').trim();
+  const requestedValue = String(req.body.requestedValue || '').trim();
+  const currentValue = req.body.currentValue != null ? String(req.body.currentValue).trim() || null : null;
+  const reason = req.body.reason != null ? String(req.body.reason).trim() || null : null;
+  if (!field) return res.status(400).json({ error: 'field is required' });
+  if (!requestedValue) return res.status(400).json({ error: 'requestedValue is required' });
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO profile_change_requests (organization_id, user_id, field, current_value, requested_value, reason)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, field, current_value, requested_value, reason, status, created_at`,
+      [req.user.organizationId, req.user.userId, field, currentValue, requestedValue, reason]
+    );
+
+    // Look up the institution admin(s) and student details to notify the admin(s)
+    const [adminsRes, studentRes] = await Promise.all([
+      pool.query(
+        `SELECT u.email, u.name, o.name AS organization_name
+         FROM users u
+         JOIN memberships m ON m.user_id = u.id
+         JOIN organizations o ON o.id = m.organization_id
+         WHERE m.organization_id = $1 AND m.role = 'admin'`,
+        [req.user.organizationId]
+      ),
+      pool.query('SELECT name, email FROM users WHERE id = $1', [req.user.userId]),
+    ]);
+
+    const studentName = studentRes.rows[0]?.name || 'Student';
+    const studentEmail = studentRes.rows[0]?.email || '';
+    const orgName = adminsRes.rows[0]?.organization_name || 'your institution';
+
+    for (const admin of adminsRes.rows) {
+      if (admin.email) {
+        const { error: mailErr } = await sendEmail({
+          to: admin.email,
+          subject: `HonorRoll — Student Info Change Request (${studentName})`,
+          text: `Hello ${admin.name || 'Admin'},\n\nA student in ${orgName} has submitted a request query regarding an info change:\n\nStudent: ${studentName} <${studentEmail}>\nField: ${field}\nCurrent Value: ${currentValue || '(none)'}\nRequested Value: ${requestedValue}\nReason: ${reason || '(none)'}\n\nPlease review this request in your Admin Dashboard under Students.\n\n— HonorRoll`,
+        });
+        if (mailErr) console.error(`Failed to notify admin ${admin.email} of profile change request:`, mailErr);
+      }
+    }
+
+    res.status(201).json({ request: result.rows[0] });
+  } catch (err) {
+    console.error('Create profile change request error:', err);
+    res.status(500).json({ error: 'Failed to submit request' });
+  }
+});
+
+// A student's own history of requests, across every institution they've
+// filed one from — same "not scoped to req.user.organizationId" posture as
+// GET /api/me/organizations, since the point is the student's whole
+// history, not just the current session's org.
+app.get('/api/me/profile-change-requests', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'student') {
+    return res.status(403).json({ error: 'Student access required' });
+  }
+  try {
+    const result = await pool.query(
+      `SELECT r.id, r.organization_id, o.name AS organization_name, r.field, r.current_value, r.requested_value,
+              r.reason, r.status, r.review_note, r.reviewed_at, r.created_at
+       FROM profile_change_requests r
+       JOIN organizations o ON o.id = r.organization_id
+       WHERE r.user_id = $1
+       ORDER BY r.created_at DESC`,
+      [req.user.userId]
+    );
+    res.status(200).json({ requests: result.rows });
+  } catch (err) {
+    console.error('List my profile change requests error:', err);
+    res.status(500).json({ error: 'Failed to load requests' });
+  }
+});
+
+// Cross-institution performance summary — every organization this user is a
+// STUDENT in (a role they're a teacher/admin of elsewhere doesn't belong on
+// a "my results" view), each with a rolled-up assignment/exam percent for
+// just that org. Reuses getAssignmentPerformance/getExamPerformance (built
+// for the teacher dashboard) with a single-student `studentIds` array —
+// less efficient than a true bulk query, but a student is realistically in
+// a handful of orgs at most, so the per-org round trip is cheap in practice.
+app.get('/api/me/performance', authenticateToken, async (req, res) => {
+  try {
+    const membershipsRes = await pool.query(
+      `SELECT m.organization_id, o.name AS organization_name, m.org_unit_id
+       FROM memberships m JOIN organizations o ON o.id = m.organization_id
+       WHERE m.user_id = $1 AND m.role = 'student'
+       ORDER BY o.name ASC`,
+      [req.user.userId]
+    );
+
+    const organizations = await Promise.all(membershipsRes.rows.map(async (m) => {
+      const { problems, exams } = await getStudentScopedAssignmentsAndExams(m.organization_id, m.org_unit_id);
+      const [{ byUser: aByUser }, { byUser: eByUser }, legacyRes] = await Promise.all([
+        getAssignmentPerformance(problems, [req.user.userId]),
+        getExamPerformance(exams, [req.user.userId]),
+        pool.query('SELECT assignment_score_percent, exam_score_percent FROM legacy_scores WHERE organization_id = $1 AND user_id = $2', [m.organization_id, req.user.userId]),
+      ]);
+      const aMap = aByUser.get(req.user.userId) || new Map();
+      const eMap = eByUser.get(req.user.userId) || new Map();
+      const legacyAssignment = legacyRes.rows.map((r) => r.assignment_score_percent).filter((v) => v != null);
+      const legacyExam = legacyRes.rows.map((r) => r.exam_score_percent).filter((v) => v != null);
+      const avgAssignmentPercent = averagePercentWithExtra(aMap, legacyAssignment);
+      const avgExamPercent = averagePercentWithExtra(eMap, legacyExam);
+      const tags = await getPercentileAndGradeTags(m.organization_id, avgAssignmentPercent, avgExamPercent);
+      return {
+        organizationId: m.organization_id,
+        organizationName: m.organization_name,
+        assignmentsTotal: problems.length,
+        assignmentsSubmitted: aMap.size,
+        avgAssignmentPercent,
+        examsTotal: exams.length,
+        examsAttempted: eMap.size,
+        avgExamPercent,
+        ...tags,
+      };
+    }));
+
+    res.status(200).json({ organizations });
+  } catch (err) {
+    console.error('My performance error:', err);
+    res.status(500).json({ error: 'Failed to load performance' });
+  }
+});
+
+// One organization's full breakdown for the caller's own student
+// membership there — 404s if they aren't actually a student in that org
+// (rather than leaking whether the org id even exists).
+app.get('/api/me/performance/:organizationId', authenticateToken, async (req, res) => {
+  try {
+    const organizationId = Number(req.params.organizationId);
+    const membershipRes = await pool.query(
+      `SELECT m.org_unit_id, o.name AS organization_name
+       FROM memberships m JOIN organizations o ON o.id = m.organization_id
+       WHERE m.user_id = $1 AND m.organization_id = $2 AND m.role = 'student'`,
+      [req.user.userId, organizationId]
+    );
+    if (membershipRes.rows.length === 0) return res.status(404).json({ error: 'Not enrolled in this organization' });
+    const { org_unit_id: orgUnitId, organization_name: organizationName } = membershipRes.rows[0];
+
+    const { problems, exams } = await getStudentScopedAssignmentsAndExams(organizationId, orgUnitId);
+    const [{ byUser: aByUser }, { byUser: eByUser }, legacyRes] = await Promise.all([
+      getAssignmentPerformance(problems, [req.user.userId]),
+      getExamPerformance(exams, [req.user.userId]),
+      pool.query(
+        'SELECT academic_year, assignment_score_percent, exam_score_percent, notes FROM legacy_scores WHERE organization_id = $1 AND user_id = $2 ORDER BY academic_year DESC',
+        [organizationId, req.user.userId]
+      ),
+    ]);
+    const aMap = aByUser.get(req.user.userId) || new Map();
+    const eMap = eByUser.get(req.user.userId) || new Map();
+
+    // Per-item percentile for the "Overall" graphs' percentile-trend view on
+    // MyPerformance (see POST /api/problems/:id/result for the single-item
+    // version this mirrors) — one query per type covering every
+    // problem/exam at once, grouped in JS, rather than N population
+    // queries for N items.
+    const visibility = await getTagVisibility(organizationId);
+    const percentileByProblem = new Map();
+    const percentileByExam = new Map();
+    if (visibility.show_percentile_tag) {
+      const codeProblemIds = problems.filter((p) => p.submission_mode === 'code').map((p) => p.id);
+      const scanProblemIds = problems.filter((p) => p.submission_mode === 'scan').map((p) => p.id);
+      const byProblem = new Map();
+      if (codeProblemIds.length > 0) {
+        const bestRes = await pool.query(
+          `SELECT DISTINCT ON (user_id, problem_id) user_id, problem_id, passed_count, total_count
+           FROM submissions WHERE problem_id = ANY($1::int[])
+           ORDER BY user_id, problem_id, (status = 'Accepted') DESC, passed_count DESC, created_at DESC`,
+          [codeProblemIds]
+        );
+        for (const r of bestRes.rows) {
+          if (r.total_count <= 0) continue;
+          if (!byProblem.has(r.problem_id)) byProblem.set(r.problem_id, []);
+          byProblem.get(r.problem_id).push({ userId: r.user_id, pct: (r.passed_count / r.total_count) * 100 });
+        }
+      }
+      if (scanProblemIds.length > 0) {
+        // Mirrors getAssignmentPerformance's own scan-mode branch — a scan
+        // submission's percent comes from summed question marks, not a
+        // passed/total test-case count.
+        const scanRes = await pool.query(
+          `SELECT ss.user_id, ss.problem_id, SUM(q.marks) AS max_marks, SUM(sa.marks_awarded) AS awarded,
+                  BOOL_AND(sa.marks_awarded IS NOT NULL) AS fully_graded
+           FROM scan_submissions ss
+           JOIN scan_assignment_questions q ON q.problem_id = ss.problem_id
+           LEFT JOIN scan_submission_answers sa ON sa.submission_id = ss.id AND sa.question_id = q.id
+           WHERE ss.problem_id = ANY($1::int[])
+           GROUP BY ss.user_id, ss.problem_id`,
+          [scanProblemIds]
+        );
+        for (const r of scanRes.rows) {
+          if (!r.fully_graded || !(Number(r.max_marks) > 0)) continue;
+          if (!byProblem.has(r.problem_id)) byProblem.set(r.problem_id, []);
+          byProblem.get(r.problem_id).push({ userId: r.user_id, pct: (Number(r.awarded) / Number(r.max_marks)) * 100 });
+        }
+      }
+      for (const [problemId, rows] of byProblem) {
+        const mine = rows.find((r) => r.userId === req.user.userId);
+        if (!mine) continue;
+        const tierFor = computePercentileTiers(rows.map((r) => r.pct));
+        percentileByProblem.set(problemId, tierFor(mine.pct).percentile);
+      }
+      if (exams.length > 0) {
+        const examIds = exams.map((e) => e.id);
+        const attemptsRes = await pool.query(
+          `SELECT a.exam_id, a.user_id, a.score, e.total_marks,
+                  NOT EXISTS (
+                    SELECT 1 FROM exam_answers ea JOIN exam_items ei ON ei.id = ea.item_id
+                    WHERE ea.attempt_id = a.id AND ei.type IN ('short', 'long') AND ea.marks_awarded IS NULL
+                  ) AND NOT EXISTS (
+                    SELECT 1 FROM exam_scan_answers esa WHERE esa.attempt_id = a.id AND esa.marks_awarded IS NULL
+                  ) AS fully_graded
+           FROM exam_attempts a JOIN exams e ON e.id = a.exam_id
+           WHERE a.exam_id = ANY($1::int[]) AND a.status = 'submitted' AND e.total_marks > 0`,
+          [examIds]
+        );
+        const byExam = new Map();
+        for (const r of attemptsRes.rows) {
+          if (!r.fully_graded) continue;
+          if (!byExam.has(r.exam_id)) byExam.set(r.exam_id, []);
+          byExam.get(r.exam_id).push({ userId: r.user_id, pct: (r.score / r.total_marks) * 100 });
+        }
+        for (const [examId, rows] of byExam) {
+          const mine = rows.find((r) => r.userId === req.user.userId);
+          if (!mine) continue;
+          const tierFor = computePercentileTiers(rows.map((r) => r.pct));
+          percentileByExam.set(examId, tierFor(mine.pct).percentile);
+        }
+      }
+    }
+
+    const [problemMetaRes, examMetaRes, scanRemarksRes, examRemarksRes] = await Promise.all([
+      problems.length
+        ? pool.query(
+            `SELECT p.id, p.title, s.name AS subject_name FROM problems p
+             LEFT JOIN subjects s ON s.id = p.subject_id WHERE p.id = ANY($1::int[])`,
+            [problems.map((p) => p.id)]
+          )
+        : { rows: [] },
+      exams.length
+        ? pool.query(
+            `SELECT e.id, e.title, s.name AS subject_name FROM exams e
+             LEFT JOIN subjects s ON s.id = e.subject_id WHERE e.id = ANY($1::int[])`,
+            [exams.map((e) => e.id)]
+          )
+        : { rows: [] },
+      problems.length
+        ? pool.query('SELECT problem_id, overall_remarks FROM scan_submissions WHERE user_id = $1 AND problem_id = ANY($2::int[])', [req.user.userId, problems.map((p) => p.id)])
+        : { rows: [] },
+      exams.length
+        ? pool.query('SELECT exam_id, overall_remarks FROM exam_attempts WHERE user_id = $1 AND exam_id = ANY($2::int[])', [req.user.userId, exams.map((e) => e.id)])
+        : { rows: [] },
+    ]);
+    const problemMetaById = new Map(problemMetaRes.rows.map((r) => [r.id, r]));
+    const examMetaById = new Map(examMetaRes.rows.map((r) => [r.id, r]));
+    const scanRemarksByProblem = new Map(scanRemarksRes.rows.map((r) => [r.problem_id, r.overall_remarks]));
+    const examRemarksByExam = new Map(examRemarksRes.rows.map((r) => [r.exam_id, r.overall_remarks]));
+
+    const assignments = problems.map((p) => {
+      const meta = problemMetaById.get(p.id);
+      const entry = aMap.get(p.id);
+      return {
+        problemId: p.id,
+        title: meta?.title,
+        subjectName: meta?.subject_name,
+        status: entry?.status || 'not_submitted',
+        percent: entry?.pct ?? null,
+        percentile: percentileByProblem.has(p.id) ? percentileByProblem.get(p.id) : null,
+        remarks: scanRemarksByProblem.get(p.id) || null,
+      };
+    });
+
+    const examsOut = exams.map((e) => {
+      const meta = examMetaById.get(e.id);
+      const entry = eMap.get(e.id);
+      return {
+        examId: e.id,
+        title: meta?.title,
+        subjectName: meta?.subject_name,
+        status: entry?.status || 'not_attempted',
+        percent: entry?.pct ?? null,
+        percentile: percentileByExam.has(e.id) ? percentileByExam.get(e.id) : null,
+        remarks: examRemarksByExam.get(e.id) || null,
+      };
+    });
+
+    const legacyAssignment = legacyRes.rows.map((r) => r.assignment_score_percent).filter((v) => v != null);
+    const legacyExam = legacyRes.rows.map((r) => r.exam_score_percent).filter((v) => v != null);
+    const avgAssignmentPercent = averagePercentWithExtra(aMap, legacyAssignment);
+    const avgExamPercent = averagePercentWithExtra(eMap, legacyExam);
+    const tags = await getPercentileAndGradeTags(organizationId, avgAssignmentPercent, avgExamPercent);
+
+    res.status(200).json({
+      organizationId,
+      organizationName,
+      assignments,
+      exams: examsOut,
+      historicalScores: legacyRes.rows.map((r) => ({
+        academicYear: r.academic_year,
+        assignmentScorePercent: r.assignment_score_percent,
+        examScorePercent: r.exam_score_percent,
+        notes: r.notes,
+      })),
+      avgAssignmentPercent,
+      avgExamPercent,
+      ...tags,
+    });
+  } catch (err) {
+    console.error('My performance detail error:', err);
+    res.status(500).json({ error: 'Failed to load performance' });
+  }
+});
+
+// Stateless token, so there's nothing server-side to invalidate here — the
 // frontend just discards the token from localStorage. This route stays
 // mainly so AuthContext has a consistent place to call, and so a future
 // token-blacklist (if ever needed) has a natural home.
@@ -4140,18 +6684,22 @@ app.get('/api/problems', authenticateToken, async (req, res) => {
 
     const withStatus = result.rows.map((p) => ({ ...p, status: getProblemStatus(p) }));
 
-    // Students never see an assignment before its opens_at; admins see everything
-    // (open, closed, and upcoming) so they can manage the whole set.
-    let visible = req.user.role === 'admin'
-      ? withStatus
-      : withStatus.filter((p) => p.status !== 'upcoming');
+    // Students never see an assignment before its opens_at; admins AND
+    // teachers see everything (open, closed, and upcoming) so they can
+    // manage the whole set — a teacher who just created an assignment
+    // needs to see it immediately, same as an admin would.
+    let visible = req.user.role === 'student'
+      ? withStatus.filter((p) => p.status !== 'upcoming')
+      : withStatus;
 
     // Subject visibility: a subject attached at "Department" reaches every
     // unit beneath it (e.g. every year), so this checks the student's own
     // unit AND all of its ancestors — not the unit alone. An item with no
     // subject at all (subject_id NULL) stays org-wide visible, same as
-    // every problem behaved before this feature existed.
-    if (req.user.role !== 'admin') {
+    // every problem behaved before this feature existed. Only applies to
+    // students — teachers/admins manage the whole org's set regardless of
+    // their own unit.
+    if (req.user.role === 'student') {
       const visibleSubjectIds = await getVisibleSubjectIds(req.user.orgUnitId);
       visible = visible.filter((p) => p.subject_id == null || visibleSubjectIds.includes(p.subject_id));
     }
@@ -4208,7 +6756,7 @@ app.get('/api/problems/:id', authenticateToken, async (req, res) => {
     if (problemRes.rows.length === 0) return res.status(404).json({ error: 'Problem not found' });
 
     const status = getProblemStatus(problemRes.rows[0]);
-    if (status === 'upcoming' && req.user.role !== 'admin') {
+    if (status === 'upcoming' && req.user.role === 'student') {
       return res.status(403).json({ error: 'This assignment is not open yet' });
     }
 
@@ -4257,59 +6805,118 @@ app.get('/api/problems/:id', authenticateToken, async (req, res) => {
 app.get('/api/problems/:id/result', authenticateToken, async (req, res) => {
   const problemId = req.params.id;
   try {
-    const bestRes = await pool.query(
-      `SELECT passed_count, total_count FROM submissions
-       WHERE user_id = $1 AND problem_id = $2
-       ORDER BY (status = 'Accepted') DESC, passed_count DESC, created_at DESC LIMIT 1`,
-      [req.user.userId, problemId]
-    );
-    if (bestRes.rows.length === 0) return res.status(404).json({ error: 'No submission found for this assignment' });
-
-    const problemRes = await pool.query('SELECT closes_at FROM problems WHERE id = $1 AND organization_id = $2', [problemId, req.user.organizationId]);
+    const problemRes = await pool.query('SELECT submission_mode, closes_at FROM problems WHERE id = $1 AND organization_id = $2', [problemId, req.user.organizationId]);
     if (problemRes.rows.length === 0) return res.status(404).json({ error: 'Assignment not found' });
+    const isScan = problemRes.rows[0].submission_mode === 'scan';
 
-    if (problemRes.rows[0].closes_at && new Date(problemRes.rows[0].closes_at) > new Date()) {
-      return res.status(200).json({ status: 'pending', reason: 'deadline' });
+    let myPercentage;
+    let problemPercentages;
+    let overallAvgByUser; // Map<userId, avgPercentage> across every problem of this SAME mode, own deadline passed
+
+    if (isScan) {
+      const mineRes = await pool.query(
+        `SELECT SUM(q.marks) AS max_marks, SUM(sa.marks_awarded) AS awarded, BOOL_AND(sa.marks_awarded IS NOT NULL) AS fully_graded
+         FROM scan_submissions ss
+         JOIN scan_assignment_questions q ON q.problem_id = ss.problem_id
+         LEFT JOIN scan_submission_answers sa ON sa.submission_id = ss.id AND sa.question_id = q.id
+         WHERE ss.user_id = $1 AND ss.problem_id = $2
+         GROUP BY ss.id`,
+        [req.user.userId, problemId]
+      );
+      if (mineRes.rows.length === 0) return res.status(404).json({ error: 'No submission found for this assignment' });
+      if (!mineRes.rows[0].fully_graded) return res.status(200).json({ status: 'pending', reason: 'grading' });
+
+      if (problemRes.rows[0].closes_at && new Date(problemRes.rows[0].closes_at) > new Date()) {
+        return res.status(200).json({ status: 'pending', reason: 'deadline' });
+      }
+
+      myPercentage = Number(mineRes.rows[0].max_marks) > 0 ? (Number(mineRes.rows[0].awarded) / Number(mineRes.rows[0].max_marks)) * 100 : 0;
+
+      const allRes = await pool.query(
+        `SELECT ss.user_id, SUM(q.marks) AS max_marks, SUM(sa.marks_awarded) AS awarded, BOOL_AND(sa.marks_awarded IS NOT NULL) AS fully_graded
+         FROM scan_submissions ss
+         JOIN scan_assignment_questions q ON q.problem_id = ss.problem_id
+         LEFT JOIN scan_submission_answers sa ON sa.submission_id = ss.id AND sa.question_id = q.id
+         WHERE ss.problem_id = $1
+         GROUP BY ss.id`,
+        [problemId]
+      );
+      problemPercentages = allRes.rows
+        .filter((r) => r.fully_graded && Number(r.max_marks) > 0)
+        .map((r) => (Number(r.awarded) / Number(r.max_marks)) * 100);
+
+      const overallRes = await pool.query(
+        `SELECT best.user_id, AVG(best.pct) AS avg_percentage FROM (
+           SELECT ss.user_id, ss.problem_id, SUM(q.marks) AS max_marks, SUM(sa.marks_awarded) AS awarded,
+                  BOOL_AND(sa.marks_awarded IS NOT NULL) AS fully_graded,
+                  (SUM(sa.marks_awarded)::float / NULLIF(SUM(q.marks), 0) * 100) AS pct
+           FROM scan_submissions ss
+           JOIN scan_assignment_questions q ON q.problem_id = ss.problem_id
+           JOIN problems p ON p.id = ss.problem_id
+           LEFT JOIN scan_submission_answers sa ON sa.submission_id = ss.id AND sa.question_id = q.id
+           WHERE p.organization_id = $1 AND (p.closes_at IS NULL OR p.closes_at <= now())
+           GROUP BY ss.id, ss.user_id, ss.problem_id
+         ) best
+         WHERE best.fully_graded AND best.pct IS NOT NULL
+         GROUP BY best.user_id`,
+        [req.user.organizationId]
+      );
+      overallAvgByUser = new Map(overallRes.rows.map((r) => [r.user_id, Number(r.avg_percentage)]));
+    } else {
+      const bestRes = await pool.query(
+        `SELECT passed_count, total_count FROM submissions
+         WHERE user_id = $1 AND problem_id = $2
+         ORDER BY (status = 'Accepted') DESC, passed_count DESC, created_at DESC LIMIT 1`,
+        [req.user.userId, problemId]
+      );
+      if (bestRes.rows.length === 0) return res.status(404).json({ error: 'No submission found for this assignment' });
+
+      if (problemRes.rows[0].closes_at && new Date(problemRes.rows[0].closes_at) > new Date()) {
+        return res.status(200).json({ status: 'pending', reason: 'deadline' });
+      }
+
+      const best = bestRes.rows[0];
+      myPercentage = best.total_count > 0 ? (best.passed_count / best.total_count) * 100 : 0;
+
+      // Per-assignment percentile, among every student's best submission for
+      // this problem. No deadline filter needed on the population itself —
+      // we only ever reach this line once this problem's own closes_at has
+      // already passed.
+      const allBestRes = await pool.query(
+        `SELECT DISTINCT ON (user_id) user_id, passed_count, total_count
+         FROM submissions WHERE problem_id = $1
+         ORDER BY user_id, (status = 'Accepted') DESC, passed_count DESC, created_at DESC`,
+        [problemId]
+      );
+      problemPercentages = allBestRes.rows
+        .filter((r) => r.total_count > 0)
+        .map((r) => (r.passed_count / r.total_count) * 100);
+
+      // Overall (assignments) percentile: every student's average best-submission
+      // % across every problem they've submitted to, only counting problems
+      // whose own deadline has already passed — same fairness rule as exams'
+      // "overall" so a still-open assignment elsewhere can't skew it early.
+      const overallRes = await pool.query(
+        `SELECT best.user_id, AVG(best.passed_count::float / best.total_count * 100) AS avg_percentage
+         FROM (
+           SELECT DISTINCT ON (s.user_id, s.problem_id) s.user_id, s.problem_id, s.passed_count, s.total_count
+           FROM submissions s
+           JOIN problems p ON p.id = s.problem_id
+           WHERE p.organization_id = $1 AND (p.closes_at IS NULL OR p.closes_at <= now())
+           ORDER BY s.user_id, s.problem_id, (s.status = 'Accepted') DESC, s.passed_count DESC, s.created_at DESC
+         ) best
+         WHERE best.total_count > 0
+         GROUP BY best.user_id`,
+        [req.user.organizationId]
+      );
+      overallAvgByUser = new Map(overallRes.rows.map((r) => [r.user_id, Number(r.avg_percentage)]));
     }
 
-    const best = bestRes.rows[0];
-    const myPercentage = best.total_count > 0 ? (best.passed_count / best.total_count) * 100 : 0;
-
-    // Per-assignment percentile, among every student's best submission for
-    // this problem. No deadline filter needed on the population itself —
-    // we only ever reach this line once this problem's own closes_at has
-    // already passed.
-    const allBestRes = await pool.query(
-      `SELECT DISTINCT ON (user_id) user_id, passed_count, total_count
-       FROM submissions WHERE problem_id = $1
-       ORDER BY user_id, (status = 'Accepted') DESC, passed_count DESC, created_at DESC`,
-      [problemId]
-    );
-    const problemPercentages = allBestRes.rows
-      .filter((r) => r.total_count > 0)
-      .map((r) => (r.passed_count / r.total_count) * 100);
-    const { tag: percentileTag } = computePercentileTiers(problemPercentages)(myPercentage);
-
-    // Overall (assignments) percentile: every student's average best-submission
-    // % across every problem they've submitted to, only counting problems
-    // whose own deadline has already passed — same fairness rule as exams'
-    // "overall" so a still-open assignment elsewhere can't skew it early.
-    const overallRes = await pool.query(
-      `SELECT best.user_id, AVG(best.passed_count::float / best.total_count * 100) AS avg_percentage
-       FROM (
-         SELECT DISTINCT ON (s.user_id, s.problem_id) s.user_id, s.problem_id, s.passed_count, s.total_count
-         FROM submissions s
-         JOIN problems p ON p.id = s.problem_id
-         WHERE p.organization_id = $1 AND (p.closes_at IS NULL OR p.closes_at <= now())
-         ORDER BY s.user_id, s.problem_id, (s.status = 'Accepted') DESC, s.passed_count DESC, s.created_at DESC
-       ) best
-       WHERE best.total_count > 0
-       GROUP BY best.user_id`,
-      [req.user.organizationId]
-    );
-    const overallPercentileFor = computePercentileTiers(overallRes.rows.map((r) => Number(r.avg_percentage)));
-    const myOverall = overallRes.rows.find((r) => r.user_id === req.user.userId);
-    const overallAssignmentsPercentileTag = myOverall ? overallPercentileFor(Number(myOverall.avg_percentage)).tag : null;
+    const { tag: percentileTag, percentile } = computePercentileTiers(problemPercentages)(myPercentage);
+    const overallPercentileFor = computePercentileTiers([...overallAvgByUser.values()]);
+    const overallAssignmentsPercentileTag = overallAvgByUser.has(req.user.userId)
+      ? overallPercentileFor(overallAvgByUser.get(req.user.userId)).tag
+      : null;
 
     const bandsRes = await pool.query('SELECT label, min_percent FROM grade_bands WHERE organization_id = $1', [req.user.organizationId]);
     const gradeTag = gradeTagForPercentage(bandsRes.rows, myPercentage);
@@ -4318,12 +6925,72 @@ app.get('/api/problems/:id/result', authenticateToken, async (req, res) => {
     res.status(200).json({
       status: 'graded',
       percentileTag: visibility.show_percentile_tag ? percentileTag : undefined,
+      percentile: visibility.show_percentile_tag ? percentile : undefined,
+      populationSize: visibility.show_percentile_tag ? problemPercentages.length : undefined,
       overallAssignmentsPercentileTag: visibility.show_percentile_tag ? overallAssignmentsPercentileTag : undefined,
       gradeTag: visibility.show_grade_tag ? gradeTag : undefined,
     });
   } catch (err) {
     console.error('Assignment result error:', err);
     res.status(500).json({ error: 'Failed to load result' });
+  }
+});
+
+// Per-question breakdown for the "per question" factor on MyPerformance's
+// assignment graph. Only real for scan-mode assignments — a code submission
+// stores just its aggregate passed_count/total_count, never a per-test-case
+// result, so there's no genuine per-question data for those; this returns
+// that summary instead of fabricating one.
+app.get('/api/problems/:id/questions', authenticateToken, async (req, res) => {
+  const problemId = req.params.id;
+  try {
+    const problemRes = await pool.query(
+      'SELECT submission_mode, closes_at FROM problems WHERE id = $1 AND organization_id = $2',
+      [problemId, req.user.organizationId]
+    );
+    if (problemRes.rows.length === 0) return res.status(404).json({ error: 'Assignment not found' });
+    const problem = problemRes.rows[0];
+    if (problem.closes_at && new Date(problem.closes_at) > new Date()) {
+      return res.status(200).json({ status: 'pending', reason: 'deadline' });
+    }
+
+    if (problem.submission_mode !== 'scan') {
+      const bestRes = await pool.query(
+        `SELECT passed_count, total_count FROM submissions
+         WHERE user_id = $1 AND problem_id = $2
+         ORDER BY (status = 'Accepted') DESC, passed_count DESC, created_at DESC LIMIT 1`,
+        [req.user.userId, problemId]
+      );
+      if (bestRes.rows.length === 0) return res.status(404).json({ error: 'No submission found for this assignment' });
+      return res.status(200).json({ status: 'graded', mode: 'code', passedCount: bestRes.rows[0].passed_count, totalCount: bestRes.rows[0].total_count });
+    }
+
+    const submissionRes = await pool.query(
+      'SELECT id FROM scan_submissions WHERE user_id = $1 AND problem_id = $2 ORDER BY created_at DESC LIMIT 1',
+      [req.user.userId, problemId]
+    );
+    if (submissionRes.rows.length === 0) return res.status(404).json({ error: 'No submission found for this assignment' });
+
+    const questionsRes = await pool.query(
+      `SELECT q.position, q.marks AS max_marks, a.marks_awarded
+       FROM scan_assignment_questions q
+       LEFT JOIN scan_submission_answers a ON a.question_id = q.id AND a.submission_id = $1
+       WHERE q.problem_id = $2
+       ORDER BY q.position ASC`,
+      [submissionRes.rows[0].id, problemId]
+    );
+    res.status(200).json({
+      status: 'graded',
+      mode: 'scan',
+      questions: questionsRes.rows.map((r, i) => ({
+        label: `Q${r.position ?? i + 1}`,
+        earned: r.marks_awarded != null ? Number(r.marks_awarded) : null,
+        max: Number(r.max_marks),
+      })),
+    });
+  } catch (err) {
+    console.error('Assignment questions breakdown error:', err);
+    res.status(500).json({ error: 'Failed to load question breakdown' });
   }
 });
 
@@ -5109,6 +7776,7 @@ app.put('/api/admin/tag-visibility', authenticateToken, requireAdmin, async (req
       [!!req.body.showPercentileTag, !!req.body.showGradeTag, req.user.organizationId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Tag visibility settings not found' });
+    await invalidate(`tagvis:${req.user.organizationId}`);
     res.status(200).json({
       showPercentileTag: result.rows[0].show_percentile_tag,
       showGradeTag: result.rows[0].show_grade_tag,
@@ -5143,11 +7811,11 @@ app.get('/api/exams', authenticateToken, async (req, res) => {
     );
 
     const withStatus = result.rows.map((e) => ({ ...e, status: getProblemStatus(e) }));
-    let visible = req.user.role === 'admin'
-      ? withStatus
-      : withStatus.filter((e) => e.status !== 'upcoming');
+    let visible = req.user.role === 'student'
+      ? withStatus.filter((e) => e.status !== 'upcoming')
+      : withStatus;
 
-    if (req.user.role !== 'admin') {
+    if (req.user.role === 'student') {
       const visibleSubjectIds = await getVisibleSubjectIds(req.user.orgUnitId);
       visible = visible.filter((e) => e.subject_id == null || visibleSubjectIds.includes(e.subject_id));
     }
@@ -5172,7 +7840,7 @@ app.get('/api/exams/:id', authenticateToken, async (req, res) => {
 
     const exam = examRes.rows[0];
     const status = getProblemStatus(exam);
-    if (status === 'upcoming' && req.user.role !== 'admin') {
+    if (status === 'upcoming' && req.user.role === 'student') {
       return res.status(403).json({ error: 'This exam is not open yet' });
     }
 
@@ -5499,7 +8167,7 @@ app.get('/api/exams/:id/result', authenticateToken, async (req, res) => {
     const examPercentages = totalMarks > 0
       ? examAttemptsRes.rows.filter((a) => a.fully_graded).map((a) => (a.score / totalMarks) * 100)
       : [];
-    const { tag: percentileTag } = computePercentileTiers(examPercentages)(myPercentage);
+    const { tag: percentileTag, percentile } = computePercentileTiers(examPercentages)(myPercentage);
 
     // Overall (exams) percentile: every student's average % across their
     // own fully-graded exams, but only counting exams whose OWN deadline
@@ -5532,12 +8200,59 @@ app.get('/api/exams/:id/result', authenticateToken, async (req, res) => {
     res.status(200).json({
       status: 'graded',
       percentileTag: visibility.show_percentile_tag ? percentileTag : undefined,
+      percentile: visibility.show_percentile_tag ? percentile : undefined,
+      populationSize: visibility.show_percentile_tag ? examPercentages.length : undefined,
       overallExamsPercentileTag: visibility.show_percentile_tag ? overallExamsPercentileTag : undefined,
       gradeTag: visibility.show_grade_tag ? gradeTag : undefined,
     });
   } catch (err) {
     console.error('Exam result error:', err);
     res.status(500).json({ error: 'Failed to load result' });
+  }
+});
+
+// Per-question breakdown for the "per question" factor on MyPerformance's
+// exam graph — every exam has real per-item marks (exam_items.marks vs
+// this attempt's own marks_awarded, whichever of exam_answers/
+// exam_scan_answers holds this item), unlike assignments where only
+// scan-mode ones do.
+app.get('/api/exams/:id/questions', authenticateToken, async (req, res) => {
+  const examId = req.params.id;
+  try {
+    const attemptRes = await pool.query('SELECT id, status FROM exam_attempts WHERE exam_id = $1 AND user_id = $2', [examId, req.user.userId]);
+    if (attemptRes.rows.length === 0) return res.status(404).json({ error: 'No attempt found for this exam' });
+    if (attemptRes.rows[0].status !== 'submitted') return res.status(409).json({ error: 'This exam has not been finished yet' });
+    const attemptId = attemptRes.rows[0].id;
+
+    const examRes = await pool.query('SELECT closes_at FROM exams WHERE id = $1', [examId]);
+    if (examRes.rows[0]?.closes_at && new Date(examRes.rows[0].closes_at) > new Date()) {
+      return res.status(200).json({ status: 'pending', reason: 'deadline' });
+    }
+    if (!(await isAttemptFullyGraded(attemptId))) {
+      return res.status(200).json({ status: 'pending', reason: 'grading' });
+    }
+
+    const itemsRes = await pool.query(
+      `SELECT i.position, i.marks AS max_marks,
+              COALESCE(ea.marks_awarded, esa.marks_awarded) AS marks_awarded
+       FROM exam_items i
+       LEFT JOIN exam_answers ea ON ea.item_id = i.id AND ea.attempt_id = $1
+       LEFT JOIN exam_scan_answers esa ON esa.item_id = i.id AND esa.attempt_id = $1
+       WHERE i.exam_id = $2
+       ORDER BY i.position ASC`,
+      [attemptId, examId]
+    );
+    res.status(200).json({
+      status: 'graded',
+      questions: itemsRes.rows.map((r, i) => ({
+        label: `Q${r.position ?? i + 1}`,
+        earned: r.marks_awarded != null ? Number(r.marks_awarded) : null,
+        max: Number(r.max_marks),
+      })),
+    });
+  } catch (err) {
+    console.error('Exam questions breakdown error:', err);
+    res.status(500).json({ error: 'Failed to load question breakdown' });
   }
 });
 
@@ -5661,9 +8376,9 @@ app.get('/api/admin/exam-attempts/:attemptId/flags', authenticateToken, requireA
 app.get('/api/admin/exam-attempts/:attemptId/answers', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT ea.id AS answer_id, ei.id AS item_id, ei.type, ei.prompt, ei.marks,
+      `SELECT ea.id AS answer_id, ei.id AS item_id, ei.type, ei.prompt, ei.marks, ei.options,
               ea.marks_awarded, ea.selected_option_id, ea.text_answer, ea.is_correct,
-              ea.passed_count, ea.total_count, ea.code, ea.language
+              ea.passed_count, ea.total_count, ea.code, ea.language, ea.remarks
        FROM exam_answers ea
        JOIN exam_items ei ON ei.id = ea.item_id
        JOIN exam_attempts a ON a.id = ea.attempt_id
@@ -5679,7 +8394,7 @@ app.get('/api/admin/exam-attempts/:attemptId/answers', authenticateToken, requir
     // scan-type items at all (the common case — most exams have none).
     const scanAnswersRes = await pool.query(
       `SELECT esa.id AS answer_id, ei.id AS item_id, ei.type, ei.prompt, ei.marks,
-              esa.marks_awarded, esa.ai_assessment
+              esa.marks_awarded, esa.ai_assessment, esa.remarks
        FROM exam_scan_answers esa
        JOIN exam_items ei ON ei.id = esa.item_id
        JOIN exam_attempts a ON a.id = esa.attempt_id
@@ -5707,15 +8422,24 @@ app.get('/api/admin/exam-attempts/:attemptId/answers', authenticateToken, requir
       };
     }
 
-    res.status(200).json({ answers: result.rows, scanAnswers: scanAnswersRes.rows, attemptScan });
+    const overallRemarksRes = await pool.query(
+      `SELECT a.overall_remarks FROM exam_attempts a JOIN exams e ON e.id = a.exam_id
+       WHERE a.id = $1 AND e.organization_id = $2`,
+      [req.params.attemptId, req.user.organizationId]
+    );
+    const overallRemarks = overallRemarksRes.rows[0] ? overallRemarksRes.rows[0].overall_remarks : null;
+
+    res.status(200).json({ answers: result.rows, scanAnswers: scanAnswersRes.rows, attemptScan, overallRemarks });
   } catch (err) {
     console.error('List exam answers error:', err);
     res.status(500).json({ error: 'Failed to load answers' });
   }
 });
 
-// Admin: manually award marks for one short/long answer. mcq/coding stay
-// auto-graded — not overridable here in this pass.
+// Admin: manually award marks and/or remarks for one answer. Marks stay
+// restricted to short/long (mcq/coding stay auto-graded), but remarks can be
+// left on any item type — both fields are independently optional (undefined
+// means "don't touch"), same pattern as the assignment grading route.
 app.put('/api/admin/exam-answers/:answerId/grade', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const answerRes = await pool.query(
@@ -5730,16 +8454,22 @@ app.put('/api/admin/exam-answers/:answerId/grade', authenticateToken, requireAdm
     if (answerRes.rows.length === 0) return res.status(404).json({ error: 'Answer not found' });
 
     const answer = answerRes.rows[0];
-    if (answer.type !== 'short' && answer.type !== 'long') {
-      return res.status(400).json({ error: 'Only short/long answers can be manually graded' });
+
+    if (req.body.marksAwarded !== undefined) {
+      if (answer.type !== 'short' && answer.type !== 'long') {
+        return res.status(400).json({ error: 'Only short/long answers can be manually graded' });
+      }
+      const marksAwarded = Number(req.body.marksAwarded);
+      if (!Number.isFinite(marksAwarded) || marksAwarded < 0 || marksAwarded > answer.marks) {
+        return res.status(400).json({ error: `Marks must be between 0 and ${answer.marks}` });
+      }
+      await pool.query('UPDATE exam_answers SET marks_awarded = $1 WHERE id = $2', [Math.round(marksAwarded), answer.id]);
     }
 
-    const marksAwarded = Number(req.body.marksAwarded);
-    if (!Number.isFinite(marksAwarded) || marksAwarded < 0 || marksAwarded > answer.marks) {
-      return res.status(400).json({ error: `Marks must be between 0 and ${answer.marks}` });
+    if (req.body.remarks !== undefined) {
+      const remarks = String(req.body.remarks).trim() || null;
+      await pool.query('UPDATE exam_answers SET remarks = $1 WHERE id = $2', [remarks, answer.id]);
     }
-
-    await pool.query('UPDATE exam_answers SET marks_awarded = $1 WHERE id = $2', [Math.round(marksAwarded), answer.id]);
 
     const score = await recomputeExamAttemptScore(answer.attempt_id);
     const fullyGraded = await isAttemptFullyGraded(answer.attempt_id);
@@ -5750,10 +8480,10 @@ app.put('/api/admin/exam-answers/:answerId/grade', authenticateToken, requireAdm
   }
 });
 
-// Admin: manually award marks for one scan item's answer. Every row in
-// exam_scan_answers is inherently a scan-type item by construction (see
-// POST /api/exams/:id/submit / scan-submit), so there's no type check to
-// make here the way the short/long route above needs one.
+// Admin: manually award marks and/or remarks for one scan item's answer.
+// Every row in exam_scan_answers is inherently a scan-type item by
+// construction (see POST /api/exams/:id/submit / scan-submit), so there's
+// no type check to make here the way the short/long route above needs one.
 app.put('/api/admin/exam-scan-answers/:answerId/grade', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const answerRes = await pool.query(
@@ -5768,12 +8498,19 @@ app.put('/api/admin/exam-scan-answers/:answerId/grade', authenticateToken, requi
     if (answerRes.rows.length === 0) return res.status(404).json({ error: 'Answer not found' });
 
     const answer = answerRes.rows[0];
-    const marksAwarded = Number(req.body.marksAwarded);
-    if (!Number.isFinite(marksAwarded) || marksAwarded < 0 || marksAwarded > answer.marks) {
-      return res.status(400).json({ error: `Marks must be between 0 and ${answer.marks}` });
+
+    if (req.body.marksAwarded !== undefined) {
+      const marksAwarded = Number(req.body.marksAwarded);
+      if (!Number.isFinite(marksAwarded) || marksAwarded < 0 || marksAwarded > answer.marks) {
+        return res.status(400).json({ error: `Marks must be between 0 and ${answer.marks}` });
+      }
+      await pool.query('UPDATE exam_scan_answers SET marks_awarded = $1 WHERE id = $2', [Math.round(marksAwarded), answer.id]);
     }
 
-    await pool.query('UPDATE exam_scan_answers SET marks_awarded = $1 WHERE id = $2', [Math.round(marksAwarded), answer.id]);
+    if (req.body.remarks !== undefined) {
+      const remarks = String(req.body.remarks).trim() || null;
+      await pool.query('UPDATE exam_scan_answers SET remarks = $1 WHERE id = $2', [remarks, answer.id]);
+    }
 
     const score = await recomputeExamAttemptScore(answer.attempt_id);
     const fullyGraded = await isAttemptFullyGraded(answer.attempt_id);
@@ -5781,6 +8518,26 @@ app.put('/api/admin/exam-scan-answers/:answerId/grade', authenticateToken, requi
   } catch (err) {
     console.error('Grade exam scan answer error:', err);
     res.status(500).json({ error: 'Failed to save grade' });
+  }
+});
+
+// Admin: set the overall remarks for an exam attempt (separate from any
+// per-question remarks above).
+app.put('/api/admin/exam-attempts/:attemptId/remarks', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const attemptRes = await pool.query(
+      `SELECT a.id FROM exam_attempts a JOIN exams e ON e.id = a.exam_id
+       WHERE a.id = $1 AND e.organization_id = $2`,
+      [req.params.attemptId, req.user.organizationId]
+    );
+    if (attemptRes.rows.length === 0) return res.status(404).json({ error: 'Attempt not found' });
+
+    const overallRemarks = String(req.body.overallRemarks || '').trim() || null;
+    await pool.query('UPDATE exam_attempts SET overall_remarks = $1 WHERE id = $2', [overallRemarks, req.params.attemptId]);
+    res.status(200).json({ overallRemarks });
+  } catch (err) {
+    console.error('Set exam attempt remarks error:', err);
+    res.status(500).json({ error: 'Failed to save remarks' });
   }
 });
 
@@ -6076,7 +8833,7 @@ app.get('/api/me/scan-submission', authenticateToken, async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT ss.id, ss.status, ss.original_filename, ss.storage_key, ss.created_at, ss.ocr_error, ss.penalized
+      `SELECT ss.id, ss.status, ss.original_filename, ss.storage_key, ss.created_at, ss.ocr_error, ss.penalized, ss.overall_remarks
        FROM scan_submissions ss JOIN problems p ON p.id = ss.problem_id
        WHERE ss.problem_id = $1 AND p.organization_id = $2 AND ss.user_id = $3`,
       [problemId, req.user.organizationId, req.user.userId]
@@ -6093,7 +8850,7 @@ app.get('/api/me/scan-submission', authenticateToken, async (req, res) => {
     // until a teacher enters something via PUT
     // /api/admin/scan-submissions/:id/grade.
     const answersRes = await pool.query(
-      `SELECT q.prompt, q.marks AS max_marks, sa.marks_awarded
+      `SELECT q.prompt, q.marks AS max_marks, sa.marks_awarded, sa.remarks
        FROM scan_assignment_questions q
        LEFT JOIN scan_submission_answers sa ON sa.question_id = q.id AND sa.submission_id = $1
        WHERE q.problem_id = $2 ORDER BY q.position ASC`,
@@ -6110,10 +8867,14 @@ app.get('/api/me/scan-submission', authenticateToken, async (req, res) => {
         ocrError: row.ocr_error,
         penalized: row.penalized,
         viewUrl,
+        // A teacher's overall note is visible as soon as it exists, same
+        // as any other courtesy feedback — not gated behind fullyGraded
+        // the way the actual score/percentile-affecting grade is below.
+        overallRemarks: row.overall_remarks,
         grade: fullyGraded ? {
           totalMarks: answersRes.rows.reduce((sum, a) => sum + a.max_marks, 0),
           awardedMarks: row.penalized ? 0 : answersRes.rows.reduce((sum, a) => sum + a.marks_awarded, 0),
-          questions: answersRes.rows.map((a) => ({ prompt: a.prompt, maxMarks: a.max_marks, marksAwarded: row.penalized ? 0 : a.marks_awarded })),
+          questions: answersRes.rows.map((a) => ({ prompt: a.prompt, maxMarks: a.max_marks, marksAwarded: row.penalized ? 0 : a.marks_awarded, remarks: a.remarks })),
         } : null,
       },
     });
@@ -6459,7 +9220,7 @@ app.get('/api/admin/scan-submissions/:id', authenticateToken, requireAdmin, asyn
     const answersRes = await pool.query(
       `SELECT q.id AS question_id, q.position, q.prompt, q.marks AS max_marks, q.type, q.options,
               sa.ai_assessment, sa.marks_awarded, sa.selected_option_id, sa.text_answer,
-              sa.is_correct, sa.language, sa.code, sa.passed_count, sa.total_count
+              sa.is_correct, sa.language, sa.code, sa.passed_count, sa.total_count, sa.remarks
        FROM scan_assignment_questions q
        LEFT JOIN scan_submission_answers sa ON sa.question_id = q.id AND sa.submission_id = $1
        WHERE q.problem_id = $2
@@ -6487,6 +9248,7 @@ app.get('/api/admin/scan-submissions/:id', authenticateToken, requireAdmin, asyn
       createdAt: submission.created_at,
       pages: submission.ocr_pages || [],
       viewUrl: configured && submission.storage_key ? await getScanPdfUrl(submission.storage_key) : null,
+      overallRemarks: submission.overall_remarks,
       questions: answersRes.rows.map((r) => ({
         questionId: r.question_id,
         prompt: r.prompt,
@@ -6502,6 +9264,7 @@ app.get('/api/admin/scan-submissions/:id', authenticateToken, requireAdmin, asyn
         code: r.code,
         passedCount: r.passed_count,
         totalCount: r.total_count,
+        remarks: r.remarks,
       })),
       flags: flagsRes.rows.map((f) => ({
         id: f.id,
@@ -6630,7 +9393,7 @@ app.post('/api/admin/problems/:id/scan-submissions', authenticateToken, requireA
 // a confirmed plagiarism flag can't be silently undone by re-saving a grade
 // — see PUT /api/admin/scan-flags/:type/:id for how that flag gets cleared.
 app.put('/api/admin/scan-submissions/:id/grade', authenticateToken, requireAdmin, async (req, res) => {
-  const { marks } = req.body; // [{ questionId, marksAwarded }, ...]
+  const { marks, overallRemarks } = req.body; // marks: [{ questionId, marksAwarded, remarks }, ...]
   if (!Array.isArray(marks)) return res.status(400).json({ error: 'marks array is required' });
 
   try {
@@ -6650,28 +9413,59 @@ app.put('/api/admin/scan-submissions/:id/grade', authenticateToken, requireAdmin
     );
     const maxMarksById = new Map(questionsRes.rows.map((q) => [q.id, q.marks]));
 
+    // marksAwarded/remarks are each independently optional per entry (a
+    // remarks-only save on an mcq question, say, shouldn't require also
+    // resending its already-correct auto-graded marks) — `undefined` means
+    // "leave this field alone", which is why the actual writes below are
+    // two separate conditional UPDATEs rather than one upsert that would
+    // silently null out whichever field wasn't included this time.
     const updates = [];
     for (const entry of marks) {
       const questionId = Number(entry.questionId);
-      const marksAwarded = entry.marksAwarded === null || entry.marksAwarded === '' ? null : Number(entry.marksAwarded);
-      if (!questionId || Number.isNaN(marksAwarded)) continue;
-      if (marksAwarded !== null) {
+      if (!questionId) continue;
+      if (!maxMarksById.has(questionId)) return res.status(400).json({ error: `Question ${questionId} does not belong to this assignment` });
+
+      let marksAwarded;
+      if (entry.marksAwarded === undefined) {
+        marksAwarded = undefined;
+      } else if (entry.marksAwarded === null || entry.marksAwarded === '') {
+        marksAwarded = null;
+      } else {
+        marksAwarded = Number(entry.marksAwarded);
+        if (Number.isNaN(marksAwarded)) continue;
         const maxMarks = maxMarksById.get(questionId);
-        if (maxMarks === undefined) return res.status(400).json({ error: `Question ${questionId} does not belong to this assignment` });
         if (marksAwarded < 0 || marksAwarded > maxMarks) {
-          return res.status(400).json({ error: `Marks for "${questionId}" must be between 0 and ${maxMarks}` });
+          return res.status(400).json({ error: `Marks for question ${questionId} must be between 0 and ${maxMarks}` });
         }
       }
-      updates.push({ questionId, marksAwarded });
+
+      const remarks = entry.remarks !== undefined ? (String(entry.remarks).trim() || null) : undefined;
+      if (marksAwarded === undefined && remarks === undefined) continue;
+      updates.push({ questionId, marksAwarded, remarks });
     }
 
-    for (const { questionId, marksAwarded } of updates) {
+    for (const { questionId, marksAwarded, remarks } of updates) {
       await pool.query(
-        `INSERT INTO scan_submission_answers (submission_id, question_id, marks_awarded)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (submission_id, question_id) DO UPDATE SET marks_awarded = EXCLUDED.marks_awarded`,
-        [req.params.id, questionId, marksAwarded]
+        `INSERT INTO scan_submission_answers (submission_id, question_id) VALUES ($1, $2)
+         ON CONFLICT (submission_id, question_id) DO NOTHING`,
+        [req.params.id, questionId]
       );
+      if (marksAwarded !== undefined) {
+        await pool.query(
+          `UPDATE scan_submission_answers SET marks_awarded = $1 WHERE submission_id = $2 AND question_id = $3`,
+          [marksAwarded, req.params.id, questionId]
+        );
+      }
+      if (remarks !== undefined) {
+        await pool.query(
+          `UPDATE scan_submission_answers SET remarks = $1 WHERE submission_id = $2 AND question_id = $3`,
+          [remarks, req.params.id, questionId]
+        );
+      }
+    }
+
+    if (overallRemarks !== undefined) {
+      await pool.query('UPDATE scan_submissions SET overall_remarks = $1 WHERE id = $2', [String(overallRemarks).trim() || null, req.params.id]);
     }
 
     res.status(200).json({ message: 'Grade saved' });
@@ -6936,6 +9730,28 @@ app.post('/api/problems/:id/time-log', authenticateToken, async (req, res) => {
 });
 
 
+// Backstop, not the primary error-handling path — every route above already
+// wraps its own body in try/catch and answers its own res.status(500), so
+// this exists for whatever slips past that: a synchronous throw in
+// middleware, or (Express 5 specifically, unlike 4) an async route handler
+// whose rejection was never caught locally, which Express 5 now forwards
+// here automatically instead of silently hanging the request. Must be
+// registered after every app.use/app.get/etc above — Express identifies
+// error-handling middleware purely by arity (4 params), so this has to
+// come last or later routes would shadow it. Never echoes err.message back
+// to the client: an internal error string can carry query fragments or
+// stack detail that's an information leak to hand an unauthenticated
+// caller, so the response is always the same generic message regardless of
+// what actually broke.
+app.use((err, req, res, next) => {
+  console.error('Unhandled error in request pipeline:', err);
+  if (res.headersSent) return next(err);
+  const isConnectivity = /ECONNREFUSED|ETIMEDOUT|Connection terminated|too many clients|connect ECONNRESET/i.test(err?.message || '');
+  res.status(isConnectivity ? 503 : 500).json({
+    error: isConnectivity ? 'Service is temporarily unavailable — please retry in a moment.' : 'Internal server error',
+  });
+});
+
 // child_process interactions (closed pipes, unexpected signals, timing races)
 // are inherently more prone to unforeseen edge cases than typical API code.
 // Without this, ANY single uncaught error anywhere â€” not just in the sandbox
@@ -6948,6 +9764,63 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled promise rejection (server stayed alive):', err);
 });
+
+// ============================================================================
+// PERFORMANCE INDEXES — Postgres does NOT automatically index foreign-key
+// columns (only primary keys get that for free), so every WHERE/JOIN on an
+// FK column — which in a multi-tenant app means almost every query, since
+// nearly everything filters by organization_id, problem_id, exam_id, or
+// user_id — falls back to a sequential scan without one. Fine at today's
+// data volume; a real bottleneck once any of these tables grow past a few
+// thousand rows. Consolidated here (one pass, run once at boot) rather
+// than folded into each table's own ensureXSchema function, since these
+// are a deliberate performance pass over the whole schema, not part of any
+// single feature's own migration — CREATE INDEX CONCURRENTLY isn't used
+// because it can't run inside the implicit transaction each pool.query
+// already is; on a table with real production data, run these by hand
+// with CONCURRENTLY first instead of relying on this function to do it
+// under load. Each statement is independent and individually caught, same
+// posture as every other ensureXSchema function, so one racing against a
+// table that isn't created yet on a cold first boot doesn't block the
+// rest — CREATE INDEX IF NOT EXISTS just re-attempts and succeeds on the
+// next restart.
+async function ensurePerformanceIndexes() {
+  const statements = [
+    // organization_id — the single most common WHERE clause in this
+    // codebase; every one of these tables is queried scoped to one org on
+    // nearly every request.
+    'CREATE INDEX IF NOT EXISTS problems_organization_id_idx ON problems(organization_id)',
+    'CREATE INDEX IF NOT EXISTS exams_organization_id_idx ON exams(organization_id)',
+    'CREATE INDEX IF NOT EXISTS subjects_organization_id_idx ON subjects(organization_id)',
+    'CREATE INDEX IF NOT EXISTS org_units_organization_id_idx ON org_units(organization_id)',
+    'CREATE INDEX IF NOT EXISTS grade_bands_organization_id_idx ON grade_bands(organization_id)',
+    'CREATE INDEX IF NOT EXISTS profile_change_requests_organization_id_idx ON profile_change_requests(organization_id)',
+    // Submission/attempt/grading tables — joined or filtered by
+    // problem_id/exam_id/user_id on every performance rollup, every
+    // gradebook view, every "did this student already submit" check.
+    'CREATE INDEX IF NOT EXISTS submissions_problem_id_idx ON submissions(problem_id)',
+    'CREATE INDEX IF NOT EXISTS submissions_user_id_idx ON submissions(user_id)',
+    'CREATE INDEX IF NOT EXISTS exam_attempts_user_id_idx ON exam_attempts(user_id)',
+    'CREATE INDEX IF NOT EXISTS exam_items_exam_id_idx ON exam_items(exam_id)',
+    'CREATE INDEX IF NOT EXISTS exam_answers_item_id_idx ON exam_answers(item_id)',
+    'CREATE INDEX IF NOT EXISTS test_cases_problem_id_idx ON test_cases(problem_id)',
+    'CREATE INDEX IF NOT EXISTS starter_code_problem_id_idx ON starter_code(problem_id)',
+    'CREATE INDEX IF NOT EXISTS problem_time_logs_problem_id_idx ON problem_time_logs(problem_id)',
+    'CREATE INDEX IF NOT EXISTS subject_teachers_user_id_idx ON subject_teachers(user_id)',
+    // Org-structure resolution — resolveOrgUnitPath and every roster/CSV
+    // view walks unit -> level and unit -> parent constantly.
+    'CREATE INDEX IF NOT EXISTS org_units_level_def_id_idx ON org_units(level_def_id)',
+    'CREATE INDEX IF NOT EXISTS memberships_org_unit_id_idx ON memberships(org_unit_id)',
+  ];
+  for (const sql of statements) {
+    try {
+      await pool.query(sql);
+    } catch (err) {
+      console.error(`Failed to create performance index (${sql}):`, err.message);
+    }
+  }
+}
+bootSchemaStep(ensurePerformanceIndexes);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {

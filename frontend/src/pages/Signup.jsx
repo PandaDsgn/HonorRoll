@@ -18,6 +18,7 @@ export default function Signup() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
+  const [acceptedTos, setAcceptedTos] = useState(false);
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
 
@@ -32,7 +33,7 @@ export default function Signup() {
 
     try {
       const response = await axios.post(`${API}/api/organizations/signup`, {
-        organizationName, accessCode, name, email, password,
+        organizationName, accessCode, name, email, password, acceptedTos,
       });
       login(response.data.token, response.data.user);
       navigate('/admin', { replace: true });
@@ -142,7 +143,22 @@ export default function Signup() {
             </div>
           </div>
 
-          <button type="submit" className="btn btn-primary auth-submit" disabled={isLoading}>
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13.5, margin: '4px 0 0' }}>
+            <input
+              type="checkbox"
+              checked={acceptedTos}
+              onChange={(e) => setAcceptedTos(e.target.checked)}
+              style={{ marginTop: 2 }}
+            />
+            <span>
+              I agree to the{' '}
+              <a href="#/terms" target="_blank" rel="noreferrer" className="auth-link" style={{ display: 'inline' }}>Terms of Service</a>{' '}
+              and{' '}
+              <a href="#/privacy" target="_blank" rel="noreferrer" className="auth-link" style={{ display: 'inline' }}>Privacy Policy</a>.
+            </span>
+          </label>
+
+          <button type="submit" className="btn btn-primary auth-submit" disabled={isLoading || !acceptedTos}>
             {isLoading && <span className="spinner" />}
             {isLoading ? 'Creating…' : 'Create organization'}
           </button>

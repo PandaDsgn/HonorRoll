@@ -62,12 +62,14 @@ function formatLocal(iso) {
 export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
   const isEditMode = !!initialData;
 
-  // 'scan' assignments skip the code-judge fields entirely — students
-  // scan handwritten answers to these questions instead of writing code.
-  // submissionMode itself can't change after creation (the type toggle
-  // below is hidden in edit mode), but everything else — including the
-  // question set — is fully editable.
-  const [submissionMode, setSubmissionMode] = useState(initialData?.submissionMode || 'code');
+  // Every NEW assignment is 'scan' mode now — a single unified item
+  // builder (mcq/short/long/coding/scan, mixed freely), the same 1:1 shape
+  // as ExamForm's item list, no upfront mode choice. 'code' mode (the
+  // original single-coding-problem type, its own test-cases/starter-code
+  // fields below) still exists purely so an assignment created before this
+  // change keeps rendering its original editing UI — there's no toggle to
+  // pick it for anything new, submissionMode is fixed at creation either way.
+  const [submissionMode] = useState(initialData?.submissionMode || 'scan');
   const [assignmentNo, setAssignmentNo] = useState(initialData?.assignmentNo || '');
   const [questions, setQuestions] = useState(
     initialData?.questions?.length ? initialData.questions.map(questionFromServer) : [emptyQuestion()]
@@ -256,20 +258,6 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
 
   return (
     <form className="panel assignment-form" onSubmit={handleSubmit}>
-      {!isEditMode && (
-        <div className="field" style={{ marginBottom: 16 }}>
-          <label>Assignment type</label>
-          <div className="segmented" role="tablist" aria-label="Assignment type">
-            <button type="button" role="tab" aria-pressed={submissionMode === 'code'} className={submissionMode === 'code' ? 'active' : ''} onClick={() => setSubmissionMode('code')}>
-              Code
-            </button>
-            <button type="button" role="tab" aria-pressed={submissionMode === 'scan'} className={submissionMode === 'scan' ? 'active' : ''} onClick={() => setSubmissionMode('scan')}>
-              Scanned handwritten
-            </button>
-          </div>
-        </div>
-      )}
-
       <div className="assignment-form-grid">
         <div className="field">
           <label htmlFor="af-title">Title</label>

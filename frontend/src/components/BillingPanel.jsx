@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { API } from '../config';
+import { useAuth } from '../context/AuthContext';
 
 const RAZORPAY_SCRIPT_SRC = 'https://checkout.razorpay.com/v1/checkout.js';
 
@@ -35,6 +36,7 @@ const PLAN_ORDER = ['free', 'starter', 'growth', 'institution', 'scale', 'custom
 
 export default function BillingPanel() {
   const navigate = useNavigate();
+  const { user } = useAuth();
   const [plans, setPlans] = useState(null);
   const [status, setStatus] = useState(null);
   const [billingCycle, setBillingCycle] = useState('monthly');
@@ -99,14 +101,38 @@ export default function BillingPanel() {
         subscription_id: data.subscriptionId,
         name: 'HonorRoll',
         description: `${data.planLabel} — ${data.billingCycle}`,
-        // A client-side "success" here is only ever a signal to start
-        // polling — the real confirmation is a signature-verified webhook
-        // on the backend, which is what actually promotes the plan.
-        handler: () => {
+        prefill: data.prefill || {
+          name: user?.name || '',
+          email: user?.email || '',
+        },
+        theme: { color: '#4f46e5' },
+        handler: async (response) => {
           setConfirming(true);
+          try {
+            const verifyRes = await axios.post(`${API}/api/admin/billing/verify`, {
+              razorpayPaymentId: response.razorpay_payment_id,
+              razorpaySubscriptionId: response.razorpay_subscription_id || data.subscriptionId,
+              razorpaySignature: response.razorpay_signature,
+            }, { withCredentials: true });
+
+            if (verifyRes.data?.success) {
+              setStatus(verifyRes.data.status);
+              setConfirming(false);
+              fetchAll();
+              return;
+            }
+          } catch (err) {
+            console.error('Immediate payment verification error:', err);
+          }
+          // Fallback to polling if immediate verify did not complete
           pollUntilActive();
         },
-        modal: { ondismiss: () => setCheckingOut(null) },
+        modal: {
+          ondismiss: () => {
+            setCheckingOut(null);
+            fetchAll();
+          },
+        },
       });
       rzp.on('payment.failed', () => setError('Payment failed — you have not been charged. You can try again.'));
       rzp.open();
@@ -132,10 +158,27 @@ export default function BillingPanel() {
     }
   };
 
-  if (!plans || !status) return <p className="sb-loading">Loading billing…</p>;
+  if (!plans || !status) {
+    return (
+      <div className="panel" style={{ padding: 24, textAlign: 'center' }}>
+        {error ? (
+          <div className="alert" style={{ marginBottom: 16 }}>
+            <span className="alert-icon">!</span>
+            <span>{error}</span>
+          </div>
+        ) : (
+          <p className="sb-loading" style={{ margin: 0 }}>Loading billing details…</p>
+        )}
+      </div>
+    );
+  }
 
-  const usagePct = Math.min(100, Math.round((status.currentStudentCount / status.studentCap) * 100));
-  const isPaidActive = status.status === 'active' && status.planKey !== 'free';
+  const effectiveKey = status?.effectivePlanKey || 'free';
+  const currentPlan = plans?.[effectiveKey] || { label: effectiveKey, studentCap: 30 };
+  const studentCap = status?.studentCap || currentPlan.studentCap || 30;
+  const currentStudentCount = status?.currentStudentCount || 0;
+  const usagePct = studentCap > 0 ? Math.min(100, Math.round((currentStudentCount / studentCap) * 100)) : 0;
+  const isPaidActive = status?.status === 'active' && effectiveKey !== 'free';
 
   return (
     <div>
@@ -149,17 +192,17 @@ export default function BillingPanel() {
       )}
 
       <div className="panel" style={{ padding: 20, marginBottom: 24 }}>
-        <h3 style={{ margin: '0 0 4px' }}>Current plan: {plans[status.effectivePlanKey]?.label}</h3>
+        <h3 style={{ margin: '0 0 4px' }}>Current plan: {currentPlan.label}</h3>
         {status.status === 'pending' && (
           <p className="auth-sub" style={{ margin: '4px 0 0', color: 'var(--danger)' }}>
             Your last payment failed — Razorpay is retrying. Update your payment method to avoid losing access.
           </p>
         )}
-        {status.status !== status.effectivePlanKey && status.status !== 'active' && status.status !== 'free' && status.status !== 'pending' && (
+        {status.status !== effectiveKey && status.status !== 'active' && status.status !== 'free' && status.status !== 'pending' && (
           <p className="auth-sub" style={{ margin: '4px 0 0' }}>Subscription status: {status.status}</p>
         )}
         <p className="auth-sub" style={{ margin: '10px 0 6px' }}>
-          {status.currentStudentCount} / {status.studentCap} students
+          {currentStudentCount} / {studentCap} students
         </p>
         <div style={{ height: 8, borderRadius: 999, background: 'var(--surface-2)', overflow: 'hidden' }}>
           <div style={{ height: '100%', width: `${usagePct}%`, background: usagePct >= 100 ? 'var(--danger)' : 'var(--accent)', transition: 'width 0.2s ease' }} />
@@ -203,13 +246,14 @@ export default function BillingPanel() {
               );
             }
 
-            const plan = plans[planKey];
+            const plan = plans?.[planKey];
+            if (!plan) return null;
             const price = billingCycle === 'monthly' ? plan.monthlyPaise : plan.annualPaise;
-            const isCurrent = status.effectivePlanKey === planKey;
+            const isCurrent = effectiveKey === planKey;
             return (
               <div key={planKey} className="panel" style={{ padding: 16, borderColor: isCurrent ? 'var(--accent)' : undefined }}>
                 <div className="admin-cell-strong" style={{ fontSize: 15, marginBottom: 4 }}>{plan.label}</div>
-                <div style={{ fontSize: 13, color: 'var(--text-dim)', marginBottom: 10 }}>up to {plan.studentCap.toLocaleString('en-IN')} students</div>
+                <div style={{ fontSize: 13, color: 'var(--text-dim)', marginBottom: 10 }}>up to {plan.studentCap?.toLocaleString('en-IN')} students</div>
                 <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 12 }}>
                   {price === 0 ? 'Free' : (
                     <>{formatRupees(price)}<span style={{ fontSize: 12, fontWeight: 400, color: 'var(--text-dim)' }}>/{billingCycle === 'monthly' ? 'mo' : 'yr'}</span></>

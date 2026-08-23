@@ -18,8 +18,12 @@ import Exams from './pages/Exams';
 import ExamAttempt from './pages/ExamAttempt';
 import ExamResult from './pages/ExamResult';
 import AdminDashboard from './pages/AdminDashboard';
+import MyPerformance from './pages/MyPerformance';
 import ScanReview from './pages/ScanReview';
 import SuperadminDashboard from './pages/SuperadminDashboard';
+import SuperadminOrgDetail from './pages/SuperadminOrgDetail';
+import Terms from './pages/Terms';
+import Privacy from './pages/Privacy';
 
 function App() {
   return (
@@ -33,6 +37,8 @@ function App() {
           <Route path="/verify-organization" element={<VerifyOrganization />} />
           <Route path="/forgot-password" element={<ForgotPassword />} />
           <Route path="/reset-password" element={<ResetPassword />} />
+          <Route path="/terms" element={<Terms />} />
+          <Route path="/privacy" element={<Privacy />} />
 
           <Route path="/assignments" element={<ProtectedRoute><Problems /></ProtectedRoute>} />
           <Route path="/assignments/:id" element={<ProtectedRoute><Sandbox /></ProtectedRoute>} />
@@ -45,6 +51,8 @@ function App() {
           <Route path="/exams" element={<ProtectedRoute><Exams /></ProtectedRoute>} />
           <Route path="/exams/:id" element={<ProtectedRoute><ExamAttempt /></ProtectedRoute>} />
           <Route path="/exams/:id/result" element={<ProtectedRoute><ExamResult /></ProtectedRoute>} />
+
+          <Route path="/performance" element={<ProtectedRoute roles={['student']}><MyPerformance /></ProtectedRoute>} />
 
           <Route
             path="/admin"
@@ -69,6 +77,15 @@ function App() {
             element={
               <ProtectedRoute roles={['superadmin']}>
                 <SuperadminDashboard />
+              </ProtectedRoute>
+            }
+          />
+
+          <Route
+            path="/superadmin/organizations/:orgId"
+            element={
+              <ProtectedRoute roles={['superadmin']}>
+                <SuperadminOrgDetail />
               </ProtectedRoute>
             }
           />

@@ -29,31 +29,65 @@ function isGmailConfigured() {
 }
 
 // Builds the raw RFC 2822 message Gmail's API expects, base64url-encoded.
-// Plain text only (every caller here sends plain text today) — MIME
-// multipart/HTML can be added later if a template ever needs it.
-function buildRawMessage({ from, to, subject, text }) {
-  const message = [
+// Plain text only when there's no attachment (every such caller sends plain
+// text today). With one or more attachments, switches to
+// multipart/mixed: a text/plain body part plus one application/octet-stream
+// part per attachment, each base64-encoded — the standard shape for a
+// file attached to an otherwise plain-text email.
+function buildRawMessage({ from, to, subject, text, attachments = [] }) {
+  const encodedSubject = `=?UTF-8?B?${Buffer.from(subject, 'utf-8').toString('base64')}?=`;
+  if (attachments.length === 0) {
+    const message = [
+      `From: ${from}`,
+      `To: ${to}`,
+      `Subject: ${encodedSubject}`,
+      'MIME-Version: 1.0',
+      'Content-Type: text/plain; charset="UTF-8"',
+      '',
+      text,
+    ].join('\r\n');
+    return Buffer.from(message, 'utf-8').toString('base64url');
+  }
+
+  const boundary = `honorroll_${Buffer.from(String(Date.now())).toString('hex')}`;
+  const parts = [
     `From: ${from}`,
     `To: ${to}`,
-    `Subject: =?UTF-8?B?${Buffer.from(subject, 'utf-8').toString('base64')}?=`,
+    `Subject: ${encodedSubject}`,
     'MIME-Version: 1.0',
+    `Content-Type: multipart/mixed; boundary="${boundary}"`,
+    '',
+    `--${boundary}`,
     'Content-Type: text/plain; charset="UTF-8"',
     '',
     text,
-  ].join('\r\n');
-  return Buffer.from(message, 'utf-8').toString('base64url');
+    '',
+  ];
+  for (const att of attachments) {
+    parts.push(
+      `--${boundary}`,
+      `Content-Type: ${att.contentType || 'application/octet-stream'}; name="${att.filename}"`,
+      'Content-Transfer-Encoding: base64',
+      `Content-Disposition: attachment; filename="${att.filename}"`,
+      '',
+      att.content.toString('base64').replace(/(.{76})/g, '$1\r\n'),
+      ''
+    );
+  }
+  parts.push(`--${boundary}--`);
+  return Buffer.from(parts.join('\r\n'), 'utf-8').toString('base64url');
 }
 
 // Shared send used by every transactional email in this app — welcome
 // emails, org-signup verification, password reset, billing notifications.
 // Returns { error } (never throws) so every call site can keep its existing
 // "best-effort, log and move on" pattern without a try/catch of its own.
-async function sendEmail({ to, subject, text, fromName = 'HonorRoll' }) {
+async function sendEmail({ to, subject, text, fromName = 'HonorRoll', attachments = [] }) {
   const client = getGmailClient();
   if (!client) return { error: new Error('Gmail is not configured') };
   try {
     const { token: accessToken } = await client.getAccessToken();
-    const raw = buildRawMessage({ from: `${fromName} <${process.env.GMAIL_SENDER_EMAIL}>`, to, subject, text });
+    const raw = buildRawMessage({ from: `${fromName} <${process.env.GMAIL_SENDER_EMAIL}>`, to, subject, text, attachments });
     const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
       method: 'POST',
       headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import axios from 'axios';
 import { API } from '../config';
 
@@ -11,18 +11,25 @@ import { API } from '../config';
 // the tree itself is built client-side via a simple parent -> children map,
 // since there's no tree library anywhere in this frontend and the realistic
 // scale here (hundreds of nodes, ~8 tiers deep) doesn't need one.
-export default function OrgStructureBuilder() {
+export default function OrgStructureBuilder({ onChange }) {
   const [levels, setLevels] = useState(null);
   const [units, setUnits] = useState(null);
   const [error, setError] = useState('');
   const [newLevelLabel, setNewLevelLabel] = useState('');
   const [busy, setBusy] = useState(false);
 
+  // Other panels (SubjectsPanel, TeachersPanel) keep their own copy of this
+  // same units/levels list for their own unit-picker dropdowns — a ref, not
+  // a dependency, so calling onChange doesn't recreate fetchAll and loop.
+  const onChangeRef = useRef(onChange);
+  useEffect(() => { onChangeRef.current = onChange; });
+
   const fetchAll = useCallback(async () => {
     try {
       const res = await axios.get(`${API}/api/admin/org-units`, { withCredentials: true });
       setLevels(res.data.levels);
       setUnits(res.data.units);
+      onChangeRef.current?.();
     } catch {
       setError('Failed to load organization structure.');
     }

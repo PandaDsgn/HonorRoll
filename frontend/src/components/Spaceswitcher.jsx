@@ -3,12 +3,13 @@ import { useAuth } from '../context/AuthContext';
 
 export default function SpaceSwitcher({ activeTab }) {
   const navigate = useNavigate();
-  const { isAdmin } = useAuth();
+  const { isAdmin, role } = useAuth();
 
   const spaces = [
     { id: 'assignments', label: 'Assignments', path: '/assignments' },
     { id: 'exams', label: 'Exams', path: '/exams' },
     { id: 'ide', label: 'IDE', path: '/ide' },
+    ...(role === 'student' ? [{ id: 'performance', label: 'My Info', path: '/performance' }] : []),
     ...(isAdmin ? [{ id: 'admin', label: 'Admin', path: '/admin' }] : []),
   ];
 

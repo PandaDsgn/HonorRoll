@@ -35,6 +35,8 @@ export default function ScanReview() {
 
   const [submission, setSubmission] = useState(null);
   const [marks, setMarks] = useState({}); // { [questionId]: string }
+  const [remarks, setRemarks] = useState({}); // { [questionId]: string }
+  const [overallRemarks, setOverallRemarks] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
@@ -48,6 +50,8 @@ export default function ScanReview() {
         const res = await axios.get(`${API}/api/admin/scan-submissions/${id}`, { withCredentials: true });
         setSubmission(res.data);
         setMarks(Object.fromEntries(res.data.questions.map((q) => [q.questionId, q.marksAwarded ?? ''])));
+        setRemarks(Object.fromEntries(res.data.questions.map((q) => [q.questionId, q.remarks || ''])));
+        setOverallRemarks(res.data.overallRemarks || '');
       } catch (err) {
         setError(err.response?.data?.error || 'Failed to load submission.');
       } finally {
@@ -65,6 +69,8 @@ export default function ScanReview() {
       const res = await axios.get(`${API}/api/admin/scan-submissions/${id}`, { withCredentials: true });
       setSubmission(res.data);
       setMarks(Object.fromEntries(res.data.questions.map((q) => [q.questionId, q.marksAwarded ?? ''])));
+      setRemarks(Object.fromEntries(res.data.questions.map((q) => [q.questionId, q.remarks || ''])));
+      setOverallRemarks(res.data.overallRemarks || '');
     } catch (err) {
       setError(err.response?.data?.error || 'Failed to load submission.');
     }
@@ -84,7 +90,12 @@ export default function ScanReview() {
     setSaveMessage('');
     try {
       await axios.put(`${API}/api/admin/scan-submissions/${id}/grade`, {
-        marks: Object.entries(marks).map(([questionId, marksAwarded]) => ({ questionId: Number(questionId), marksAwarded: marksAwarded === '' ? null : marksAwarded })),
+        marks: Object.entries(marks).map(([questionId, marksAwarded]) => ({
+          questionId: Number(questionId),
+          marksAwarded: marksAwarded === '' ? null : marksAwarded,
+          remarks: remarks[questionId] ?? '',
+        })),
+        overallRemarks,
       }, { withCredentials: true });
       setSaveMessage('Grade saved.');
       await refetchSubmission();
@@ -246,7 +257,7 @@ export default function ScanReview() {
                       )}
 
                       {manuallyGraded && (
-                        <label htmlFor={`marks-${q.questionId}`} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <label htmlFor={`marks-${q.questionId}`} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
                           Marks awarded:
                           <input
                             id={`marks-${q.questionId}`}
@@ -259,6 +270,18 @@ export default function ScanReview() {
                           />
                         </label>
                       )}
+
+                      <label htmlFor={`remarks-${q.questionId}`} style={{ display: 'block' }}>
+                        <span className="auth-sub" style={{ display: 'block', marginBottom: 4 }}>Remarks for this question</span>
+                        <textarea
+                          id={`remarks-${q.questionId}`}
+                          rows={2}
+                          style={{ width: '100%', resize: 'vertical' }}
+                          placeholder="Optional feedback for the student…"
+                          value={remarks[q.questionId] ?? ''}
+                          onChange={(e) => setRemarks((prev) => ({ ...prev, [q.questionId]: e.target.value }))}
+                        />
+                      </label>
                     </div>
                   );
                 })}
@@ -281,6 +304,15 @@ export default function ScanReview() {
               ) : (
                 <p className="auth-sub" style={{ margin: '0 0 20px' }}>No text recognised. Please refer to the scanned pdf.</p>
               )}
+
+              <div className="field-group-label">Overall remarks</div>
+              <textarea
+                rows={3}
+                style={{ width: '100%', resize: 'vertical', marginBottom: 16 }}
+                placeholder="Optional feedback on the submission as a whole…"
+                value={overallRemarks}
+                onChange={(e) => setOverallRemarks(e.target.value)}
+              />
 
               {saveMessage && <p className="auth-sub" style={{ margin: '0 0 8px' }}>{saveMessage}</p>}
               <div className="scan-capture-actions">

@@ -177,9 +177,9 @@
   border-color: var(--border-strong);
 }
 
-/* Status Indicators on Tabs */
-.tc-tab.status-pass::before,
-.tc-tab.status-fail::before,
+/* Status Indicators on Tabs — pass/fail read as an actual tick/cross glyph
+   rather than a plain colored dot; pending stays a dot since there's no
+   meaningful glyph for "still running". */
 .tc-tab.status-pending::before {
   content: '';
   display: inline-block;
@@ -188,10 +188,18 @@
   border-radius: 50%;
   margin-right: 6px;
   transform: translateY(-1px);
+  background: var(--accent);
+  animation: pulse 1s infinite;
 }
-.tc-tab.status-pass::before { background: var(--teal); box-shadow: 0 0 6px var(--teal); }
-.tc-tab.status-fail::before { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
-.tc-tab.status-pending::before { background: var(--accent); animation: pulse 1s infinite; }
+.tc-tab.status-pass::before,
+.tc-tab.status-fail::before {
+  display: inline-block;
+  margin-right: 5px;
+  font-weight: 700;
+  line-height: 1;
+}
+.tc-tab.status-pass::before { content: '✓'; color: var(--teal); }
+.tc-tab.status-fail::before { content: '✗'; color: var(--danger); }
 
 .tc-tab.status-pass.active { border-color: rgba(79, 209, 197, 0.5); background: var(--teal-dim); }
 .tc-tab.status-fail.active { border-color: rgba(255, 92, 92, 0.5); background: var(--danger-dim); }

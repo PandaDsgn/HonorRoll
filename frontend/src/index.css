@@ -19,7 +19,7 @@
      sapphire would be — against near-black surfaces (--surface-2/3 are
      #191d21/#20252a) a darker value reads as dim/muted rather than
      serious; this is the floor for staying visible as an active indicator. */
-  --accent: #4a72c2;
+  --accent: #4a92c2;
   --accent-strong: #6f96db;
   --accent-dim: rgba(74, 114, 194, 0.2);
 
@@ -782,3 +782,57 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity:
   .sandbox-left { border-right: none; border-bottom: 1px solid var(--border); }
   .sb-crumb { display: none; }
 }
+
+/* Terms of Service / Privacy Policy — plain long-form prose, deliberately
+   narrower than the app's usual full-width panels (readable line length
+   matters more than density here) and public (no sb-topbar auth actions). */
+.legal-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.legal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+.legal-content {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 40px 24px 80px;
+  line-height: 1.7;
+  color: var(--text);
+}
+
+.legal-content h1 {
+  font-size: 26px;
+  margin: 0 0 6px;
+}
+
+.legal-content .legal-updated {
+  color: var(--text-dim);
+  font-size: 13.5px;
+  margin: 0 0 32px;
+}
+
+.legal-content h2 {
+  font-size: 18px;
+  margin: 32px 0 10px;
+}
+
+.legal-content p, .legal-content li {
+  color: var(--text);
+  font-size: 14.5px;
+  margin: 0 0 12px;
+}
+
+.legal-content ul {
+  margin: 0 0 12px;
+  padding-left: 22px;
+}
+
+.legal-content a { color: var(--accent); }
