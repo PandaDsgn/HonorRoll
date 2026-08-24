@@ -2,10 +2,13 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import axios from 'axios';
 import CodeMirror from '@uiw/react-codemirror';
+import { EditorView } from '@codemirror/view';
 import { python } from '@codemirror/lang-python';
 import { cpp } from '@codemirror/lang-cpp';
 import { java } from '@codemirror/lang-java';
 import { useTheme } from '../hooks/useTheme';
+import { useFontSize } from '../hooks/useFontSize';
+import { usePanelSplit } from '../hooks/usePanelSplit';
 import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
 import SpaceSwitcher from '../components/SpaceSwitcher';
@@ -172,6 +175,9 @@ export default function Sandbox() {
   const navigate = useNavigate();
   const { id } = useParams();
   const { theme, toggleTheme } = useTheme();
+  const { fontSize, increaseFontSize, decreaseFontSize, canIncrease, canDecrease } = useFontSize();
+  const sandboxRef = useRef(null);
+  const { leftPercent, dragging, startDragging } = usePanelSplit(sandboxRef);
 
   const [problem, setProblem] = useState(null);
   const [starterCode, setStarterCode] = useState({});
@@ -356,8 +362,8 @@ export default function Sandbox() {
         </div>
       </header>
 
-      <div className="sandbox">
-        <section className="sandbox-left">
+      <div className="sandbox" ref={sandboxRef}>
+        <section className="sandbox-left" style={{ width: `${leftPercent}%` }}>
           {problem ? (
             <>
               <div className="sb-problem-head">
@@ -380,19 +386,36 @@ export default function Sandbox() {
           )}
         </section>
 
-        <section className="sandbox-right">
+        <div
+          className={`sandbox-divider${dragging ? ' dragging' : ''}`}
+          onMouseDown={startDragging}
+          onTouchStart={startDragging}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize panels"
+        />
+
+        <section className="sandbox-right" style={{ width: `${100 - leftPercent}%` }}>
           <div className="sb-toolbar">
-            <div className="segmented" role="tablist">
-              {LANGUAGES.map((l) => (
-                <button
-                  key={l.id}
-                  type="button"
-                  className={language === l.id ? 'active' : ''}
-                  onClick={() => selectLanguage(l.id)}
-                >
-                  {l.label}
-                </button>
-              ))}
+            <div className="sb-toolbar-group">
+              <div className="segmented" role="tablist">
+                {LANGUAGES.map((l) => (
+                  <button
+                    key={l.id}
+                    type="button"
+                    className={language === l.id ? 'active' : ''}
+                    onClick={() => selectLanguage(l.id)}
+                  >
+                    {l.label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="font-size-control">
+                <button type="button" className="btn btn-ghost font-size-btn" aria-label="Decrease font size" disabled={!canDecrease} onClick={decreaseFontSize}>−</button>
+                <span className="font-size-value">{fontSize}px</span>
+                <button type="button" className="btn btn-ghost font-size-btn" aria-label="Increase font size" disabled={!canIncrease} onClick={increaseFontSize}>+</button>
+              </div>
             </div>
 
             <div className="sb-actions">
@@ -414,7 +437,7 @@ export default function Sandbox() {
               value={code}
               height="100%"
               theme={theme === 'light' ? 'light' : 'dark'}
-              extensions={getLanguageExtension()}
+              extensions={[...getLanguageExtension(), EditorView.theme({ '&': { fontSize: `${fontSize}px` } })]}
               onChange={(val) => setCode(val)}
               className="cm-wrap"
             />

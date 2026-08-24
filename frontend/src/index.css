@@ -449,6 +449,46 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity:
   color: var(--accent);
 }
 
+/* ---------- mobile hamburger nav (SpaceSwitcher, AdminDashboard tabs) ---------- */
+/* Below this width, a full row of segmented buttons (up to 8 for an admin)
+   wraps into two-plus rows and pushes real content down the page — swap it
+   for a single hamburger button that opens the same items as a dropdown
+   instead. Both the row and the toggle/dropdown stay in the DOM always;
+   only `display` changes, so there's no JS viewport check or layout
+   flash on mount. */
+.space-nav-mobile { display: none; position: relative; }
+.space-nav-drawer {
+  position: absolute;
+  /* Default: opens toward the left (right edge pinned to the toggle
+     button's own right edge) — used by AdminDashboard's section-tab
+     drawer, whose toggle sits near the right edge of .admin-head. */
+  right: 0;
+  top: calc(100% + 8px);
+  min-width: 180px;
+  z-index: 60;
+  flex-direction: column;
+  flex-wrap: nowrap;
+  align-items: stretch;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+  padding: 8px;
+}
+.space-nav-drawer button { text-align: left; width: 100%; }
+
+/* SpaceSwitcher's own drawer (the top-bar hamburger) opens centered below
+   its toggle instead — that button sits further from the page edge, with
+   NotificationBell/ThemeToggle/Log-out to its right, so a left- or
+   right-pinned drawer would sit off-center under everything else in
+   .sb-actions rather than under the button that opened it. */
+.space-nav-drawer-center {
+  right: auto;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+@media (max-width: 760px) {
+  .space-nav-row { display: none; }
+  .space-nav-mobile { display: inline-flex; }
+}
 
 /* ---------- theme toggle ---------- */
 .theme-toggle {
@@ -582,10 +622,39 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity:
 .sandbox { display: flex; flex: 1; min-height: 0; }
 
 .sandbox-left {
-  width: 40%;
   padding: 32px 36px;
-  border-right: 1px solid var(--border);
   overflow-y: auto;
+  flex-shrink: 0;
+}
+
+/* Drag handle between the left (problem/stdin) and right (editor/console)
+   columns — replaces what used to be a static border-right on .sandbox-left
+   with something actually draggable. A 1px line sits centered in a wider
+   invisible hit-area so it's easy to grab without needing pixel-perfect
+   aim. Width is driven by usePanelSplit's leftPercent, applied as inline
+   styles on the two sections rather than here. */
+.sandbox-divider {
+  flex-shrink: 0;
+  width: 9px;
+  margin: 0 -4px;
+  cursor: col-resize;
+  position: relative;
+  z-index: 5;
+}
+.sandbox-divider::before {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+  transition: background 0.15s ease;
+}
+.sandbox-divider:hover::before, .sandbox-divider.dragging::before {
+  background: var(--accent);
+  width: 2px;
+  left: 3.5px;
 }
 .sb-problem-head {
   display: flex;
@@ -601,15 +670,26 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity:
 .sb-loading { color: var(--text-dim); font-family: var(--font-sans); font-size: 13px; }
 
 .sandbox-right {
-  width: 60%;
   display: flex;
   flex-direction: column;
   gap: 14px;
   padding: 20px;
   min-height: 0;
+  flex-shrink: 0;
 }
 
-.sb-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-shrink: 0; }
+.sb-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-shrink: 0; flex-wrap: wrap; }
+.sb-toolbar-group { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+
+.font-size-control { display: inline-flex; align-items: center; gap: 4px; }
+.font-size-btn { padding: 4px 10px; line-height: 1; font-size: 14px; font-weight: 700; }
+.font-size-value {
+  min-width: 40px;
+  text-align: center;
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
 
 .editor-panel {
   flex: 2;
@@ -778,8 +858,13 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity:
 
 @media (max-width: 900px) {
   .sandbox { flex-direction: column; }
-  .sandbox-left, .sandbox-right { width: 100%; }
-  .sandbox-left { border-right: none; border-bottom: 1px solid var(--border); }
+  /* !important: usePanelSplit sets an inline width style on these two
+     elements for the desktop drag-resize, which would otherwise out-rank
+     this rule and keep them at their last desktop split percentage instead
+     of stacking full-width. */
+  .sandbox-left, .sandbox-right { width: 100% !important; }
+  .sandbox-left { border-bottom: 1px solid var(--border); }
+  .sandbox-divider { display: none; }
   .sb-crumb { display: none; }
 }
 

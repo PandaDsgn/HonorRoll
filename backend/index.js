@@ -85,8 +85,21 @@ app.use(express.json({
   verify: (req, res, buf) => { req.rawBody = buf; },
 }));
 const cors = require('cors');
+// Besides the two fixed origins, also allow the Vite dev server when it's
+// reached from another device on the same private network (e.g. a phone
+// testing mobile layout against a laptop's `npm run dev -- --host`) — an
+// origin header can only ever reflect where the requesting page is actually
+// served from, so a private-network address here can't be spoofed by an
+// unrelated public site, it just widens local dev testing without loosening
+// anything for the real deployed origins.
+const LAN_DEV_ORIGIN_RE = /^http:\/\/(10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}):5173$/;
 app.use(cors({
-  origin: ['http://localhost:5173', 'https://pandadsgn.github.io'],
+  origin: (origin, callback) => {
+    if (!origin || origin === 'http://localhost:5173' || origin === 'https://pandadsgn.github.io' || LAN_DEV_ORIGIN_RE.test(origin)) {
+      return callback(null, true);
+    }
+    callback(new Error('Not allowed by CORS'));
+  },
   credentials: true
 }));
 

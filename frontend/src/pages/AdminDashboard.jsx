@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, Fragment } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef, Fragment } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import axios from 'axios';
 import { useTheme } from '../hooks/useTheme';
@@ -49,6 +49,16 @@ function toDatetimeLocal(iso) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+function MenuIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <line x1="4" y1="7" x2="20" y2="7" />
+      <line x1="4" y1="12" x2="20" y2="12" />
+      <line x1="4" y1="17" x2="20" y2="17" />
+    </svg>
+  );
+}
+
 export default function AdminDashboard() {
   const navigate = useNavigate();
   const location = useLocation();
@@ -57,6 +67,20 @@ export default function AdminDashboard() {
   const [tab, setTab] = useState('students');
   const [selectedStudentId, setSelectedStudentId] = useState(null);
   const [selectedMyStudentId, setSelectedMyStudentId] = useState(null);
+
+  // Mobile-only dropdown for the section tab bar below — see .space-nav-mobile
+  // in index.css and SpaceSwitcher's own identical pattern for why both the
+  // full row and this toggle/dropdown stay in the DOM at all times.
+  const [adminTabsMobileOpen, setAdminTabsMobileOpen] = useState(false);
+  const adminTabsMobileRef = useRef(null);
+  useEffect(() => {
+    if (!adminTabsMobileOpen) return undefined;
+    const onClickOutside = (e) => {
+      if (adminTabsMobileRef.current && !adminTabsMobileRef.current.contains(e.target)) setAdminTabsMobileOpen(false);
+    };
+    document.addEventListener('mousedown', onClickOutside);
+    return () => document.removeEventListener('mousedown', onClickOutside);
+  }, [adminTabsMobileOpen]);
 
   // 'students' (StudentsPanel/StudentDetailPanel below) hits admin-only
   // routes — a teacher landing here on the default tab would just see a
@@ -96,59 +120,56 @@ export default function AdminDashboard() {
             {user?.name && <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-h)' }}>{user.name}</div>}
             {user?.organization_name && <div style={{ fontSize: 13, color: 'var(--text-dim)', marginTop: 2 }}>{user.organization_name}</div>}
           </div>
-          <div className="segmented" role="tablist" aria-label="Admin section">
-            {user?.role === 'admin' && (
-              <button type="button" role="tab" aria-pressed={tab === 'students'} className={tab === 'students' ? 'active' : ''} onClick={() => { setTab('students'); setSelectedStudentId(null); }}>
-                Students
-              </button>
-            )}
-            {user?.role === 'teacher' && (
-              <button type="button" role="tab" aria-pressed={tab === 'my-students'} className={tab === 'my-students' ? 'active' : ''} onClick={() => { setTab('my-students'); setSelectedMyStudentId(null); }}>
-                My Students
-              </button>
-            )}
-            {user?.role === 'teacher' && (
-              <button type="button" role="tab" aria-pressed={tab === 'assignments'} className={tab === 'assignments' ? 'active' : ''} onClick={() => setTab('assignments')}>
-                Assignments
-              </button>
-            )}
-            <button type="button" role="tab" aria-pressed={tab === 'exams'} className={tab === 'exams' ? 'active' : ''} onClick={() => setTab('exams')}>
-              Exams
-            </button>
-            <button type="button" role="tab" aria-pressed={tab === 'gradebook'} className={tab === 'gradebook' ? 'active' : ''} onClick={() => setTab('gradebook')}>
-              Gradebook
-            </button>
-            {user?.role === 'teacher' && (
-              <button type="button" role="tab" aria-pressed={tab === 'uploads'} className={tab === 'uploads' ? 'active' : ''} onClick={() => setTab('uploads')}>
-                Uploads
-              </button>
-            )}
-            {user?.role === 'admin' && (
-              <button type="button" role="tab" aria-pressed={tab === 'notices'} className={tab === 'notices' ? 'active' : ''} onClick={() => setTab('notices')}>
-                Notices
-              </button>
-            )}
-            {user?.role === 'admin' && (
-              <button type="button" role="tab" aria-pressed={tab === 'grade-scale'} className={tab === 'grade-scale' ? 'active' : ''} onClick={() => setTab('grade-scale')}>
-                Grading
-              </button>
-            )}
-            {user?.role === 'admin' && (
-              <button type="button" role="tab" aria-pressed={tab === 'structure'} className={tab === 'structure' ? 'active' : ''} onClick={() => setTab('structure')}>
-                Structure
-              </button>
-            )}
-            {user?.role === 'admin' && (
-              <button type="button" role="tab" aria-pressed={tab === 'billing'} className={tab === 'billing' ? 'active' : ''} onClick={() => setTab('billing')}>
-                Billing
-              </button>
-            )}
-            {user?.role === 'admin' && (
-              <button type="button" role="tab" aria-pressed={tab === 'contact-superadmin'} className={tab === 'contact-superadmin' ? 'active' : ''} onClick={() => setTab('contact-superadmin')}>
-                Contact Superadmin
-              </button>
-            )}
-          </div>
+          {(() => {
+            // Same list rendered twice below (full row on desktop, dropdown
+            // on mobile — see .space-nav-mobile's own comment in index.css
+            // for why both are always in the DOM) — building it once here
+            // keeps the two renders from drifting out of sync with each
+            // other as tabs get added/removed.
+            const adminTabs = [
+              user?.role === 'admin' && { id: 'students', label: 'Students', onClick: () => { setTab('students'); setSelectedStudentId(null); } },
+              user?.role === 'teacher' && { id: 'my-students', label: 'My Students', onClick: () => { setTab('my-students'); setSelectedMyStudentId(null); } },
+              user?.role === 'teacher' && { id: 'assignments', label: 'Assignments', onClick: () => setTab('assignments') },
+              { id: 'exams', label: 'Exams', onClick: () => setTab('exams') },
+              { id: 'gradebook', label: 'Gradebook', onClick: () => setTab('gradebook') },
+              user?.role === 'teacher' && { id: 'uploads', label: 'Uploads', onClick: () => setTab('uploads') },
+              user?.role === 'admin' && { id: 'notices', label: 'Notices', onClick: () => setTab('notices') },
+              user?.role === 'admin' && { id: 'grade-scale', label: 'Grading', onClick: () => setTab('grade-scale') },
+              user?.role === 'admin' && { id: 'structure', label: 'Structure', onClick: () => setTab('structure') },
+              user?.role === 'admin' && { id: 'billing', label: 'Billing', onClick: () => setTab('billing') },
+              user?.role === 'admin' && { id: 'contact-superadmin', label: 'Contact Superadmin', onClick: () => setTab('contact-superadmin') },
+            ].filter(Boolean);
+
+            return (
+              <>
+                <div className="segmented space-nav-row" role="tablist" aria-label="Admin section">
+                  {adminTabs.map((t) => (
+                    <button key={t.id} type="button" role="tab" aria-pressed={tab === t.id} className={tab === t.id ? 'active' : ''} onClick={t.onClick}>
+                      {t.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="space-nav-mobile" ref={adminTabsMobileRef}>
+                  <button type="button" className="btn btn-ghost" aria-label="Section menu" aria-expanded={adminTabsMobileOpen} onClick={() => setAdminTabsMobileOpen((v) => !v)}>
+                    <MenuIcon />
+                  </button>
+                  {adminTabsMobileOpen && (
+                    <div className="panel segmented space-nav-drawer" role="tablist" aria-label="Admin section">
+                      {adminTabs.map((t) => (
+                        <button
+                          key={t.id} type="button" role="tab" aria-pressed={tab === t.id}
+                          className={tab === t.id ? 'active' : ''}
+                          onClick={() => { setAdminTabsMobileOpen(false); t.onClick(); }}
+                        >
+                          {t.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </>
+            );
+          })()}
         </div>
 
         {tab === 'students' ? (
@@ -2545,7 +2566,7 @@ function IntegrationsPanel() {
         Point your Google Form's submit trigger at this URL to auto-create student accounts in {org.name}.
       </p>
       <div className="testcase-row">
-        <input value={webhookUrl} readOnly style={{ fontFamily: 'var(--font-mono)', fontSize: '12.5px' }} />
+        <input value={webhookUrl} readOnly style={{ fontFamily: 'var(--font-mono)', fontSize: '12.5px', textOverflow: 'ellipsis', overflow: 'hidden', minWidth: 0, width: '100%' }} />
         <button type="button" className="btn btn-ghost btn-sm" onClick={copyUrl}>{copied ? 'Copied' : 'Copy'}</button>
       </div>
     </div>
