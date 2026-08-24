@@ -23,6 +23,15 @@ function formatFlagStatus(status) {
   return FLAG_STATUS_LABELS[status] || status;
 }
 
+const FLAG_TYPE_LABELS = {
+  text_similarity: 'Text plagiarism (handwritten)',
+  typed_text_similarity: 'Text plagiarism (typed)',
+  handwriting: 'Handwriting match',
+};
+function formatFlagType(type) {
+  return FLAG_TYPE_LABELS[type] || type;
+}
+
 // One scanned submission's full review — OCR'd pages, each question with
 // the AI's correctness assessment (an aid, never authoritative — see
 // backend/aiGrading.js) alongside a marks input the teacher actually
@@ -154,14 +163,17 @@ export default function ScanReview() {
             </div>
           )}
 
-          {submission && (
+          {submission && (() => {
+            const hasScanQuestions = submission.questions.some((q) => q.type === 'scan');
+            return (
             <>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, marginBottom: 16 }}>
                 <div>
                   <h2 style={{ margin: '0 0 4px' }}>{submission.name || submission.email}</h2>
                   <p className="auth-sub" style={{ margin: 0 }}>
-                    Submitted {formatScanDate(submission.createdAt)} — status: {formatScanStatus(submission.status)}
-                    {submission.ocrError && ` (${submission.ocrError})`}
+                    Submitted {formatScanDate(submission.createdAt)}
+                    {hasScanQuestions && ` — status: ${formatScanStatus(submission.status)}`}
+                    {hasScanQuestions && submission.ocrError && ` (${submission.ocrError})`}
                   </p>
                 </div>
                 <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -169,7 +181,7 @@ export default function ScanReview() {
                   {submission.viewUrl && (
                     <a className="btn btn-ghost" href={submission.viewUrl} target="_blank" rel="noreferrer">View PDF</a>
                   )}
-                  {submission.status !== 'processing' && (
+                  {hasScanQuestions && submission.status !== 'processing' && (
                     <button type="button" className="btn btn-ghost" disabled={ocrStarting} onClick={runOcrNow}>
                       {ocrStarting && <span className="spinner" />}
                       {ocrStarting ? 'Starting…' : submission.status === 'ocr_done' ? 'Run OCR again' : 'Run OCR now'}
@@ -186,6 +198,7 @@ export default function ScanReview() {
                       <thead>
                         <tr>
                           <th>Type</th>
+                          <th>Question</th>
                           <th>Matched submission</th>
                           <th>Similarity</th>
                           <th>Status</th>
@@ -193,24 +206,29 @@ export default function ScanReview() {
                         </tr>
                       </thead>
                       <tbody>
-                        {submission.flags.map((f) => (
-                          <tr key={`${f.type}-${f.id}`}>
-                            <td>{f.type === 'text_similarity' ? 'Text plagiarism' : 'Handwriting match'}</td>
-                            <td>#{f.otherSubmissionId}</td>
-                            <td>{Math.round(f.similarityScore * 100)}%</td>
-                            <td>{formatFlagStatus(f.status)}</td>
-                            <td>
-                              {f.status === 'open' && (
-                                <div style={{ display: 'flex', gap: 6 }}>
-                                  <button type="button" className="btn btn-ghost btn-sm" disabled={flagBusyId === f.id} onClick={() => resolveFlag(f, 'reviewed_dismissed')}>Dismiss</button>
-                                  <button type="button" className="btn btn-primary btn-sm" disabled={flagBusyId === f.id} onClick={() => resolveFlag(f, 'reviewed_confirmed')}>
-                                    {f.type === 'text_similarity' ? 'Confirm (penalizes both)' : 'Confirm'}
-                                  </button>
-                                </div>
-                              )}
-                            </td>
-                          </tr>
-                        ))}
+                        {submission.flags.map((f) => {
+                          const isTextFlag = f.type !== 'handwriting';
+                          const flaggedQuestion = f.questionId != null ? submission.questions.find((q) => q.questionId === f.questionId) : null;
+                          return (
+                            <tr key={`${f.type}-${f.id}`}>
+                              <td>{formatFlagType(f.type)}</td>
+                              <td>{flaggedQuestion ? flaggedQuestion.prompt : '—'}</td>
+                              <td>#{f.otherSubmissionId}</td>
+                              <td>{Math.round(f.similarityScore * 100)}%</td>
+                              <td>{formatFlagStatus(f.status)}</td>
+                              <td>
+                                {f.status === 'open' && (
+                                  <div style={{ display: 'flex', gap: 6 }}>
+                                    <button type="button" className="btn btn-ghost btn-sm" disabled={flagBusyId === f.id} onClick={() => resolveFlag(f, 'reviewed_dismissed')}>Dismiss</button>
+                                    <button type="button" className="btn btn-primary btn-sm" disabled={flagBusyId === f.id} onClick={() => resolveFlag(f, 'reviewed_confirmed')}>
+                                      {isTextFlag ? 'Confirm (penalizes both)' : 'Confirm'}
+                                    </button>
+                                  </div>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -287,22 +305,26 @@ export default function ScanReview() {
                 })}
               </div>
 
-              <div className="field-group-label">OCR'd text</div>
-              {submission.pages.length > 0 ? (
-                submission.pages.map((p) => (
-                  <div key={p.page} className="panel" style={{ padding: 14, marginBottom: 10 }}>
-                    <p className="auth-sub" style={{ margin: '0 0 6px' }}>Page {p.page} — confidence {Math.round((p.confidence || 0) * 100)}%</p>
-                    <pre style={{ whiteSpace: 'pre-wrap', margin: 0, fontFamily: 'var(--font-sans)' }}>{p.text || '(no text recognized)'}</pre>
-                  </div>
-                ))
-              ) : submission.status === 'pending' ? (
-                <p className="auth-sub" style={{ margin: '0 0 20px' }}>OCR hasn't run yet — it starts automatically once the assignment's deadline passes, or use "Run OCR now" above to process it immediately.</p>
-              ) : submission.status === 'processing' ? (
-                <p className="auth-sub" style={{ margin: '0 0 20px' }}>OCR is running now — this can take a minute or two. Reload to check back.</p>
-              ) : submission.status === 'ocr_failed' ? (
-                <p className="auth-sub" style={{ margin: '0 0 20px' }}>OCR failed{submission.ocrError ? `: ${submission.ocrError}` : '.'} Please refer to the scanned pdf, or try "Run OCR now" again.</p>
-              ) : (
-                <p className="auth-sub" style={{ margin: '0 0 20px' }}>No text recognised. Please refer to the scanned pdf.</p>
+              {hasScanQuestions && (
+                <>
+                  <div className="field-group-label">OCR'd text</div>
+                  {submission.pages.length > 0 ? (
+                    submission.pages.map((p) => (
+                      <div key={p.page} className="panel" style={{ padding: 14, marginBottom: 10 }}>
+                        <p className="auth-sub" style={{ margin: '0 0 6px' }}>Page {p.page} — confidence {Math.round((p.confidence || 0) * 100)}%</p>
+                        <pre style={{ whiteSpace: 'pre-wrap', margin: 0, fontFamily: 'var(--font-sans)' }}>{p.text || '(no text recognized)'}</pre>
+                      </div>
+                    ))
+                  ) : submission.status === 'pending' ? (
+                    <p className="auth-sub" style={{ margin: '0 0 20px' }}>OCR hasn't run yet — it starts automatically once the assignment's deadline passes, or use "Run OCR now" above to process it immediately.</p>
+                  ) : submission.status === 'processing' ? (
+                    <p className="auth-sub" style={{ margin: '0 0 20px' }}>OCR is running now — this can take a minute or two. Reload to check back.</p>
+                  ) : submission.status === 'ocr_failed' ? (
+                    <p className="auth-sub" style={{ margin: '0 0 20px' }}>OCR failed{submission.ocrError ? `: ${submission.ocrError}` : '.'} Please refer to the scanned pdf, or try "Run OCR now" again.</p>
+                  ) : (
+                    <p className="auth-sub" style={{ margin: '0 0 20px' }}>No text recognised. Please refer to the scanned pdf.</p>
+                  )}
+                </>
               )}
 
               <div className="field-group-label">Overall remarks</div>
@@ -322,7 +344,8 @@ export default function ScanReview() {
                 </button>
               </div>
             </>
-          )}
+            );
+          })()}
         </div>
       </section>
     </div>

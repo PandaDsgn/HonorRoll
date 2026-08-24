@@ -115,6 +115,9 @@ export default function AdminDashboard() {
             <button type="button" role="tab" aria-pressed={tab === 'exams'} className={tab === 'exams' ? 'active' : ''} onClick={() => setTab('exams')}>
               Exams
             </button>
+            <button type="button" role="tab" aria-pressed={tab === 'gradebook'} className={tab === 'gradebook' ? 'active' : ''} onClick={() => setTab('gradebook')}>
+              Gradebook
+            </button>
             {user?.role === 'teacher' && (
               <button type="button" role="tab" aria-pressed={tab === 'uploads'} className={tab === 'uploads' ? 'active' : ''} onClick={() => setTab('uploads')}>
                 Uploads
@@ -168,6 +171,8 @@ export default function AdminDashboard() {
           user?.role === 'teacher' ? <AssignmentsPanel /> : null
         ) : tab === 'exams' ? (
           <ExamsPanel />
+        ) : tab === 'gradebook' ? (
+          <GradebookPanel />
         ) : tab === 'uploads' ? (
           user?.role === 'teacher' ? <TeacherUploadsPanel /> : null
         ) : tab === 'notices' ? (
@@ -205,10 +210,254 @@ export default function AdminDashboard() {
               <TagVisibilityPanel />
               <GradeBandsPanel />
               <ScanPlagiarismThresholdPanel />
+              <CodePlagiarismThresholdPanel />
             </>
           ) : null
         ) : null}
       </section>
+    </div>
+  );
+}
+
+// ============================================================================
+// GRADEBOOK — full per-student x per-item score matrix for one subject (see
+// GET /api/admin/gradebook), with a class-average footer row. Works for both
+// admin (any subject in the org) and teacher (their own subjects only) —
+// the subject picker itself is already scoped correctly by
+// GET /api/admin/subjects, same list ExamForm's subject dropdown uses.
+// ============================================================================
+function GradebookPanel() {
+  const [subjects, setSubjects] = useState(null);
+  const [subjectId, setSubjectId] = useState('');
+  const [data, setData] = useState(null);
+  const [error, setError] = useState('');
+  const [leaderboardItem, setLeaderboardItem] = useState(null); // { type, itemId, title } | null
+
+  useEffect(() => {
+    axios.get(`${API}/api/admin/subjects`, { withCredentials: true })
+      .then((res) => {
+        setSubjects(res.data.subjects);
+        if (res.data.subjects.length > 0) setSubjectId(String(res.data.subjects[0].id));
+      })
+      .catch(() => setError('Failed to load subjects.'));
+  }, []);
+
+  useEffect(() => {
+    if (!subjectId) { setData(null); return; }
+    setData(null);
+    setError('');
+    axios.get(`${API}/api/admin/gradebook`, { params: { subjectId }, withCredentials: true })
+      .then((res) => setData(res.data))
+      .catch(() => setError('Failed to load gradebook.'));
+  }, [subjectId]);
+
+  const fmtPct = (v) => (v == null ? '—' : `${Math.round(v)}%`);
+
+  const downloadCsv = () => {
+    if (!data) return;
+    const headers = ['Student', 'Email', ...data.assignments.map((a) => a.title), ...data.exams.map((e) => e.title), 'Avg Assignment %', 'Avg Exam %'];
+    const escape = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const rows = data.students.map((s) => [
+      s.name || '',
+      s.email,
+      ...data.assignments.map((a) => (s.assignments[a.id]?.pct != null ? Math.round(s.assignments[a.id].pct) : '')),
+      ...data.exams.map((e) => (s.exams[e.id]?.pct != null ? Math.round(s.exams[e.id].pct) : '')),
+      s.avgAssignmentPercent != null ? Math.round(s.avgAssignmentPercent) : '',
+      s.avgExamPercent != null ? Math.round(s.avgExamPercent) : '',
+    ]);
+    const classAvgRow = [
+      'Class average', '',
+      ...data.assignments.map((a) => (data.classAverages.assignments[a.id] != null ? Math.round(data.classAverages.assignments[a.id]) : '')),
+      ...data.exams.map((e) => (data.classAverages.exams[e.id] != null ? Math.round(data.classAverages.exams[e.id]) : '')),
+      data.classAverages.overallAssignment != null ? Math.round(data.classAverages.overallAssignment) : '',
+      data.classAverages.overallExam != null ? Math.round(data.classAverages.overallExam) : '',
+    ];
+    const csv = [headers, ...rows, classAvgRow].map((r) => r.map(escape).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `gradebook-${data.subject.name.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="panel" style={{ padding: 20 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
+        <h3 style={{ margin: 0 }}>Gradebook</h3>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {subjects && subjects.length > 0 && (
+            <select value={subjectId} onChange={(e) => setSubjectId(e.target.value)}>
+              {subjects.map((s) => (
+                <option key={s.id} value={s.id}>{s.name} — {s.org_unit_name}</option>
+              ))}
+            </select>
+          )}
+          <button type="button" className="btn btn-ghost btn-sm" onClick={downloadCsv} disabled={!data || data.students.length === 0}>
+            Export CSV
+          </button>
+        </div>
+      </div>
+
+      {error && <div className="alert"><span className="alert-icon">!</span><span>{error}</span></div>}
+      {!error && subjects && subjects.length === 0 && (
+        <p className="sb-loading">No subjects available yet — ask an admin to set one up under Structure → Subjects.</p>
+      )}
+      {!error && subjects && subjects.length > 0 && !data && <p className="sb-loading">Loading gradebook…</p>}
+      {!error && data && data.students.length > 0 && (data.assignments.length > 0 || data.exams.length > 0) && (
+        <p className="auth-sub" style={{ margin: '0 0 10px' }}>Click a column header to see that item's ranked leaderboard.</p>
+      )}
+
+      {leaderboardItem && (
+        <LeaderboardModal
+          type={leaderboardItem.type}
+          itemId={leaderboardItem.itemId}
+          title={leaderboardItem.title}
+          onClose={() => setLeaderboardItem(null)}
+        />
+      )}
+
+      {data && (
+        data.students.length === 0 ? (
+          <p className="sb-loading">No students found under this subject yet.</p>
+        ) : (
+          <div className="admin-table-wrap">
+            <table className="admin-table">
+              <thead>
+                <tr>
+                  <th>Student</th>
+                  {data.assignments.map((a) => (
+                    <th key={`a-${a.id}`}>
+                      <button type="button" className="admin-th-sortable" style={{ background: 'none', border: 'none', color: 'inherit', font: 'inherit', cursor: 'pointer', padding: 0 }} onClick={() => setLeaderboardItem({ type: 'assignment', itemId: a.id, title: a.title })} title="View leaderboard">
+                        {a.title}
+                      </button>
+                    </th>
+                  ))}
+                  {data.exams.map((e) => (
+                    <th key={`e-${e.id}`}>
+                      <button type="button" className="admin-th-sortable" style={{ background: 'none', border: 'none', color: 'inherit', font: 'inherit', cursor: 'pointer', padding: 0 }} onClick={() => setLeaderboardItem({ type: 'exam', itemId: e.id, title: e.title })} title="View leaderboard">
+                        {e.title}
+                      </button>
+                    </th>
+                  ))}
+                  <th>Avg Assignment</th>
+                  <th>Avg Exam</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.students.map((s) => (
+                  <tr key={s.id}>
+                    <td className="admin-cell-strong">
+                      {s.name || s.email}
+                      {s.name && <div style={{ color: 'var(--text-dim)', fontSize: '12px', fontWeight: 400 }}>{s.email}</div>}
+                    </td>
+                    {data.assignments.map((a) => {
+                      const cell = s.assignments[a.id];
+                      return (
+                        <td key={`a-${a.id}`}>
+                          {cell.status === 'not_submitted' ? '—' : cell.status === 'pending_grading' ? <span className="chip chip-medium"><span className="dot" />grading</span> : fmtPct(cell.pct)}
+                        </td>
+                      );
+                    })}
+                    {data.exams.map((e) => {
+                      const cell = s.exams[e.id];
+                      return (
+                        <td key={`e-${e.id}`}>
+                          {cell.status === 'not_submitted' ? '—' : cell.status === 'in_progress' ? <span className="chip chip-medium"><span className="dot" />in progress</span> : cell.status === 'pending_grading' ? <span className="chip chip-medium"><span className="dot" />grading</span> : fmtPct(cell.pct)}
+                        </td>
+                      );
+                    })}
+                    <td>{fmtPct(s.avgAssignmentPercent)}</td>
+                    <td>{fmtPct(s.avgExamPercent)}</td>
+                  </tr>
+                ))}
+                <tr style={{ borderTop: '2px solid var(--border-strong)', fontWeight: 600 }}>
+                  <td>Class average</td>
+                  {data.assignments.map((a) => <td key={`a-${a.id}`}>{fmtPct(data.classAverages.assignments[a.id])}</td>)}
+                  {data.exams.map((e) => <td key={`e-${e.id}`}>{fmtPct(data.classAverages.exams[e.id])}</td>)}
+                  <td>{fmtPct(data.classAverages.overallAssignment)}</td>
+                  <td>{fmtPct(data.classAverages.overallExam)}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        )
+      )}
+    </div>
+  );
+}
+
+// Ranked class view for one exam/assignment (GET /api/admin/leaderboard),
+// opened by clicking a Gradebook column header. Simple fixed-overlay dialog
+// — there's no shared Modal component elsewhere in this codebase yet, so
+// this stays self-contained rather than introducing one for a single use.
+function LeaderboardModal({ type, itemId, title, onClose }) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    setData(null);
+    setError('');
+    axios.get(`${API}/api/admin/leaderboard`, { params: { type, itemId }, withCredentials: true })
+      .then((res) => setData(res.data))
+      .catch(() => setError('Failed to load leaderboard.'));
+  }, [type, itemId]);
+
+  return (
+    <div
+      style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}
+      onClick={onClose}
+    >
+      <div
+        className="panel"
+        style={{ maxWidth: 520, width: '100%', maxHeight: '80vh', overflowY: 'auto', padding: 20 }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
+          <div>
+            <h3 style={{ margin: 0 }}>{title}</h3>
+            <p className="auth-sub" style={{ margin: '2px 0 0' }}>Leaderboard</p>
+          </div>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={onClose}>Close</button>
+        </div>
+
+        {error && <div className="alert"><span className="alert-icon">!</span><span>{error}</span></div>}
+        {!error && !data && <p className="sb-loading">Loading…</p>}
+
+        {data && (
+          data.ranked.length === 0 ? (
+            <p className="sb-loading">No graded scores yet.</p>
+          ) : (
+            <>
+              <p className="auth-sub" style={{ margin: '0 0 12px' }}>
+                Class average: {data.classAverage != null ? `${Math.round(data.classAverage)}%` : '—'} across {data.ranked.length} graded student{data.ranked.length === 1 ? '' : 's'}
+                {data.ungraded.length > 0 && ` (${data.ungraded.length} not yet graded/submitted)`}
+              </p>
+              <table className="admin-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Student</th>
+                    <th>Score</th>
+                    <th>Percentile</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.ranked.map((r) => (
+                    <tr key={r.id}>
+                      <td>{r.rank}</td>
+                      <td className="admin-cell-strong">{r.name || r.email}</td>
+                      <td>{Math.round(r.pct)}%</td>
+                      <td>{r.tag ? <span className="chip chip-neutral"><span className="dot" />{r.tag}</span> : '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
+          )
+        )}
+      </div>
     </div>
   );
 }
@@ -1058,6 +1307,7 @@ function AssignmentsPanel() {
   const [editingWindowId, setEditingWindowId] = useState(null);
   const [windowDraft, setWindowDraft] = useState({ opensAt: '', closesAt: '' });
   const [expandedAttemptsProblemId, setExpandedAttemptsProblemId] = useState(null);
+  const [plagiarismProblem, setPlagiarismProblem] = useState(null);
 
   const fetchProblems = useCallback(async () => {
     try {
@@ -1194,6 +1444,9 @@ function AssignmentsPanel() {
                               </button>
                               <button type="button" className="btn btn-ghost btn-sm" onClick={() => startFullEdit(p)}>Edit</button>
                               <button type="button" className="btn btn-ghost btn-sm" onClick={() => startEditWindow(p)}>Deadline</button>
+                              {p.submission_mode !== 'scan' && (
+                                <button type="button" className="btn btn-ghost btn-sm" onClick={() => setPlagiarismProblem(p)}>Plagiarism</button>
+                              )}
                               <button type="button" className="btn btn-ghost btn-sm" onClick={() => setConfirmingId(p.id)}>Delete</button>
                             </>
                           )}
@@ -1216,6 +1469,81 @@ function AssignmentsPanel() {
           </table>
         </div>
       )}
+
+      {plagiarismProblem && (
+        <CodePlagiarismModal
+          problemId={plagiarismProblem.id}
+          problemTitle={plagiarismProblem.title}
+          onClose={() => setPlagiarismProblem(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+// Open code-similarity flags for one coding assignment (GET /api/admin/
+// problems/:id/code-flags), with confirm/dismiss actions. Same self-
+// contained fixed-overlay treatment as the other admin modals.
+function CodePlagiarismModal({ problemId, problemTitle, onClose }) {
+  const [flags, setFlags] = useState(null);
+  const [error, setError] = useState('');
+  const [busyId, setBusyId] = useState(null);
+
+  const fetchFlags = useCallback(() => {
+    axios.get(`${API}/api/admin/problems/${problemId}/code-flags`, { withCredentials: true })
+      .then((res) => setFlags(res.data.flags))
+      .catch(() => setError('Failed to load flags.'));
+  }, [problemId]);
+
+  useEffect(() => { fetchFlags(); }, [fetchFlags]);
+
+  const review = async (flagId, status) => {
+    setBusyId(flagId);
+    try {
+      await axios.put(`${API}/api/admin/code-flags/${flagId}`, { status }, { withCredentials: true });
+      setFlags((prev) => prev.filter((f) => f.id !== flagId));
+    } catch {
+      setError('Failed to update flag.');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }} onClick={onClose}>
+      <div className="panel" style={{ maxWidth: 560, width: '100%', maxHeight: '80vh', overflowY: 'auto', padding: 20 }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
+          <div>
+            <h3 style={{ margin: 0 }}>Plagiarism flags</h3>
+            <p className="auth-sub" style={{ margin: '2px 0 0' }}>{problemTitle}</p>
+          </div>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={onClose}>Close</button>
+        </div>
+
+        {error && <div className="alert" style={{ marginBottom: 10 }}><span className="alert-icon">!</span><span>{error}</span></div>}
+        {!flags ? (
+          <p className="sb-loading">Loading…</p>
+        ) : flags.length === 0 ? (
+          <p className="sb-loading">No open flags — no Accepted solutions have matched above the similarity threshold.</p>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {flags.map((f) => (
+              <div key={f.id} className="submission-card">
+                <div className="submission-card-head">
+                  <span>
+                    {f.submissionA.name || f.submissionA.email} &harr; {f.submissionB.name || f.submissionB.email}
+                  </span>
+                  <span className="chip chip-hard"><span className="dot" />{Math.round(f.similarityScore * 100)}% similar</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 8 }}>
+                  <button type="button" className="btn btn-ghost btn-sm" disabled={busyId === f.id} onClick={() => review(f.id, 'reviewed_dismissed')}>Dismiss</button>
+                  <button type="button" className="btn btn-danger btn-sm" disabled={busyId === f.id} onClick={() => review(f.id, 'reviewed_confirmed')}>Confirm</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -1434,13 +1762,14 @@ function AdminScanUploadForm({ problemId, onUploaded }) {
 function ScanSubmissionsPanel({ problemId }) {
   const navigate = useNavigate();
   const [submissions, setSubmissions] = useState(null);
+  const [hasScanQuestions, setHasScanQuestions] = useState(false);
   const [error, setError] = useState('');
   const [expandedTextId, setExpandedTextId] = useState(null);
   const [processingId, setProcessingId] = useState(null);
 
   const fetchSubmissions = useCallback(() => {
     axios.get(`${API}/api/admin/problems/${problemId}/scan-submissions`, { withCredentials: true })
-      .then((res) => setSubmissions(res.data.submissions))
+      .then((res) => { setSubmissions(res.data.submissions); setHasScanQuestions(res.data.hasScanQuestions); })
       .catch(() => setError('Failed to load submissions.'));
   }, [problemId]);
 
@@ -1481,7 +1810,7 @@ function ScanSubmissionsPanel({ problemId }) {
           <thead>
             <tr>
               <th>Student</th>
-              <th>Status</th>
+              {hasScanQuestions && <th>Status</th>}
               <th>Marks</th>
               <th>Submitted</th>
               <th aria-label="Actions" />
@@ -1495,24 +1824,30 @@ function ScanSubmissionsPanel({ problemId }) {
                     {s.name || s.email}
                     {s.name && <div style={{ color: 'var(--text-dim)', fontSize: '12px', fontWeight: 400 }}>{s.email}</div>}
                   </td>
+                  {hasScanQuestions && (
+                    <td>
+                      {s.status === 'processing' ? (
+                        <ScanProgressRing processingStartedAt={s.processingStartedAt} />
+                      ) : (
+                        <span className={`chip ${s.status === 'ocr_done' ? 'chip-easy' : s.status === 'ocr_failed' ? 'chip-hard' : 'chip-medium'}`}>
+                          <span className="dot" />{formatScanStatus(s.status)}
+                        </span>
+                      )}
+                    </td>
+                  )}
                   <td>
-                    {s.status === 'processing' ? (
-                      <ScanProgressRing processingStartedAt={s.processingStartedAt} />
-                    ) : (
-                      <span className={`chip ${s.status === 'ocr_done' ? 'chip-easy' : s.status === 'ocr_failed' ? 'chip-hard' : 'chip-medium'}`}>
-                        <span className="dot" />{formatScanStatus(s.status)}
-                      </span>
-                    )}
+                    {s.fullyGraded ? `${s.awardedMarks}/${s.totalMarks}` : `—/${s.totalMarks}`}
                     {s.penalized && <span className="chip chip-hard" style={{ marginLeft: 6 }}>penalized</span>}
                   </td>
-                  <td>{s.fullyGraded ? `${s.awardedMarks}/${s.totalMarks}` : `—/${s.totalMarks}`}</td>
                   <td>{formatDate(s.createdAt)}</td>
                   <td className="admin-cell-actions">
                     {s.viewUrl && <a className="btn btn-ghost btn-sm" href={s.viewUrl} target="_blank" rel="noreferrer">View PDF</a>}
-                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => setExpandedTextId(expandedTextId === s.id ? null : s.id)}>
-                      {expandedTextId === s.id ? 'Hide text' : 'View text'}
-                    </button>
-                    {s.status !== 'processing' && (
+                    {hasScanQuestions && (
+                      <button type="button" className="btn btn-ghost btn-sm" onClick={() => setExpandedTextId(expandedTextId === s.id ? null : s.id)}>
+                        {expandedTextId === s.id ? 'Hide text' : 'View text'}
+                      </button>
+                    )}
+                    {hasScanQuestions && s.status !== 'processing' && (
                       <button type="button" className="btn btn-ghost btn-sm" disabled={processingId === s.id} onClick={() => runOcrNow(s.id)}>
                         {processingId === s.id && <span className="spinner" />}
                         {s.status === 'ocr_done' ? 'Run OCR again' : 'Run OCR now'}
@@ -1523,7 +1858,7 @@ function ScanSubmissionsPanel({ problemId }) {
                 </tr>
                 {expandedTextId === s.id && (
                   <tr>
-                    <td colSpan={5} style={{ background: 'var(--surface-2)' }}>
+                    <td colSpan={hasScanQuestions ? 5 : 4} style={{ background: 'var(--surface-2)' }}>
                       <ScanExtractedText submissionId={s.id} />
                     </td>
                   </tr>
@@ -1775,6 +2110,7 @@ function GradingForm({ attemptId, onGraded }) {
             <span className="chip chip-neutral"><span className="dot" />{a.marks} marks</span>
           </div>
           <pre className="submission-code">{a.text_answer || '(no answer given)'}</pre>
+          {a.ai_assessment && <p className="auth-sub" style={{ margin: '8px 0' }}>AI assessment (aid only): {a.ai_assessment}</p>}
           {gradeInput('short-long', a)}
           {remarksField('short-long', a)}
         </div>
@@ -1953,6 +2289,7 @@ function ExamsPanel() {
   const [confirmingId, setConfirmingId] = useState(null);
   const [busyId, setBusyId] = useState(null);
   const [expandedAttemptsExamId, setExpandedAttemptsExamId] = useState(null);
+  const [cloneExam, setCloneExam] = useState(null);
 
   const fetchExams = useCallback(async () => {
     try {
@@ -2033,6 +2370,7 @@ function ExamsPanel() {
                 <th>Marks</th>
                 <th>Time limit</th>
                 <th>Webcam</th>
+                <th>Calculator</th>
                 <th>Status</th>
                 <th>Deadline</th>
                 <th aria-label="Actions" />
@@ -2051,6 +2389,11 @@ function ExamsPanel() {
                         ? <span className="chip chip-medium"><span className="dot" />Required</span>
                         : '—'}
                     </td>
+                    <td>
+                      {ex.calculator_allowed
+                        ? <span className="chip chip-medium"><span className="dot" />{ex.calculator_type}</span>
+                        : '—'}
+                    </td>
                     <td><span className={`chip ${STATUS_CLASS[ex.status] || 'chip-medium'}`}><span className="dot" />{ex.status}</span></td>
                     <td>{formatDate(ex.closes_at)}</td>
                     <td className="admin-cell-actions">
@@ -2065,6 +2408,7 @@ function ExamsPanel() {
                             {expandedAttemptsExamId === ex.id ? 'Hide attempts' : 'Attempts'}
                           </button>
                           <button type="button" className="btn btn-ghost btn-sm" onClick={() => startFullEdit(ex)}>Edit</button>
+                          <button type="button" className="btn btn-ghost btn-sm" onClick={() => setCloneExam(ex)}>Clone</button>
                           <button type="button" className="btn btn-ghost btn-sm" onClick={() => setConfirmingId(ex.id)}>Delete</button>
                         </>
                       )}
@@ -2072,7 +2416,7 @@ function ExamsPanel() {
                   </tr>
                   {expandedAttemptsExamId === ex.id && (
                     <tr>
-                      <td colSpan={8} style={{ background: 'var(--surface-2)' }}>
+                      <td colSpan={9} style={{ background: 'var(--surface-2)' }}>
                         <ExamAttemptsPanel examId={ex.id} />
                       </td>
                     </tr>
@@ -2083,6 +2427,86 @@ function ExamsPanel() {
           </table>
         </div>
       )}
+
+      {cloneExam && (
+        <CloneExamModal
+          exam={cloneExam}
+          onClose={() => setCloneExam(null)}
+          onCloned={() => { setCloneExam(null); fetchExams(); }}
+        />
+      )}
+    </div>
+  );
+}
+
+// Clones one exam (with its full item set) into one or more target
+// subjects at once — the "run this same test across several sections"
+// case, see POST /api/admin/exams/:id/clone. Same self-contained
+// fixed-overlay treatment as LeaderboardModal above.
+function CloneExamModal({ exam, onClose, onCloned }) {
+  const [subjects, setSubjects] = useState(null);
+  const [selected, setSelected] = useState(new Set());
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    axios.get(`${API}/api/admin/subjects`, { withCredentials: true })
+      .then((res) => setSubjects(res.data.subjects))
+      .catch(() => setError('Failed to load subjects.'));
+  }, []);
+
+  const toggle = (id) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const submit = async () => {
+    if (selected.size === 0) { setError('Pick at least one target subject.'); return; }
+    setSubmitting(true);
+    setError('');
+    try {
+      await axios.post(`${API}/api/admin/exams/${exam.id}/clone`, { subjectIds: [...selected] }, { withCredentials: true });
+      onCloned();
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to clone exam.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }} onClick={onClose}>
+      <div className="panel" style={{ maxWidth: 440, width: '100%', maxHeight: '80vh', overflowY: 'auto', padding: 20 }} onClick={(e) => e.stopPropagation()}>
+        <h3 style={{ margin: '0 0 4px' }}>Clone "{exam.title}"</h3>
+        <p className="auth-sub" style={{ margin: '0 0 12px' }}>Pick every subject that should get its own copy of this exam, items included.</p>
+
+        {error && <div className="alert" style={{ marginBottom: 10 }}><span className="alert-icon">!</span><span>{error}</span></div>}
+        {!subjects ? (
+          <p className="sb-loading">Loading subjects…</p>
+        ) : subjects.length === 0 ? (
+          <p className="sb-loading">No subjects available.</p>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 16, maxHeight: 260, overflowY: 'auto' }}>
+            {subjects.map((s) => (
+              <label key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13.5 }}>
+                <input type="checkbox" checked={selected.has(s.id)} onChange={() => toggle(s.id)} />
+                {s.name} — {s.org_unit_name}
+              </label>
+            ))}
+          </div>
+        )}
+
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+          <button type="button" className="btn btn-ghost" onClick={onClose} disabled={submitting}>Cancel</button>
+          <button type="button" className="btn btn-primary" onClick={submit} disabled={submitting || !subjects || subjects.length === 0}>
+            {submitting && <span className="spinner" />}
+            {submitting ? 'Cloning…' : `Clone into ${selected.size || ''} subject${selected.size === 1 ? '' : 's'}`}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -2227,6 +2651,60 @@ function ScanPlagiarismThresholdPanel() {
       <h3 style={{ margin: '0 0 4px' }}>Scanned-assignment plagiarism threshold</h3>
       <p className="auth-sub" style={{ margin: '0 0 14px' }}>
         How similar two scanned answer sheets' recognized text has to be before they're flagged for your review (0 = never flags, 1 = only exact duplicates). Confirming a flag zeroes both submissions' marks until you re-grade them.
+      </p>
+      {error && <div className="alert" style={{ marginBottom: '12px' }}><span className="alert-icon">!</span><span>{error}</span></div>}
+      {threshold !== null && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <input
+            type="number" min="0" max="1" step="0.05"
+            style={{ maxWidth: 100 }}
+            value={threshold}
+            onChange={(e) => setThreshold(e.target.value)}
+          />
+          <button type="button" className="btn btn-primary btn-sm" onClick={save} disabled={saving}>
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+          {saveMessage && <span className="auth-sub">{saveMessage}</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Same shape as ScanPlagiarismThresholdPanel above, for coding assignments —
+// separate column/route since code and prose similarity don't live on the
+// same natural scale (code shares far more incidental boilerplate).
+function CodePlagiarismThresholdPanel() {
+  const [threshold, setThreshold] = useState(null);
+  const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [saveMessage, setSaveMessage] = useState('');
+
+  useEffect(() => {
+    axios.get(`${API}/api/admin/settings/code-plagiarism-threshold`, { withCredentials: true })
+      .then((res) => setThreshold(res.data.threshold))
+      .catch(() => setError('Failed to load the plagiarism threshold.'));
+  }, []);
+
+  const save = async () => {
+    setSaving(true);
+    setSaveMessage('');
+    setError('');
+    try {
+      await axios.put(`${API}/api/admin/settings/code-plagiarism-threshold`, { threshold: Number(threshold) }, { withCredentials: true });
+      setSaveMessage('Saved.');
+    } catch {
+      setError('Failed to save the threshold.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="panel" style={{ padding: '20px', marginBottom: '24px' }}>
+      <h3 style={{ margin: '0 0 4px' }}>Coding-assignment plagiarism threshold</h3>
+      <p className="auth-sub" style={{ margin: '0 0 14px' }}>
+        How similar two students' Accepted solutions to the same assignment have to be before they're flagged for your review (0 = never flags, 1 = only exact duplicates). Review flags per-assignment from the Assignments tab — confirming a flag never changes either submission's score, it's just a record for you to act on.
       </p>
       {error && <div className="alert" style={{ marginBottom: '12px' }}><span className="alert-icon">!</span><span>{error}</span></div>}
       {threshold !== null && (

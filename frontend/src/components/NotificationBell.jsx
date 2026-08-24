@@ -1,6 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { API } from '../config';
+
+// Where clicking a notification of a given type sends the student — the
+// list pages, deliberately, not a specific item's detail route: an exam's
+// detail route (ExamAttempt) starts the proctored attempt on load, so
+// jumping straight there from a notification click would surprise-start an
+// exam rather than just show the student what's new.
+const NOTIFICATION_LINK_BY_TYPE = { assignment: '/assignments', exam: '/exams' };
 
 function BellIcon() {
   return (
@@ -32,6 +40,7 @@ function timeAgo(iso) {
 // state individually — matches how most notification bells behave (badge
 // clears on open, not on a per-item basis).
 export default function NotificationBell() {
+  const navigate = useNavigate();
   const [notifications, setNotifications] = useState([]);
   const [open, setOpen] = useState(false);
   const containerRef = useRef(null);
@@ -111,13 +120,26 @@ export default function NotificationBell() {
           {notifications.length === 0 ? (
             <p className="sb-loading" style={{ margin: '12px 8px' }}>No notifications yet.</p>
           ) : (
-            notifications.map((n) => (
-              <div key={n.id} style={{ padding: '8px 10px', borderRadius: 'var(--radius-sm)', background: n.read ? 'transparent' : 'var(--surface-2)' }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-h)' }}>{n.title}</div>
-                {n.body && <div style={{ fontSize: 12.5, color: 'var(--text-dim)', marginTop: 2 }}>{n.body}</div>}
-                <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 4 }}>{timeAgo(n.createdAt)}</div>
-              </div>
-            ))
+            notifications.map((n) => {
+              const linkTo = NOTIFICATION_LINK_BY_TYPE[n.type];
+              return (
+                <div
+                  key={n.id}
+                  role={linkTo ? 'button' : undefined}
+                  tabIndex={linkTo ? 0 : undefined}
+                  onClick={linkTo ? () => { setOpen(false); navigate(linkTo); } : undefined}
+                  style={{
+                    padding: '8px 10px', borderRadius: 'var(--radius-sm)',
+                    background: n.read ? 'transparent' : 'var(--surface-2)',
+                    cursor: linkTo ? 'pointer' : 'default',
+                  }}
+                >
+                  <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-h)' }}>{n.title}</div>
+                  {n.body && <div style={{ fontSize: 12.5, color: 'var(--text-dim)', marginTop: 2 }}>{n.body}</div>}
+                  <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 4 }}>{timeAgo(n.createdAt)}</div>
+                </div>
+              );
+            })
           )}
         </div>
       )}

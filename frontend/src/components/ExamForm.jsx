@@ -94,6 +94,8 @@ export default function ExamForm({ initialData, onSubmit, onCancel }) {
   const [description, setDescription] = useState(initialData?.description || '');
   const [totalTimeMinutes, setTotalTimeMinutes] = useState(secondsToMinutesInput(initialData?.total_time_seconds));
   const [webcamRequired, setWebcamRequired] = useState(!!initialData?.webcam_required);
+  const [calculatorAllowed, setCalculatorAllowed] = useState(!!initialData?.calculator_allowed);
+  const [calculatorType, setCalculatorType] = useState(initialData?.calculator_type || 'basic');
   const [opensAt, setOpensAt] = useState(formatLocal(initialData?.opens_at));
   const [closesAt, setClosesAt] = useState(formatLocal(initialData?.closes_at));
   const [subjectId, setSubjectId] = useState(initialData?.subject_id != null ? String(initialData.subject_id) : '');
@@ -121,6 +123,10 @@ export default function ExamForm({ initialData, onSubmit, onCancel }) {
 
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+
+  const [bankStatus, setBankStatus] = useState({}); // { [itemKey]: 'saving' | 'saved' | 'error' }
+  const [bankItems, setBankItems] = useState(null);
+  const [showBankPicker, setShowBankPicker] = useState(false);
 
   const updateItem = (key, patch) => {
     setItems((prev) => prev.map((it) => (it.key === key ? { ...it, ...patch } : it)));
@@ -182,6 +188,51 @@ export default function ExamForm({ initialData, onSubmit, onCancel }) {
 
   const totalMarks = items.reduce((sum, it) => sum + (Number(it.marks) || 0), 0);
 
+  const itemToPayload = (it) => ({
+    type: it.type,
+    marks: Number(it.marks),
+    timeLimitSeconds: minutesInputToSeconds(it.timeLimitMinutes),
+    prompt: it.prompt.trim(),
+    options: it.type === 'mcq' ? it.options.filter((o) => o.text.trim()) : undefined,
+    correctOptionId: it.type === 'mcq' ? it.correctOptionId : undefined,
+    wordLimit: (it.type === 'short' || it.type === 'long') && it.wordLimit ? Number(it.wordLimit) : undefined,
+    problemId: it.type === 'coding' && it.codingMode === 'reuse' ? Number(it.problemId) : undefined,
+    starterCode: it.type === 'coding' && it.codingMode === 'custom'
+      ? Object.fromEntries(Object.entries(it.starterCode).filter(([, code]) => code.trim() !== ''))
+      : undefined,
+    testCases: it.type === 'coding' && it.codingMode === 'custom'
+      ? it.testCases.filter((tc) => tc.expectedOutput.trim() !== '')
+      : undefined,
+  });
+
+  const saveItemToBank = async (it) => {
+    setBankStatus((s) => ({ ...s, [it.key]: 'saving' }));
+    try {
+      await axios.post(`${API}/api/admin/question-bank`, { ...itemToPayload(it), subjectId: subjectId || null }, { withCredentials: true });
+      setBankStatus((s) => ({ ...s, [it.key]: 'saved' }));
+      setTimeout(() => setBankStatus((s) => ({ ...s, [it.key]: undefined })), 2000);
+    } catch {
+      setBankStatus((s) => ({ ...s, [it.key]: 'error' }));
+    }
+  };
+
+  const openBankPicker = async () => {
+    setShowBankPicker(true);
+    setBankItems(null);
+    try {
+      const res = await axios.get(`${API}/api/admin/question-bank`, { params: subjectId ? { subjectId } : {}, withCredentials: true });
+      setBankItems(res.data.items);
+    } catch (err) {
+      setBankItems([]);
+      setError(err.response?.data?.error || 'Failed to load question bank.');
+    }
+  };
+
+  const insertFromBank = (bankItem) => {
+    setItems((prev) => [...prev, itemFromServer(bankItem)]);
+    setShowBankPicker(false);
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
@@ -222,25 +273,12 @@ export default function ExamForm({ initialData, onSubmit, onCancel }) {
       description: description.trim() || null,
       totalTimeSeconds,
       webcamRequired,
+      calculatorAllowed,
+      calculatorType: calculatorAllowed ? calculatorType : null,
       opensAt: toIsoOrNull(opensAt),
       closesAt: toIsoOrNull(closesAt),
       subjectId: subjectId || null,
-      items: items.map((it) => ({
-        type: it.type,
-        marks: Number(it.marks),
-        timeLimitSeconds: minutesInputToSeconds(it.timeLimitMinutes),
-        prompt: it.prompt.trim(),
-        options: it.type === 'mcq' ? it.options.filter((o) => o.text.trim()) : undefined,
-        correctOptionId: it.type === 'mcq' ? it.correctOptionId : undefined,
-        wordLimit: (it.type === 'short' || it.type === 'long') && it.wordLimit ? Number(it.wordLimit) : undefined,
-        problemId: it.type === 'coding' && it.codingMode === 'reuse' ? Number(it.problemId) : undefined,
-        starterCode: it.type === 'coding' && it.codingMode === 'custom'
-          ? Object.fromEntries(Object.entries(it.starterCode).filter(([, code]) => code.trim() !== ''))
-          : undefined,
-        testCases: it.type === 'coding' && it.codingMode === 'custom'
-          ? it.testCases.filter((tc) => tc.expectedOutput.trim() !== '')
-          : undefined,
-      })),
+      items: items.map(itemToPayload),
     };
 
     setSubmitting(true);
@@ -304,6 +342,24 @@ export default function ExamForm({ initialData, onSubmit, onCancel }) {
         Require webcam proctoring for this exam
       </label>
 
+      <label className="testcase-hidden-toggle" style={{ fontSize: '13px' }}>
+        <input type="checkbox" checked={calculatorAllowed} onChange={(e) => setCalculatorAllowed(e.target.checked)} />
+        Allow a calculator during this exam
+      </label>
+
+      {calculatorAllowed && (
+        <div className="field" style={{ maxWidth: 320, marginBottom: '16px' }}>
+          <label htmlFor="ex-calc-type">Calculator type</label>
+          <select id="ex-calc-type" value={calculatorType} onChange={(e) => setCalculatorType(e.target.value)}>
+            <option value="basic">Basic — arithmetic, memory, percentage</option>
+            <option value="scientific">Scientific — trig, log, powers, roots (fx-991-style)</option>
+            <option value="programmer">Programmer — base-N, bitwise ops</option>
+            <option value="statistics">Statistics — mean, stddev, variance</option>
+            <option value="financial">Financial — TVM solver (PV/FV/PMT/N/I)</option>
+          </select>
+        </div>
+      )}
+
       <div className="field-group-label">
         Items — {totalMarks} marks total
       </div>
@@ -340,6 +396,10 @@ export default function ExamForm({ initialData, onSubmit, onCancel }) {
                   onChange={(e) => updateItem(it.key, { timeLimitMinutes: e.target.value })}
                 />
               </div>
+
+              <button type="button" className="btn btn-ghost btn-sm" onClick={() => saveItemToBank(it)} disabled={bankStatus[it.key] === 'saving'}>
+                {bankStatus[it.key] === 'saved' ? 'Saved ✓' : bankStatus[it.key] === 'error' ? 'Failed — retry' : 'Save to bank'}
+              </button>
 
               <button
                 type="button"
@@ -491,7 +551,35 @@ export default function ExamForm({ initialData, onSubmit, onCancel }) {
           </div>
         ))}
 
-        <button type="button" className="btn btn-ghost" onClick={addItem}>+ Add item</button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button type="button" className="btn btn-ghost" onClick={addItem}>+ Add item</button>
+          <button type="button" className="btn btn-ghost" onClick={openBankPicker}>Insert from bank</button>
+        </div>
+
+        {showBankPicker && (
+          <div className="panel" style={{ padding: 14, marginTop: 10 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+              <strong style={{ fontSize: 13 }}>Question bank{subjectId ? '' : ' (org-wide)'}</strong>
+              <button type="button" className="btn btn-ghost btn-sm" onClick={() => setShowBankPicker(false)}>Close</button>
+            </div>
+            {bankItems === null ? (
+              <p className="sb-loading">Loading…</p>
+            ) : bankItems.length === 0 ? (
+              <p className="sb-loading">Nothing saved to the bank yet — use "Save to bank" on any item above.</p>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {bankItems.map((b) => (
+                  <div key={b.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, padding: '6px 8px', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)' }}>
+                    <span style={{ fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <strong>{b.type}</strong> · {b.marks} marks{b.prompt ? ` · ${b.prompt.slice(0, 60)}` : ''}
+                    </span>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => insertFromBank(b)}>Insert</button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {error && (

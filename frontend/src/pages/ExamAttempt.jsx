@@ -9,6 +9,7 @@ import { useTheme } from '../hooks/useTheme';
 import { useExamLockdown } from '../hooks/useExamLockdown';
 import { useProctoring } from '../hooks/useProctoring';
 import ExamScanCapture from '../components/ExamScanCapture';
+import ExamCalculator from '../components/ExamCalculator';
 import { API } from '../config';
 import '../Exam.css';
 
@@ -64,6 +65,7 @@ export default function ExamAttempt() {
   const [blockedMessage, setBlockedMessage] = useState('');
   const [startError, setStartError] = useState('');
   const [starting, setStarting] = useState(false);
+  const [showCalculator, setShowCalculator] = useState(false);
 
   const [attemptId, setAttemptId] = useState(null);
   const [deadlineAt, setDeadlineAt] = useState(null);
@@ -347,6 +349,9 @@ export default function ExamAttempt() {
             {examMeta?.webcam_required && (
               <li>This exam requires webcam and microphone access. Your camera and audio are monitored for the duration — no face in frame, or a phone held up to it, ends the exam immediately; unusual movement or conversation is logged.</li>
             )}
+            {examMeta?.calculator_allowed && (
+              <li>A {examMeta.calculator_type} calculator is available during this exam via the toolbar button.</li>
+            )}
           </ul>
 
           {startError && (
@@ -401,9 +406,18 @@ export default function ExamAttempt() {
         <span className="brand">{examMeta?.title}</span>
         <div className="sb-actions">
           <span className="sb-timer exam-countdown" title="Time remaining">{formatTimer(remainingMs)}</span>
+          {examMeta?.calculator_allowed && (
+            <button type="button" className="btn btn-ghost" onClick={() => setShowCalculator((s) => !s)}>
+              {showCalculator ? 'Hide Calculator' : 'Calculator'}
+            </button>
+          )}
           <button type="button" className="btn btn-primary" onClick={handleSubmitClick}>Submit Exam</button>
         </div>
       </header>
+
+      {examMeta?.calculator_allowed && showCalculator && (
+        <ExamCalculator type={examMeta.calculator_type} onClose={() => setShowCalculator(false)} />
+      )}
 
       <div className="exam-take-body">
         {items.map((item, idx) => {

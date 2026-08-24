@@ -406,6 +406,34 @@ function ensureJudgeDataSchema() {
 }
 bootSchemaStep(ensureJudgeDataSchema);
 
+// Cross-student code-similarity flags for coding assignments — same shape
+// and review workflow as scan_plagiarism_flags (open/confirmed/dismissed),
+// just keyed against `submissions` instead of `scan_submissions`, and with
+// no flag_type column since there's only ever one comparator here.
+let submissionPlagiarismFlagsSchemaPromise = null;
+function ensureSubmissionPlagiarismFlagsSchema() {
+  if (!submissionPlagiarismFlagsSchemaPromise) {
+    submissionPlagiarismFlagsSchemaPromise = ensureJudgeDataSchema().then(async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS submission_plagiarism_flags (
+          id SERIAL PRIMARY KEY,
+          problem_id INTEGER NOT NULL REFERENCES problems(id) ON DELETE CASCADE,
+          submission_a_id INTEGER NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
+          submission_b_id INTEGER NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
+          similarity_score REAL NOT NULL,
+          status TEXT NOT NULL CHECK (status IN ('open', 'reviewed_confirmed', 'reviewed_dismissed')) DEFAULT 'open',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          CHECK (submission_a_id < submission_b_id)
+        )
+      `);
+      await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS submission_plagiarism_flags_pair_idx ON submission_plagiarism_flags(problem_id, submission_a_id, submission_b_id)');
+      await pool.query('ALTER TABLE organizations ADD COLUMN IF NOT EXISTS code_plagiarism_threshold REAL NOT NULL DEFAULT 0.6');
+    }).catch((err) => console.error('Failed to ensure submission_plagiarism_flags schema:', err));
+  }
+  return submissionPlagiarismFlagsSchemaPromise;
+}
+bootSchemaStep(ensureSubmissionPlagiarismFlagsSchema);
+
 async function ensureProblemsOrgColumn() {
   await ensureProblemsSchema();
   await ensureOrganizationsSchema();
@@ -454,6 +482,22 @@ async function ensureTimeLimitColumn() {
 }
 bootSchemaStep(ensureTimeLimitColumn);
 
+// Auto-provisions the optional per-assignment plagiarism threshold override
+// (scan-mode assignments only — see runTextPlagiarismComparator/
+// runTypedTextPlagiarismComparator). NULL means "use the org-wide
+// organizations.scan_plagiarism_threshold instead", same nullable-means-
+// unset idiom as time_limit_seconds above, since a teacher usually wants
+// the org default and only needs to override it for a specific assignment.
+async function ensureProblemsPlagiarismThresholdColumn() {
+  await ensureProblemsSchema();
+  try {
+    await pool.query(`ALTER TABLE problems ADD COLUMN IF NOT EXISTS plagiarism_threshold REAL`);
+  } catch (err) {
+    console.error('Failed to ensure problems.plagiarism_threshold column:', err);
+  }
+}
+bootSchemaStep(ensureProblemsPlagiarismThresholdColumn);
+
 // Auto-provisions the exam data model: `exams` (the container — total time,
 // total marks, webcam requirement, scheduling) and `exam_items` (the actual
 // questions inside it). One `exams` row can hold any mix of item types —
@@ -495,6 +539,16 @@ async function ensureExamSchemaImpl() {
       )
     `);
     await pool.query('ALTER TABLE exams ADD COLUMN IF NOT EXISTS organization_id INTEGER REFERENCES organizations(id)');
+    await pool.query('ALTER TABLE exams ADD COLUMN IF NOT EXISTS calculator_allowed BOOLEAN NOT NULL DEFAULT false');
+    await pool.query('ALTER TABLE exams ADD COLUMN IF NOT EXISTS calculator_type TEXT');
+    // Mirrors problems.notified — flips true once sweepAssignmentExamNotifications
+    // has fanned out a "new exam available" notification for this row, so a
+    // restart of the sweep never double-notifies the same exam.
+    await pool.query('ALTER TABLE exams ADD COLUMN IF NOT EXISTS notified BOOLEAN NOT NULL DEFAULT false');
+    await pool.query(`
+      ALTER TABLE exams ADD CONSTRAINT exams_calculator_type_check
+        CHECK (calculator_type IS NULL OR calculator_type IN ('basic', 'scientific', 'programmer', 'statistics', 'financial'))
+    `).catch((err) => { if (err.code !== '42710') throw err; });
     await pool.query(`
       CREATE TABLE IF NOT EXISTS exam_items (
         id SERIAL PRIMARY KEY,
@@ -531,6 +585,34 @@ async function ensureExamSchemaImpl() {
     // ensureExamProctoringSchema's end_reason constraint further down.
     await pool.query('ALTER TABLE exam_items DROP CONSTRAINT IF EXISTS exam_items_type_check');
     await pool.query(`ALTER TABLE exam_items ADD CONSTRAINT exam_items_type_check CHECK (type IN ('mcq', 'short', 'long', 'coding', 'scan'))`);
+
+    // Reusable item library — same column shape as exam_items minus
+    // exam_id/position (an item lives here detached from any specific exam
+    // until a teacher inserts it into one, at which point ExamForm copies
+    // its fields into a fresh exam_items row; editing the copy never
+    // touches the bank original). subject_id NULL = org-wide, admin-only
+    // (mirrors exams.subject_id's own "no subject" option and the same
+    // enforceSubjectAuthority gate).
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS question_bank_items (
+        id SERIAL PRIMARY KEY,
+        organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+        subject_id INTEGER REFERENCES subjects(id) ON DELETE CASCADE,
+        type TEXT NOT NULL CHECK (type IN ('mcq', 'short', 'long', 'coding', 'scan')),
+        marks INTEGER NOT NULL DEFAULT 1,
+        time_limit_seconds INTEGER,
+        prompt TEXT,
+        options JSONB,
+        correct_option_id TEXT,
+        word_limit INTEGER,
+        problem_id INTEGER REFERENCES problems(id) ON DELETE SET NULL,
+        starter_code JSONB,
+        test_cases JSONB,
+        created_by uuid REFERENCES users(id),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS question_bank_items_subject_idx ON question_bank_items(subject_id)');
   }
 }
 bootSchemaStep(ensureExamSchema);
@@ -618,6 +700,11 @@ async function ensureExamSubmissionSchema() {
     await pool.query('ALTER TABLE exam_answers ADD COLUMN IF NOT EXISTS remarks TEXT');
     await pool.query('ALTER TABLE exam_scan_answers ADD COLUMN IF NOT EXISTS remarks TEXT');
     await pool.query('ALTER TABLE exam_attempts ADD COLUMN IF NOT EXISTS overall_remarks TEXT');
+    // Groq assist-only suggestion for short/long items, same role as
+    // exam_scan_answers.ai_assessment — never touches marks_awarded, purely
+    // a note for the teacher grading the item manually. See
+    // runExamShortLongAiAssessment for how it gets populated.
+    await pool.query('ALTER TABLE exam_answers ADD COLUMN IF NOT EXISTS ai_assessment TEXT');
   } catch (err) {
     console.error('Failed to ensure exam submission schema:', err);
   }
@@ -1142,7 +1229,7 @@ bootSchemaStep(ensureScanSubmissionsSchema);
 let scanPlagiarismFlagsSchemaPromise = null;
 function ensureScanPlagiarismFlagsSchema() {
   if (!scanPlagiarismFlagsSchemaPromise) {
-    scanPlagiarismFlagsSchemaPromise = ensureScanSubmissionsSchema().then(async () => {
+    scanPlagiarismFlagsSchemaPromise = Promise.all([ensureScanSubmissionsSchema(), ensureScanAssignmentQuestionsSchema()]).then(async () => {
       await pool.query(`
         CREATE TABLE IF NOT EXISTS scan_plagiarism_flags (
           id SERIAL PRIMARY KEY,
@@ -1156,7 +1243,20 @@ function ensureScanPlagiarismFlagsSchema() {
           CHECK (submission_a_id < submission_b_id)
         )
       `);
-      await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS scan_plagiarism_flags_pair_idx ON scan_plagiarism_flags(problem_id, submission_a_id, submission_b_id, flag_type)');
+      // NULL for whole-submission OCR-text flags (flag_type =
+      // 'text_similarity', one row per submission pair) — set to the
+      // specific question for per-question typed-answer flags (flag_type =
+      // 'typed_text_similarity', see runTypedTextPlagiarismComparator),
+      // since unlike the OCR blob, typed answers are already cleanly
+      // separated by question and a per-question flag is more useful.
+      await pool.query('ALTER TABLE scan_plagiarism_flags ADD COLUMN IF NOT EXISTS question_id INTEGER REFERENCES scan_assignment_questions(id) ON DELETE CASCADE');
+      await pool.query('DROP INDEX IF EXISTS scan_plagiarism_flags_pair_idx');
+      // Two partial indexes rather than one index including question_id:
+      // NULL <> NULL in SQL, so a plain unique index over question_id
+      // wouldn't actually stop duplicate whole-submission flags from being
+      // inserted (every NULL would look distinct to it).
+      await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS scan_plagiarism_flags_pair_submission_idx ON scan_plagiarism_flags(problem_id, submission_a_id, submission_b_id, flag_type) WHERE question_id IS NULL');
+      await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS scan_plagiarism_flags_pair_question_idx ON scan_plagiarism_flags(problem_id, submission_a_id, submission_b_id, flag_type, question_id) WHERE question_id IS NOT NULL');
     }).catch((err) => console.error('Failed to ensure scan_plagiarism_flags schema:', err));
   }
   return scanPlagiarismFlagsSchemaPromise;
@@ -1433,7 +1533,7 @@ bootSchemaStep(ensureNoticesSchema);
 let notificationsSchemaPromise = null;
 function ensureNotificationsSchema() {
   if (!notificationsSchemaPromise) {
-    notificationsSchemaPromise = Promise.all([ensureNotesSchema(), ensureNoticesSchema(), ensureUsersSchema()]).then(async () => {
+    notificationsSchemaPromise = Promise.all([ensureNotesSchema(), ensureNoticesSchema(), ensureUsersSchema(), ensureProblemsSchema(), ensureExamSchema()]).then(async () => {
       await pool.query(`
         CREATE TABLE IF NOT EXISTS notifications (
           id SERIAL PRIMARY KEY,
@@ -1456,6 +1556,11 @@ function ensureNotificationsSchema() {
       // already-created table up to date" posture as ensureNotesSchema's
       // own ALTERs above.
       await pool.query('ALTER TABLE notifications ADD COLUMN IF NOT EXISTS notice_id INTEGER REFERENCES notices(id) ON DELETE CASCADE');
+      // "New assignment/exam available" notifications — see
+      // sweepAssignmentExamNotifications. Same one-FK-column-per-type
+      // pattern as note_id/notice_id above.
+      await pool.query('ALTER TABLE notifications ADD COLUMN IF NOT EXISTS problem_id INTEGER REFERENCES problems(id) ON DELETE CASCADE');
+      await pool.query('ALTER TABLE notifications ADD COLUMN IF NOT EXISTS exam_id INTEGER REFERENCES exams(id) ON DELETE CASCADE');
     }).catch((err) => console.error('Failed to ensure notifications schema:', err));
   }
   return notificationsSchemaPromise;
@@ -1790,6 +1895,22 @@ function normalizeTimeLimitSeconds(value) {
     throw new Error('Time limit must be a positive number of seconds, or left blank for no limit');
   }
   return Math.round(n);
+}
+
+// Validates the optional per-assignment plagiarism threshold override sent
+// from AssignmentForm — same "'', null, undefined all mean unset" idiom as
+// normalizeTimeLimitSeconds above, falling back to the org-wide
+// organizations.scan_plagiarism_threshold when left blank (see
+// runTextPlagiarismComparator/runTypedTextPlagiarismComparator). Range
+// matches the org-wide setting's own PUT route (0-1, a raw similarity
+// fraction, not a percentage).
+function normalizePlagiarismThreshold(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0 || n > 1) {
+    throw new Error('Plagiarism threshold must be a number between 0 and 1, or left blank to use the organization default');
+  }
+  return n;
 }
 
 const EXAM_ITEM_TYPES = new Set(['mcq', 'short', 'long', 'coding', 'scan']);
@@ -2492,6 +2613,26 @@ async function getSubjectScopedAssignmentsAndExams(organizationId, subjectIds) {
   return { problems: problemsRes.rows, exams: examsRes.rows };
 }
 
+// Every student "under" a single subject — same cascade-down rule as
+// getTeacherScope's descendant_units CTE, just seeded from one subject's
+// org_unit instead of a teacher's whole assigned set. Shared by the
+// gradebook and class-leaderboard routes below.
+async function getStudentsForSubject(organizationId, subjectId) {
+  const { rows } = await pool.query(
+    `WITH RECURSIVE descendant_units AS (
+       SELECT org_unit_id AS id FROM subjects WHERE id = $1 AND organization_id = $2
+       UNION
+       SELECT ou.id FROM org_units ou JOIN descendant_units d ON ou.parent_unit_id = d.id
+     )
+     SELECT u.id, u.email, u.name
+     FROM users u JOIN memberships m ON m.user_id = u.id AND m.organization_id = $2 AND m.role = 'student'
+     WHERE m.org_unit_id IN (SELECT id FROM descendant_units)
+     ORDER BY u.email ASC`,
+    [subjectId, organizationId]
+  );
+  return rows;
+}
+
 // Resolves "which assignments/exams count" for one student in one org, for
 // the cross-institution performance dashboard (GET /api/me/performance*
 // below) — the same subject-visibility rule GET /api/problems already
@@ -2863,6 +3004,40 @@ async function finalizeExamAttempt(attemptId, examItems, answers) {
   }
 
   return score;
+}
+
+// Assist-only AI suggestion for short/long items, same posture as the scan-
+// grading pipeline's assessAnswers call: never touches marks_awarded, purely
+// a note a teacher sees next to the grade input in GradingForm. Deliberately
+// NOT awaited inline in POST /api/exams/:id/submit (see the call site) —
+// each item is its own Groq call, and blocking a student's submit response
+// on that would add real latency/failure risk to every exam finish. One
+// assessAnswers call per item rather than one batched call for all of them:
+// unlike the OCR pipeline (one text blob that may cover several questions,
+// needing the model to disentangle which answer belongs to which prompt),
+// each short/long item already has its own cleanly separated text_answer —
+// batching would just reintroduce an ambiguity that doesn't exist here.
+async function runExamShortLongAiAssessment(attemptId, examItems) {
+  if (!isGroqConfigured()) return;
+  const shortLongItems = examItems.filter((it) => it.type === 'short' || it.type === 'long');
+  if (shortLongItems.length === 0) return;
+  const itemsById = new Map(shortLongItems.map((it) => [it.id, it]));
+
+  try {
+    const answersRes = await pool.query(
+      'SELECT id, item_id, text_answer FROM exam_answers WHERE attempt_id = $1 AND item_id = ANY($2::int[])',
+      [attemptId, shortLongItems.map((it) => it.id)]
+    );
+    for (const row of answersRes.rows) {
+      if (!row.text_answer || !row.text_answer.trim()) continue;
+      const item = itemsById.get(row.item_id);
+      if (!item) continue;
+      const [assessment] = await assessAnswers([{ prompt: item.prompt, marks: item.marks }], row.text_answer, { isOcr: false });
+      await pool.query('UPDATE exam_answers SET ai_assessment = $1 WHERE id = $2', [assessment || null, row.id]);
+    }
+  } catch (err) {
+    console.error(`Exam short/long AI assessment failed for attempt ${attemptId}:`, err);
+  }
 }
 
 // Recomputes and saves an attempt's total score from scratch — marks_awarded
@@ -4156,6 +4331,152 @@ app.get('/api/admin/students', authenticateToken, requireAdmin, async (req, res)
   } catch (error) {
     console.error('List students error:', error);
     res.status(500).json({ error: 'Failed to load students' });
+  }
+});
+
+// ============================================================================
+// GRADEBOOK - full per-student x per-item score matrix for one subject
+// (not just the rollup averages /api/teacher/students returns), plus a
+// class-average row. Admin can view any subject in their org; a teacher is
+// gated to their own assigned subjects via enforceSubjectAuthority, the
+// same check every other subject-scoped exam/assignment route already uses.
+// ============================================================================
+app.get('/api/admin/gradebook', authenticateToken, requireAdminOrTeacher, async (req, res) => {
+  const subjectId = req.query.subjectId != null ? Number(req.query.subjectId) : null;
+  if (!subjectId || !Number.isFinite(subjectId)) {
+    return res.status(400).json({ error: 'subjectId is required' });
+  }
+  if (await enforceSubjectAuthority(req, res, subjectId)) return;
+
+  try {
+    const subjectRes = await pool.query('SELECT id, name FROM subjects WHERE id = $1 AND organization_id = $2', [subjectId, req.user.organizationId]);
+    if (subjectRes.rows.length === 0) return res.status(404).json({ error: 'Subject not found' });
+
+    const [students, problemsRes, examsRes] = await Promise.all([
+      getStudentsForSubject(req.user.organizationId, subjectId),
+      pool.query('SELECT id, title, submission_mode FROM problems WHERE organization_id = $1 AND subject_id = $2 ORDER BY created_at ASC', [req.user.organizationId, subjectId]),
+      pool.query('SELECT id, title, total_marks FROM exams WHERE organization_id = $1 AND subject_id = $2 ORDER BY created_at ASC', [req.user.organizationId, subjectId]),
+    ]);
+    const problems = problemsRes.rows;
+    const exams = examsRes.rows;
+    const studentIds = students.map((s) => s.id);
+
+    const [{ byUser: assignmentByUser }, { byUser: examByUser }] = await Promise.all([
+      getAssignmentPerformance(problems, studentIds),
+      getExamPerformance(exams, studentIds),
+    ]);
+
+    const rows = students.map((s) => {
+      const aMap = assignmentByUser.get(s.id) || new Map();
+      const eMap = examByUser.get(s.id) || new Map();
+      return {
+        id: s.id,
+        name: s.name,
+        email: s.email,
+        assignments: Object.fromEntries(problems.map((p) => [p.id, aMap.get(p.id) || { status: 'not_submitted', pct: null }])),
+        exams: Object.fromEntries(exams.map((e) => [e.id, eMap.get(e.id) || { status: 'not_submitted', pct: null }])),
+        avgAssignmentPercent: averagePercent(aMap),
+        avgExamPercent: averagePercent(eMap),
+      };
+    });
+
+    // Class-average row — mean of graded percentages per column, ignoring
+    // students who haven't been graded on that item yet (same convention
+    // averagePercent already uses for a single student's row).
+    const classAvgFor = (getPct) => {
+      const vals = rows.map(getPct).filter((v) => v != null);
+      return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+    };
+    const classAverages = {
+      assignments: Object.fromEntries(problems.map((p) => [p.id, classAvgFor((r) => r.assignments[p.id].pct)])),
+      exams: Object.fromEntries(exams.map((e) => [e.id, classAvgFor((r) => r.exams[e.id].pct)])),
+      overallAssignment: classAvgFor((r) => r.avgAssignmentPercent),
+      overallExam: classAvgFor((r) => r.avgExamPercent),
+    };
+
+    res.status(200).json({
+      subject: subjectRes.rows[0],
+      assignments: problems.map((p) => ({ id: p.id, title: p.title })),
+      exams: exams.map((e) => ({ id: e.id, title: e.title })),
+      students: rows,
+      classAverages,
+    });
+  } catch (err) {
+    console.error('Gradebook error:', err);
+    res.status(500).json({ error: 'Failed to load gradebook' });
+  }
+});
+
+// ============================================================================
+// LEADERBOARD - ranked class view for one exam or one assignment, using the
+// same mid-rank percentile math as the student-facing gauge
+// (computePercentileTiers, see GET /api/me/performance*) rather than
+// reinventing it. type is 'exam' | 'assignment'; itemId is that item's own
+// id. Authorization derives the subject from the item itself (not a query
+// param) so a teacher can't probe an item's subject by guessing.
+// ============================================================================
+app.get('/api/admin/leaderboard', authenticateToken, requireAdminOrTeacher, async (req, res) => {
+  const type = req.query.type;
+  const itemId = req.query.itemId != null ? Number(req.query.itemId) : null;
+  if (!['exam', 'assignment'].includes(type) || !itemId || !Number.isFinite(itemId)) {
+    return res.status(400).json({ error: 'type ("exam" or "assignment") and itemId are required' });
+  }
+
+  try {
+    const table = type === 'exam' ? 'exams' : 'problems';
+    const itemRes = await pool.query(`SELECT id, title, subject_id FROM ${table} WHERE id = $1 AND organization_id = $2`, [itemId, req.user.organizationId]);
+    if (itemRes.rows.length === 0) {
+      return res.status(404).json({ error: type === 'exam' ? 'Exam not found' : 'Assignment not found' });
+    }
+    const item = itemRes.rows[0];
+    if (await enforceSubjectAuthority(req, res, item.subject_id)) return;
+
+    // Org-wide items (subject_id null) only ever reach here as an admin —
+    // enforceSubjectAuthority already 400s a teacher on a null subjectId —
+    // so the population is every student in the org rather than one
+    // subject's cascade-down set.
+    const students = item.subject_id
+      ? await getStudentsForSubject(req.user.organizationId, item.subject_id)
+      : (await pool.query(
+          `SELECT u.id, u.email, u.name FROM users u
+           JOIN memberships m ON m.user_id = u.id AND m.organization_id = $1 AND m.role = 'student'
+           ORDER BY u.email ASC`,
+          [req.user.organizationId]
+        )).rows;
+    const studentIds = students.map((s) => s.id);
+
+    let byUser;
+    if (type === 'exam') {
+      const examRow = await pool.query('SELECT id, total_marks FROM exams WHERE id = $1', [itemId]);
+      ({ byUser } = await getExamPerformance(examRow.rows, studentIds));
+    } else {
+      const probRow = await pool.query('SELECT id, submission_mode FROM problems WHERE id = $1', [itemId]);
+      ({ byUser } = await getAssignmentPerformance(probRow.rows, studentIds));
+    }
+
+    const graded = [];
+    const ungraded = [];
+    students.forEach((s) => {
+      const entry = byUser.get(s.id)?.get(itemId);
+      if (entry && entry.pct != null) graded.push({ id: s.id, name: s.name, email: s.email, pct: entry.pct });
+      else ungraded.push({ id: s.id, name: s.name, email: s.email, status: entry?.status || 'not_submitted' });
+    });
+
+    const tierFor = computePercentileTiers(graded.map((g) => g.pct));
+    const ranked = graded
+      .map((g) => ({ ...g, ...tierFor(g.pct) }))
+      .sort((a, b) => b.pct - a.pct)
+      .map((g, i) => ({ ...g, rank: i + 1 }));
+
+    res.status(200).json({
+      item: { id: item.id, title: item.title, type },
+      ranked,
+      ungraded,
+      classAverage: ranked.length ? ranked.reduce((sum, g) => sum + g.pct, 0) / ranked.length : null,
+    });
+  } catch (err) {
+    console.error('Leaderboard error:', err);
+    res.status(500).json({ error: 'Failed to load leaderboard' });
   }
 });
 
@@ -7377,14 +7698,21 @@ app.post('/api/admin/problems', authenticateToken, requireAdminOrTeacher, async 
     return res.status(400).json({ error: err.message });
   }
 
+  let plagiarismThreshold;
+  try {
+    plagiarismThreshold = normalizePlagiarismThreshold(req.body.plagiarismThreshold);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
     const problemRes = await client.query(
-      `INSERT INTO problems (title, difficulty, description, created_by, opens_at, closes_at, time_limit_seconds, organization_id, subject_id, submission_mode, assignment_no)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
-      [title, difficulty, description, req.user.userId, opensAt, closesAt, timeLimitSeconds, req.user.organizationId, subjectId, submissionMode, assignmentNo]
+      `INSERT INTO problems (title, difficulty, description, created_by, opens_at, closes_at, time_limit_seconds, organization_id, subject_id, submission_mode, assignment_no, plagiarism_threshold)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
+      [title, difficulty, description, req.user.userId, opensAt, closesAt, timeLimitSeconds, req.user.organizationId, subjectId, submissionMode, assignmentNo, plagiarismThreshold]
     );
     const problemId = problemRes.rows[0].id;
 
@@ -7436,7 +7764,7 @@ app.get('/api/admin/problems/:id', authenticateToken, requireAdminOrTeacher, asy
   const problemId = req.params.id;
   try {
     const problemRes = await pool.query(
-      'SELECT id, title, difficulty, description, opens_at, closes_at, subject_id, submission_mode, assignment_no FROM problems WHERE id = $1 AND organization_id = $2',
+      'SELECT id, title, difficulty, description, opens_at, closes_at, subject_id, submission_mode, assignment_no, plagiarism_threshold FROM problems WHERE id = $1 AND organization_id = $2',
       [problemId, req.user.organizationId]
     );
     if (problemRes.rows.length === 0) return res.status(404).json({ error: 'Problem not found' });
@@ -7488,6 +7816,7 @@ app.get('/api/admin/problems/:id', authenticateToken, requireAdminOrTeacher, asy
       subjectId: problem.subject_id,
       submissionMode: problem.submission_mode,
       assignmentNo: problem.assignment_no,
+      plagiarismThreshold: problem.plagiarism_threshold,
       questions,
     });
   } catch (err) {
@@ -7515,6 +7844,13 @@ app.put('/api/admin/problems/:id', authenticateToken, requireAdminOrTeacher, asy
   try {
     const rawQuestions = Array.isArray(req.body.questions) ? req.body.questions : [];
     questions = rawQuestions.map((q, i) => normalizeScanAssignmentQuestion(q, i));
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  let plagiarismThreshold;
+  try {
+    plagiarismThreshold = normalizePlagiarismThreshold(req.body.plagiarismThreshold);
   } catch (err) {
     return res.status(400).json({ error: err.message });
   }
@@ -7551,10 +7887,10 @@ app.put('/api/admin/problems/:id', authenticateToken, requireAdminOrTeacher, asy
 
     await client.query(
       submissionMode === 'scan'
-        ? `UPDATE problems SET title = $1, difficulty = $2, description = $3, opens_at = $4, closes_at = $5, subject_id = $6, assignment_no = $7 WHERE id = $8`
+        ? `UPDATE problems SET title = $1, difficulty = $2, description = $3, opens_at = $4, closes_at = $5, subject_id = $6, assignment_no = $7, plagiarism_threshold = $8 WHERE id = $9`
         : `UPDATE problems SET title = $1, difficulty = $2, description = $3, opens_at = $4, closes_at = $5, subject_id = $6 WHERE id = $7`,
       submissionMode === 'scan'
-        ? [title, difficulty, description, opensAt, closesAt, subjectId, assignmentNo, problemId]
+        ? [title, difficulty, description, opensAt, closesAt, subjectId, assignmentNo, plagiarismThreshold, problemId]
         : [title, difficulty, description, opensAt, closesAt, subjectId, problemId]
     );
 
@@ -7821,8 +8157,12 @@ app.get('/api/admin/problems/:id/attempts', authenticateToken, requireAdminOrTea
 
 // Create an exam with its full set of items in one transaction.
 app.post('/api/admin/exams', authenticateToken, requireAdminOrTeacher, async (req, res) => {
-  const { title, description = null, totalTimeSeconds, webcamRequired = false, opensAt = null, closesAt = null, items = [] } = req.body;
+  const { title, description = null, totalTimeSeconds, webcamRequired = false, opensAt = null, closesAt = null, items = [], calculatorAllowed = false, calculatorType = null } = req.body;
   const subjectId = req.body.subjectId != null ? Number(req.body.subjectId) : null;
+  const CALCULATOR_TYPES = ['basic', 'scientific', 'programmer', 'statistics', 'financial'];
+  if (calculatorAllowed && !CALCULATOR_TYPES.includes(calculatorType)) {
+    return res.status(400).json({ error: 'A valid calculator type is required when calculators are allowed' });
+  }
 
   if (!title || !String(title).trim()) {
     return res.status(400).json({ error: 'Title is required' });
@@ -7865,9 +8205,9 @@ app.post('/api/admin/exams', authenticateToken, requireAdminOrTeacher, async (re
     await client.query('BEGIN');
 
     const examRes = await client.query(
-      `INSERT INTO exams (title, description, total_marks, total_time_seconds, webcam_required, opens_at, closes_at, created_by, organization_id, subject_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
-      [title.trim(), description, totalMarks, Math.round(totalTime), !!webcamRequired, opensAt, closesAt, req.user.userId, req.user.organizationId, subjectId]
+      `INSERT INTO exams (title, description, total_marks, total_time_seconds, webcam_required, opens_at, closes_at, created_by, organization_id, subject_id, calculator_allowed, calculator_type)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
+      [title.trim(), description, totalMarks, Math.round(totalTime), !!webcamRequired, opensAt, closesAt, req.user.userId, req.user.organizationId, subjectId, !!calculatorAllowed, calculatorAllowed ? calculatorType : null]
     );
     const examId = examRes.rows[0].id;
 
@@ -7906,6 +8246,7 @@ app.get('/api/admin/exams', authenticateToken, requireAdminOrTeacher, async (req
   try {
     const result = await pool.query(`
       SELECT e.id, e.title, e.total_marks, e.total_time_seconds, e.webcam_required,
+             e.calculator_allowed, e.calculator_type,
              e.opens_at, e.closes_at, COUNT(ei.id)::int AS item_count
       FROM exams e
       LEFT JOIN exam_items ei ON ei.exam_id = e.id
@@ -7928,7 +8269,7 @@ app.get('/api/admin/exams/:id', authenticateToken, requireAdminOrTeacher, async 
   const examId = req.params.id;
   try {
     const examRes = await pool.query(
-      'SELECT id, title, description, total_marks, total_time_seconds, webcam_required, opens_at, closes_at, subject_id FROM exams WHERE id = $1 AND organization_id = $2',
+      'SELECT id, title, description, total_marks, total_time_seconds, webcam_required, calculator_allowed, calculator_type, opens_at, closes_at, subject_id FROM exams WHERE id = $1 AND organization_id = $2',
       [examId, req.user.organizationId]
     );
     if (examRes.rows.length === 0) return res.status(404).json({ error: 'Exam not found' });
@@ -7951,8 +8292,12 @@ app.get('/api/admin/exams/:id', authenticateToken, requireAdminOrTeacher, async 
 // editing, matching how ExamForm will send its payload (everything at once).
 app.put('/api/admin/exams/:id', authenticateToken, requireAdminOrTeacher, async (req, res) => {
   const examId = req.params.id;
-  const { title, description = null, totalTimeSeconds, webcamRequired = false, opensAt = null, closesAt = null, items = [] } = req.body;
+  const { title, description = null, totalTimeSeconds, webcamRequired = false, opensAt = null, closesAt = null, items = [], calculatorAllowed = false, calculatorType = null } = req.body;
   const subjectId = req.body.subjectId != null ? Number(req.body.subjectId) : null;
+  const CALCULATOR_TYPES = ['basic', 'scientific', 'programmer', 'statistics', 'financial'];
+  if (calculatorAllowed && !CALCULATOR_TYPES.includes(calculatorType)) {
+    return res.status(400).json({ error: 'A valid calculator type is required when calculators are allowed' });
+  }
 
   if (!title || !String(title).trim()) {
     return res.status(400).json({ error: 'Title is required' });
@@ -7998,8 +8343,9 @@ app.put('/api/admin/exams/:id', authenticateToken, requireAdminOrTeacher, async 
 
     await client.query(
       `UPDATE exams SET title = $1, description = $2, total_marks = $3, total_time_seconds = $4,
-       webcam_required = $5, opens_at = $6, closes_at = $7, subject_id = $8 WHERE id = $9`,
-      [title.trim(), description, totalMarks, Math.round(totalTime), !!webcamRequired, opensAt, closesAt, subjectId, examId]
+       webcam_required = $5, opens_at = $6, closes_at = $7, subject_id = $8,
+       calculator_allowed = $9, calculator_type = $10 WHERE id = $11`,
+      [title.trim(), description, totalMarks, Math.round(totalTime), !!webcamRequired, opensAt, closesAt, subjectId, !!calculatorAllowed, calculatorAllowed ? calculatorType : null, examId]
     );
 
     await client.query('DELETE FROM exam_items WHERE exam_id = $1', [examId]);
@@ -8039,6 +8385,145 @@ app.delete('/api/admin/exams/:id', authenticateToken, requireAdminOrTeacher, asy
   } catch (err) {
     console.error('Delete exam error:', err);
     res.status(500).json({ error: 'Failed to delete exam' });
+  }
+});
+
+// ============================================================================
+// CLONE — copies one exam (and its full item set) into one new exam per
+// target subject, e.g. running the same test across several sections at
+// once instead of rebuilding it by hand each time. Authorized twice: once
+// for the source exam's own subject, once per target subject — a teacher
+// can only clone FROM a subject they own, and only INTO subjects they own.
+// opensAt/closesAt default to the source exam's own schedule but can be
+// overridden per clone call (explicit null clears it).
+// ============================================================================
+app.post('/api/admin/exams/:id/clone', authenticateToken, requireAdminOrTeacher, async (req, res) => {
+  const subjectIds = Array.isArray(req.body.subjectIds) ? [...new Set(req.body.subjectIds.map(Number).filter(Number.isFinite))] : [];
+  if (subjectIds.length === 0) {
+    return res.status(400).json({ error: 'At least one target subject is required' });
+  }
+
+  try {
+    const sourceRes = await pool.query('SELECT * FROM exams WHERE id = $1 AND organization_id = $2', [req.params.id, req.user.organizationId]);
+    if (sourceRes.rows.length === 0) return res.status(404).json({ error: 'Exam not found' });
+    const source = sourceRes.rows[0];
+    if (await enforceSubjectAuthority(req, res, source.subject_id)) return;
+
+    for (const sid of subjectIds) {
+      if (await enforceSubjectAuthority(req, res, sid)) return;
+    }
+
+    const itemsRes = await pool.query('SELECT * FROM exam_items WHERE exam_id = $1 ORDER BY position ASC', [req.params.id]);
+    const items = itemsRes.rows;
+    const opensAt = req.body.opensAt !== undefined ? req.body.opensAt : source.opens_at;
+    const closesAt = req.body.closesAt !== undefined ? req.body.closesAt : source.closes_at;
+
+    const client = await pool.connect();
+    const createdIds = [];
+    try {
+      await client.query('BEGIN');
+      for (const sid of subjectIds) {
+        const newExamRes = await client.query(
+          `INSERT INTO exams (title, description, total_marks, total_time_seconds, webcam_required, opens_at, closes_at, created_by, organization_id, subject_id, calculator_allowed, calculator_type)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
+          [source.title, source.description, source.total_marks, source.total_time_seconds, source.webcam_required,
+           opensAt, closesAt, req.user.userId, req.user.organizationId, sid, source.calculator_allowed, source.calculator_type]
+        );
+        const newExamId = newExamRes.rows[0].id;
+        createdIds.push(newExamId);
+        for (let i = 0; i < items.length; i++) {
+          const it = items[i];
+          await client.query(
+            `INSERT INTO exam_items (exam_id, type, position, marks, time_limit_seconds, prompt, options, correct_option_id, word_limit, problem_id, starter_code, test_cases)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+            [newExamId, it.type, i, it.marks, it.time_limit_seconds, it.prompt,
+             it.options ? JSON.stringify(it.options) : null, it.correct_option_id, it.word_limit, it.problem_id,
+             it.starter_code ? JSON.stringify(it.starter_code) : null, it.test_cases ? JSON.stringify(it.test_cases) : null]
+          );
+        }
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    res.status(201).json({ message: `Cloned into ${createdIds.length} exam${createdIds.length === 1 ? '' : 's'}`, examIds: createdIds });
+  } catch (err) {
+    console.error('Clone exam error:', err);
+    res.status(500).json({ error: 'Failed to clone exam' });
+  }
+});
+
+// ============================================================================
+// QUESTION BANK — reusable exam items, detached from any specific exam
+// until ExamForm inserts a copy into one. Same shape/validation as an
+// exam_items row (normalizeExamItem), same subject authorization gate as
+// every other subject-scoped resource here.
+// ============================================================================
+app.get('/api/admin/question-bank', authenticateToken, requireAdminOrTeacher, async (req, res) => {
+  const subjectId = req.query.subjectId != null && req.query.subjectId !== '' ? Number(req.query.subjectId) : null;
+  if (await enforceSubjectAuthority(req, res, subjectId)) return;
+  try {
+    const result = await pool.query(
+      `SELECT id, subject_id, type, marks, time_limit_seconds, prompt, options, correct_option_id,
+              word_limit, problem_id, starter_code, test_cases, created_at
+       FROM question_bank_items
+       WHERE organization_id = $1 AND ($2::int IS NULL OR subject_id = $2)
+       ORDER BY created_at DESC`,
+      [req.user.organizationId, subjectId]
+    );
+    res.status(200).json({ items: result.rows });
+  } catch (err) {
+    console.error('List question bank error:', err);
+    res.status(500).json({ error: 'Failed to load question bank' });
+  }
+});
+
+app.post('/api/admin/question-bank', authenticateToken, requireAdminOrTeacher, async (req, res) => {
+  const subjectId = req.body.subjectId != null ? Number(req.body.subjectId) : null;
+  if (await enforceSubjectAuthority(req, res, subjectId)) return;
+
+  let item;
+  try {
+    item = normalizeExamItem(req.body, 0);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  if (item.type === 'coding' && item.problemId != null) {
+    const existing = await pool.query('SELECT id FROM problems WHERE id = $1 AND organization_id = $2', [item.problemId, req.user.organizationId]);
+    if (existing.rows.length === 0) return res.status(400).json({ error: 'Coding item references a missing assignment' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO question_bank_items (organization_id, subject_id, type, marks, time_limit_seconds, prompt, options, correct_option_id, word_limit, problem_id, starter_code, test_cases, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id`,
+      [req.user.organizationId, subjectId, item.type, item.marks, item.timeLimitSeconds, item.prompt,
+       item.options ? JSON.stringify(item.options) : null, item.correctOptionId, item.wordLimit, item.problemId,
+       item.starterCode ? JSON.stringify(item.starterCode) : null, item.testCases ? JSON.stringify(item.testCases) : null, req.user.userId]
+    );
+    res.status(201).json({ message: 'Saved to question bank', id: result.rows[0].id });
+  } catch (err) {
+    console.error('Create question bank item error:', err);
+    res.status(500).json({ error: 'Failed to save to question bank' });
+  }
+});
+
+app.delete('/api/admin/question-bank/:id', authenticateToken, requireAdminOrTeacher, async (req, res) => {
+  try {
+    const existing = await pool.query('SELECT id, subject_id FROM question_bank_items WHERE id = $1 AND organization_id = $2', [req.params.id, req.user.organizationId]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Question bank item not found' });
+    if (await enforceSubjectAuthority(req, res, existing.rows[0].subject_id)) return;
+
+    await pool.query('DELETE FROM question_bank_items WHERE id = $1', [req.params.id]);
+    res.status(200).json({ message: 'Deleted from question bank' });
+  } catch (err) {
+    console.error('Delete question bank item error:', err);
+    res.status(500).json({ error: 'Failed to delete question bank item' });
   }
 });
 
@@ -8186,7 +8671,7 @@ app.get('/api/exams', authenticateToken, async (req, res) => {
 app.get('/api/exams/:id', authenticateToken, async (req, res) => {
   try {
     const examRes = await pool.query(
-      'SELECT id, title, description, total_marks, total_time_seconds, webcam_required, opens_at, closes_at FROM exams WHERE id = $1 AND organization_id = $2',
+      'SELECT id, title, description, total_marks, total_time_seconds, webcam_required, calculator_allowed, calculator_type, opens_at, closes_at FROM exams WHERE id = $1 AND organization_id = $2',
       [req.params.id, req.user.organizationId]
     );
     if (examRes.rows.length === 0) return res.status(404).json({ error: 'Exam not found' });
@@ -8335,7 +8820,7 @@ app.post('/api/exams/:id/start', authenticateToken, async (req, res) => {
     res.status(201).json({
       attemptId: attempt.id,
       deadlineAt: attempt.deadline_at,
-      exam: { id: exam.id, title: exam.title, totalMarks: exam.total_marks, totalTimeSeconds: exam.total_time_seconds },
+      exam: { id: exam.id, title: exam.title, totalMarks: exam.total_marks, totalTimeSeconds: exam.total_time_seconds, calculatorAllowed: exam.calculator_allowed, calculatorType: exam.calculator_type },
       items: sanitizedItems,
     });
   } catch (err) {
@@ -8460,6 +8945,14 @@ app.post('/api/exams/:id/submit', authenticateToken, async (req, res) => {
     }
 
     res.status(200).json({ submitted: true });
+
+    // Fire-and-forget, after the response — see runExamShortLongAiAssessment's
+    // own comment for why this can't be awaited inline. Shares ocrLimit with
+    // the scan pipeline's own Groq calls so a burst of exam submissions at
+    // the end of a deadline window doesn't fan out unbounded concurrent
+    // requests to the same rate-limited API.
+    ocrLimit(() => runExamShortLongAiAssessment(attemptId, itemsRes.rows))
+      .catch((err) => console.error('Background exam AI assessment error:', err));
   } catch (err) {
     console.error('Submit exam error:', err);
     res.status(500).json({ error: 'Failed to submit exam' });
@@ -8755,7 +9248,7 @@ app.get('/api/admin/exam-attempts/:attemptId/answers', authenticateToken, requir
     const result = await pool.query(
       `SELECT ea.id AS answer_id, ei.id AS item_id, ei.type, ei.prompt, ei.marks, ei.options,
               ea.marks_awarded, ea.selected_option_id, ea.text_answer, ea.is_correct,
-              ea.passed_count, ea.total_count, ea.code, ea.language, ea.remarks
+              ea.passed_count, ea.total_count, ea.code, ea.language, ea.remarks, ea.ai_assessment
        FROM exam_answers ea
        JOIN exam_items ei ON ei.id = ea.item_id
        JOIN exam_attempts a ON a.id = ea.attempt_id
@@ -9101,6 +9594,38 @@ async function finalizeScanSubmissionDigitalAnswers(submissionId, questions, ans
   }
 }
 
+// Mirrors runExamShortLongAiAssessment (see near the exam submit route) for
+// the scan-assignment side: same posture — assist-only, one Groq call per
+// item, never touches marks_awarded, just a note a teacher sees next to the
+// grade input in ScanReview. Needed because processOneScanSubmission's own
+// AI-assessment call only ever covers type='scan' questions (see its own
+// comment) — short/long questions submitted digitally alongside (or instead
+// of) a scan never reach that function, and a scan-mode assignment with
+// only short/long questions never reaches it at all (see the initialStatus
+// comment below).
+async function runScanShortLongAiAssessment(submissionId, questions) {
+  if (!isGroqConfigured()) return;
+  const shortLongQuestions = questions.filter((q) => q.type === 'short' || q.type === 'long');
+  if (shortLongQuestions.length === 0) return;
+  const questionsById = new Map(shortLongQuestions.map((q) => [q.id, q]));
+
+  try {
+    const answersRes = await pool.query(
+      'SELECT id, question_id, text_answer FROM scan_submission_answers WHERE submission_id = $1 AND question_id = ANY($2::int[])',
+      [submissionId, shortLongQuestions.map((q) => q.id)]
+    );
+    for (const row of answersRes.rows) {
+      if (!row.text_answer || !row.text_answer.trim()) continue;
+      const q = questionsById.get(row.question_id);
+      if (!q) continue;
+      const [assessment] = await assessAnswers([{ prompt: q.prompt, marks: q.marks }], row.text_answer, { isOcr: false });
+      await pool.query('UPDATE scan_submission_answers SET ai_assessment = $1 WHERE id = $2', [assessment || null, row.id]);
+    }
+  } catch (err) {
+    console.error(`Scan short/long AI assessment failed for submission ${submissionId}:`, err);
+  }
+}
+
 app.post('/api/problems/:id/scan-submit', authenticateToken, scanUpload.single('file'), async (req, res) => {
   const problemId = req.params.id;
   if (!isB2Configured()) return res.status(503).json({ error: 'Scanned-assignment storage is not configured yet' });
@@ -9181,6 +9706,19 @@ app.post('/api/problems/:id/scan-submit', authenticateToken, scanUpload.single('
     await finalizeScanSubmissionDigitalAnswers(submissionId, questions, answers);
 
     res.status(201).json({ submissionId, status: initialStatus });
+
+    // Fire-and-forget, after the response — see runScanShortLongAiAssessment
+    // for why this can't be awaited inline. Shares ocrLimit with the rest of
+    // the scan/exam Groq calls so a burst of submissions doesn't fan out
+    // unbounded concurrent requests to the same rate-limited API.
+    ocrLimit(() => runScanShortLongAiAssessment(submissionId, questions))
+      .catch((err) => console.error('Background scan AI assessment error:', err));
+
+    // Fire-and-forget typed-answer plagiarism check — separate from the OCR
+    // pipeline's runTextPlagiarismComparator, which only ever fires (via
+    // processOneScanSubmission) once the assignment's deadline passes.
+    runTypedTextPlagiarismComparator(submissionId, problemId, questions)
+      .catch((err) => console.error('Background scan plagiarism check error:', err));
   } catch (err) {
     console.error('Scan submit error:', err);
     res.status(500).json({ error: 'Failed to upload scanned submission' });
@@ -9281,6 +9819,12 @@ app.get('/api/admin/problems/:id/scan-submissions', authenticateToken, requireAd
     const totalMarksRes = await pool.query('SELECT COALESCE(SUM(marks), 0) AS total FROM scan_assignment_questions WHERE problem_id = $1', [req.params.id]);
     const totalMarks = Number(totalMarksRes.rows[0].total);
 
+    const hasScanQuestionsRes = await pool.query(
+      `SELECT EXISTS(SELECT 1 FROM scan_assignment_questions WHERE problem_id = $1 AND type = 'scan') AS has_scan_questions`,
+      [req.params.id]
+    );
+    const hasScanQuestions = hasScanQuestionsRes.rows[0].has_scan_questions;
+
     const result = await pool.query(
       `SELECT ss.id, ss.status, ss.original_filename, ss.storage_key, ss.created_at, ss.ocr_error, ss.penalized, ss.processing_started_at, u.email, u.name,
               (SELECT COALESCE(SUM(sa.marks_awarded), 0) FROM scan_submission_answers sa WHERE sa.submission_id = ss.id) AS awarded_marks,
@@ -9309,7 +9853,7 @@ app.get('/api/admin/problems/:id/scan-submissions', authenticateToken, requireAd
       viewUrl: configured && row.storage_key ? await getScanPdfUrl(row.storage_key) : null,
     })));
 
-    res.status(200).json({ submissions });
+    res.status(200).json({ submissions, hasScanQuestions });
   } catch (err) {
     console.error('List scan submissions error:', err);
     res.status(500).json({ error: 'Failed to load submissions' });
@@ -9347,6 +9891,64 @@ function jaccardSimilarity(setA, setB) {
   return union === 0 ? 0 : intersection / union;
 }
 
+// 8-token-shingle Jaccard similarity for coding submissions — same
+// technique as textShingles above (jaccardSimilarity is shared), just
+// tokenized for code instead of prose: comments stripped first (so a
+// student who only adds/removes comments doesn't dodge detection), then
+// split into identifiers/numbers/single-char operators rather than words.
+// A larger k than the 5-word text shingle since code tokens run shorter
+// and denser than prose — 8 keeps boilerplate (loop headers, print calls)
+// from dominating the shingle set.
+function codeShingles(code, k = 8) {
+  const stripped = String(code || '')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/\/\/.*$/gm, ' ')
+    .replace(/#.*$/gm, ' ');
+  const tokens = stripped.match(/[A-Za-z_]\w*|\d+(?:\.\d+)?|[^\sA-Za-z0-9_]/g) || [];
+  const set = new Set();
+  for (let i = 0; i <= tokens.length - k; i++) set.add(tokens.slice(i, i + k).join(' '));
+  return set;
+}
+
+// Runs after a submission judges as Accepted (see POST /api/problems/:id/
+// submit) — comparing every retry against every other student's every
+// retry would be noisy and quadratic, so this only ever compares final
+// passing solutions, one per other student (their own most recent
+// Accepted submission to this same problem). Fire-and-forget from the
+// submit route: cheap in-memory set ops, no external calls, but never
+// worth delaying the judge response over.
+async function runCodePlagiarismComparator(submission) {
+  try {
+    const orgRes = await pool.query(
+      'SELECT o.code_plagiarism_threshold FROM organizations o JOIN problems p ON p.organization_id = o.id WHERE p.id = $1',
+      [submission.problem_id]
+    );
+    const threshold = orgRes.rows[0]?.code_plagiarism_threshold ?? 0.6;
+    const mySet = codeShingles(submission.code);
+    if (mySet.size === 0) return;
+
+    const othersRes = await pool.query(
+      `SELECT DISTINCT ON (user_id) id, user_id, code FROM submissions
+       WHERE problem_id = $1 AND user_id != $2 AND status = 'Accepted'
+       ORDER BY user_id, created_at DESC`,
+      [submission.problem_id, submission.user_id]
+    );
+    for (const other of othersRes.rows) {
+      const similarity = jaccardSimilarity(mySet, codeShingles(other.code));
+      if (similarity < threshold) continue;
+      const [a, b] = submission.id < other.id ? [submission.id, other.id] : [other.id, submission.id];
+      await pool.query(
+        `INSERT INTO submission_plagiarism_flags (problem_id, submission_a_id, submission_b_id, similarity_score)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (problem_id, submission_a_id, submission_b_id) DO NOTHING`,
+        [submission.problem_id, a, b, similarity]
+      );
+    }
+  } catch (err) {
+    console.error('Code plagiarism comparator failed:', err);
+  }
+}
+
 // handwriting_features -> a flat 21-dim vector (8 stroke-width bins + 12
 // slant-angle bins + 1 ink-density scalar) for cosine similarity.
 function flattenHandwritingFeatures(features) {
@@ -9374,10 +9976,10 @@ const HANDWRITING_SIMILARITY_THRESHOLD = 0.9;
 
 async function runTextPlagiarismComparator(client, submission) {
   const orgRes = await client.query(
-    'SELECT o.scan_plagiarism_threshold FROM organizations o JOIN problems p ON p.organization_id = o.id WHERE p.id = $1',
+    'SELECT p.plagiarism_threshold AS assignment_threshold, o.scan_plagiarism_threshold AS org_threshold FROM organizations o JOIN problems p ON p.organization_id = o.id WHERE p.id = $1',
     [submission.problem_id]
   );
-  const threshold = orgRes.rows[0]?.scan_plagiarism_threshold ?? 0.4;
+  const threshold = orgRes.rows[0]?.assignment_threshold ?? orgRes.rows[0]?.org_threshold ?? 0.4;
   const mySet = textShingles(submission.ocr_text);
   if (mySet.size === 0) return;
 
@@ -9393,9 +9995,61 @@ async function runTextPlagiarismComparator(client, submission) {
     await client.query(
       `INSERT INTO scan_plagiarism_flags (problem_id, submission_a_id, submission_b_id, similarity_score, flag_type)
        VALUES ($1, $2, $3, $4, 'text_similarity')
-       ON CONFLICT (problem_id, submission_a_id, submission_b_id, flag_type) DO NOTHING`,
+       ON CONFLICT (problem_id, submission_a_id, submission_b_id, flag_type) WHERE question_id IS NULL DO NOTHING`,
       [submission.problem_id, a, b, similarity]
     );
+  }
+}
+
+// Typed-answer counterpart to the comparator above — that one only ever
+// compares scan_submissions.ocr_text (the compiled OCR blob for type='scan'
+// questions), so type='short'/'long' answers submitted digitally never
+// entered its comparison pool. Run per-question (unlike the OCR version's
+// one-blob-per-submission) since each typed answer is already cleanly
+// separated by question, unlike a jumbled OCR blob that may cover several
+// questions at once. Called directly from the scan-submit route
+// (fire-and-forget, see runScanShortLongAiAssessment above) rather than
+// from processOneScanSubmission, since a typed-only submission (no scan
+// questions) never reaches that function at all — see the initialStatus
+// comment in POST /api/problems/:id/scan-submit.
+async function runTypedTextPlagiarismComparator(submissionId, problemId, questions) {
+  const shortLongQuestions = questions.filter((q) => q.type === 'short' || q.type === 'long');
+  if (shortLongQuestions.length === 0) return;
+
+  try {
+    const orgRes = await pool.query(
+      'SELECT p.plagiarism_threshold AS assignment_threshold, o.scan_plagiarism_threshold AS org_threshold FROM organizations o JOIN problems p ON p.organization_id = o.id WHERE p.id = $1',
+      [problemId]
+    );
+    const threshold = orgRes.rows[0]?.assignment_threshold ?? orgRes.rows[0]?.org_threshold ?? 0.4;
+
+    for (const q of shortLongQuestions) {
+      const mineRes = await pool.query(
+        'SELECT text_answer FROM scan_submission_answers WHERE submission_id = $1 AND question_id = $2',
+        [submissionId, q.id]
+      );
+      const mySet = textShingles(mineRes.rows[0]?.text_answer);
+      if (mySet.size === 0) continue;
+
+      const othersRes = await pool.query(
+        `SELECT submission_id, text_answer FROM scan_submission_answers
+         WHERE question_id = $1 AND submission_id != $2 AND text_answer IS NOT NULL`,
+        [q.id, submissionId]
+      );
+      for (const other of othersRes.rows) {
+        const similarity = jaccardSimilarity(mySet, textShingles(other.text_answer));
+        if (similarity < threshold) continue;
+        const [a, b] = submissionId < other.submission_id ? [submissionId, other.submission_id] : [other.submission_id, submissionId];
+        await pool.query(
+          `INSERT INTO scan_plagiarism_flags (problem_id, submission_a_id, submission_b_id, question_id, similarity_score, flag_type)
+           VALUES ($1, $2, $3, $4, $5, 'typed_text_similarity')
+           ON CONFLICT (problem_id, submission_a_id, submission_b_id, flag_type, question_id) WHERE question_id IS NOT NULL DO NOTHING`,
+          [problemId, a, b, q.id, similarity]
+        );
+      }
+    }
+  } catch (err) {
+    console.error(`Typed-text plagiarism comparator failed for submission ${submissionId}:`, err);
   }
 }
 
@@ -9583,6 +10237,92 @@ const SCAN_OCR_SWEEP_INTERVAL_MS = 60 * 1000;
 setInterval(sweepScanSubmissions, SCAN_OCR_SWEEP_INTERVAL_MS);
 sweepScanSubmissions();
 
+// ============================================================================
+// "New assignment/exam available" notifications — fans a notification out to
+// every student who can see the item the moment it actually becomes visible
+// to them (respecting opens_at, same computed status getProblemStatus/the
+// exam equivalent already use), not at creation time (a teacher may create
+// something days before its opens_at, and students shouldn't hear about it
+// before they can even see it). Same recipient rule as a subject-scoped
+// note: students under the subject's org_unit and every descendant unit
+// beneath it; an item with no subject (org-wide) reaches every student in
+// the org, same as a subject-less note would.
+// ============================================================================
+
+// Shared by both notifiers below. subjectId null means org-wide (every
+// student), mirroring how a subject-less note/notice would fan out.
+// extraColumn is always one of the two hardcoded literals passed by the
+// callers just below (never request input), so the interpolation here never
+// touches anything a caller could inject.
+async function notifyStudentsOfNewItem(organizationId, subjectId, type, title, extraColumn, extraId) {
+  if (subjectId) {
+    const subjectRes = await pool.query('SELECT org_unit_id FROM subjects WHERE id = $1 AND organization_id = $2', [subjectId, organizationId]);
+    const orgUnitId = subjectRes.rows[0]?.org_unit_id;
+    if (!orgUnitId) return;
+    await pool.query(
+      `WITH RECURSIVE descendant_units AS (
+         SELECT id FROM org_units WHERE id = $1
+         UNION
+         SELECT ou.id FROM org_units ou JOIN descendant_units d ON ou.parent_unit_id = d.id
+       )
+       INSERT INTO notifications (organization_id, user_id, type, title, ${extraColumn})
+       SELECT $2, m.user_id, $3, $4, $5
+       FROM memberships m
+       WHERE m.organization_id = $2 AND m.role = 'student' AND m.org_unit_id IN (SELECT id FROM descendant_units)`,
+      [orgUnitId, organizationId, type, title, extraId]
+    );
+  } else {
+    await pool.query(
+      `INSERT INTO notifications (organization_id, user_id, type, title, ${extraColumn})
+       SELECT $1, m.user_id, $2, $3, $4
+       FROM memberships m WHERE m.organization_id = $1 AND m.role = 'student'`,
+      [organizationId, type, title, extraId]
+    );
+  }
+}
+
+async function sweepAssignmentExamNotifications() {
+  try {
+    const dueProblems = await pool.query(
+      `SELECT id, title, subject_id, organization_id FROM problems
+       WHERE notified = false AND (opens_at IS NULL OR opens_at <= now())`
+    );
+    for (const p of dueProblems.rows) {
+      try {
+        await notifyStudentsOfNewItem(p.organization_id, p.subject_id, 'assignment', `New assignment: ${p.title}`, 'problem_id', p.id);
+      } catch (err) {
+        console.error(`Failed to notify students of new assignment ${p.id} (marking notified anyway):`, err);
+      }
+      await pool.query('UPDATE problems SET notified = true WHERE id = $1', [p.id]);
+    }
+
+    const dueExams = await pool.query(
+      `SELECT id, title, subject_id, organization_id FROM exams
+       WHERE notified = false AND (opens_at IS NULL OR opens_at <= now())`
+    );
+    for (const e of dueExams.rows) {
+      try {
+        await notifyStudentsOfNewItem(e.organization_id, e.subject_id, 'exam', `New exam: ${e.title}`, 'exam_id', e.id);
+      } catch (err) {
+        console.error(`Failed to notify students of new exam ${e.id} (marking notified anyway):`, err);
+      }
+      await pool.query('UPDATE exams SET notified = true WHERE id = $1', [e.id]);
+    }
+  } catch (err) {
+    console.error('Assignment/exam notification sweep error:', err);
+  }
+}
+const ASSIGNMENT_EXAM_NOTIFICATION_SWEEP_INTERVAL_MS = 60 * 1000;
+// Unlike sweepScanSubmissions above (whose tables/columns have existed
+// since long before this process started), notifications.problem_id/
+// exam_id and exams.notified are brand new — starting this sweep
+// immediately would race the async bootSchemaStep queue that creates them
+// on a fresh boot. Wait for the schema to actually be in place first.
+ensureNotificationsSchema().then(() => {
+  setInterval(sweepAssignmentExamNotifications, ASSIGNMENT_EXAM_NOTIFICATION_SWEEP_INTERVAL_MS);
+  sweepAssignmentExamNotifications();
+});
+
 // Full detail for one submission — OCR'd pages, each question with its AI
 // assessment and current marks, and this submission's own flags (both
 // types). Backs ScanReview.jsx. requireAdmin-only, same gating as every
@@ -9612,10 +10352,10 @@ app.get('/api/admin/scan-submissions/:id', authenticateToken, requireAdminOrTeac
     );
 
     const flagsRes = await pool.query(
-      `SELECT id, submission_a_id, submission_b_id, similarity_score, status, 'text_similarity' AS type
+      `SELECT id, submission_a_id, submission_b_id, similarity_score, status, question_id, flag_type AS type
        FROM scan_plagiarism_flags WHERE submission_a_id = $1 OR submission_b_id = $1
        UNION ALL
-       SELECT id, submission_a_id, submission_b_id, similarity_score, status, 'handwriting' AS type
+       SELECT id, submission_a_id, submission_b_id, similarity_score, status, NULL::integer AS question_id, 'handwriting' AS type
        FROM scan_handwriting_flags WHERE submission_a_id = $1 OR submission_b_id = $1`,
       [submission.id]
     );
@@ -9652,6 +10392,7 @@ app.get('/api/admin/scan-submissions/:id', authenticateToken, requireAdminOrTeac
       flags: flagsRes.rows.map((f) => ({
         id: f.id,
         type: f.type,
+        questionId: f.question_id,
         otherSubmissionId: f.submission_a_id === submission.id ? f.submission_b_id : f.submission_a_id,
         similarityScore: f.similarity_score,
         status: f.status,
@@ -9673,7 +10414,7 @@ app.get('/api/admin/scan-submissions/:id', authenticateToken, requireAdminOrTeac
 app.post('/api/admin/scan-submissions/:id/process', authenticateToken, requireAdminOrTeacher, async (req, res) => {
   try {
     const subRes = await pool.query(
-      `SELECT ss.id, ss.status, p.subject_id FROM scan_submissions ss JOIN problems p ON p.id = ss.problem_id
+      `SELECT ss.id, ss.status, ss.problem_id, p.subject_id FROM scan_submissions ss JOIN problems p ON p.id = ss.problem_id
        WHERE ss.id = $1 AND p.organization_id = $2`,
       [req.params.id, req.user.organizationId]
     );
@@ -9681,6 +10422,17 @@ app.post('/api/admin/scan-submissions/:id/process', authenticateToken, requireAd
     if (await enforceSubjectAuthority(req, res, subRes.rows[0].subject_id)) return;
     if (!isB2Configured()) return res.status(503).json({ error: 'Scanned-assignment storage is not configured yet' });
     if (!isOcrConfigured()) return res.status(503).json({ error: 'OCR is not configured yet' });
+
+    // No scan-type questions -> no PDF was ever uploaded (storage_key is
+    // ''), so there's nothing for OCR to read; running it anyway just burns
+    // a request on garbage input and leaves the row stuck 'ocr_failed'.
+    const hasScanQuestionsRes = await pool.query(
+      `SELECT EXISTS(SELECT 1 FROM scan_assignment_questions WHERE problem_id = $1 AND type = 'scan') AS has_scan_questions`,
+      [subRes.rows[0].problem_id]
+    );
+    if (!hasScanQuestionsRes.rows[0].has_scan_questions) {
+      return res.status(400).json({ error: 'This assignment has no scanned questions — nothing to OCR.' });
+    }
 
     const submissionId = subRes.rows[0].id;
     if (scanOcrInFlight.has(submissionId)) return res.status(409).json({ error: 'Already processing' });
@@ -9911,11 +10663,11 @@ app.get('/api/admin/problems/:id/scan-flags', authenticateToken, requireAdmin, a
   }
 });
 
-// Confirm/dismiss one flag. Confirming a text_similarity flag penalizes
-// BOTH submissions in the pair (marks display as 0 while penalized=true,
-// see the list/detail routes above) — handwriting flags never penalize
-// anything regardless of status, confirmed or not (see the false-positive-
-// risk note on ensureScanHandwritingFlagsSchema).
+// Confirm/dismiss one flag. Confirming a text_similarity or
+// typed_text_similarity flag penalizes BOTH submissions in the pair (marks
+// display as 0 while penalized=true, see the list/detail routes above) —
+// handwriting flags never penalize anything regardless of status, confirmed
+// or not (see the false-positive-risk note on ensureScanHandwritingFlagsSchema).
 // requireAdminOrTeacher + enforceSubjectAuthority, not requireAdmin —
 // reachable from ScanReview.jsx, a page a teacher can land on for their own
 // scan-mode assignments (see that page's own ProtectedRoute entry in
@@ -9929,7 +10681,7 @@ app.put('/api/admin/scan-flags/:type/:id', authenticateToken, requireAdminOrTeac
   if (!['reviewed_confirmed', 'reviewed_dismissed'].includes(status)) {
     return res.status(400).json({ error: 'status must be reviewed_confirmed or reviewed_dismissed' });
   }
-  const table = type === 'text_similarity' ? 'scan_plagiarism_flags' : type === 'handwriting' ? 'scan_handwriting_flags' : null;
+  const table = type === 'text_similarity' || type === 'typed_text_similarity' ? 'scan_plagiarism_flags' : type === 'handwriting' ? 'scan_handwriting_flags' : null;
   if (!table) return res.status(400).json({ error: 'Invalid flag type' });
 
   const client = await pool.connect();
@@ -9999,6 +10751,98 @@ app.put('/api/admin/settings/scan-plagiarism-threshold', authenticateToken, requ
   }
 });
 
+// Per-org Jaccard-similarity cutoff for the code-submission comparator —
+// same admin-only settings pattern as the scan one above, separate column
+// since code and prose similarity scores don't live on the same natural
+// scale (code shares far more incidental boilerplate than prose does).
+app.get('/api/admin/settings/code-plagiarism-threshold', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT code_plagiarism_threshold FROM organizations WHERE id = $1', [req.user.organizationId]);
+    res.status(200).json({ threshold: result.rows[0]?.code_plagiarism_threshold ?? 0.6 });
+  } catch (err) {
+    console.error('Get code plagiarism threshold error:', err);
+    res.status(500).json({ error: 'Failed to load threshold' });
+  }
+});
+
+app.put('/api/admin/settings/code-plagiarism-threshold', authenticateToken, requireAdmin, async (req, res) => {
+  const threshold = Number(req.body.threshold);
+  if (Number.isNaN(threshold) || threshold < 0 || threshold > 1) {
+    return res.status(400).json({ error: 'threshold must be a number between 0 and 1' });
+  }
+  try {
+    await pool.query('UPDATE organizations SET code_plagiarism_threshold = $1 WHERE id = $2', [threshold, req.user.organizationId]);
+    res.status(200).json({ message: 'Threshold updated', threshold });
+  } catch (err) {
+    console.error('Update code plagiarism threshold error:', err);
+    res.status(500).json({ error: 'Failed to update threshold' });
+  }
+});
+
+// Every open code-similarity flag for one assignment — backs a per-
+// assignment review list in AssignmentsPanel, same shape as the scan-flags
+// list above.
+app.get('/api/admin/problems/:id/code-flags', authenticateToken, requireAdminOrTeacher, async (req, res) => {
+  try {
+    const problemRes = await pool.query('SELECT id, subject_id FROM problems WHERE id = $1 AND organization_id = $2', [req.params.id, req.user.organizationId]);
+    if (problemRes.rows.length === 0) return res.status(404).json({ error: 'Assignment not found' });
+    if (await enforceSubjectAuthority(req, res, problemRes.rows[0].subject_id)) return;
+
+    const flagsRes = await pool.query(
+      `SELECT f.id, f.submission_a_id, f.submission_b_id, f.similarity_score, f.status, f.created_at,
+              ua.email AS email_a, ua.name AS name_a, ub.email AS email_b, ub.name AS name_b
+       FROM submission_plagiarism_flags f
+       JOIN submissions sa ON sa.id = f.submission_a_id JOIN users ua ON ua.id = sa.user_id
+       JOIN submissions sb ON sb.id = f.submission_b_id JOIN users ub ON ub.id = sb.user_id
+       WHERE f.problem_id = $1 AND f.status = 'open'
+       ORDER BY f.similarity_score DESC`,
+      [req.params.id]
+    );
+
+    res.status(200).json({
+      flags: flagsRes.rows.map((f) => ({
+        id: f.id,
+        submissionA: { id: f.submission_a_id, name: f.name_a, email: f.email_a },
+        submissionB: { id: f.submission_b_id, name: f.name_b, email: f.email_b },
+        similarityScore: f.similarity_score,
+        createdAt: f.created_at,
+      })),
+    });
+  } catch (err) {
+    console.error('List code flags error:', err);
+    res.status(500).json({ error: 'Failed to load flags' });
+  }
+});
+
+// Confirm/dismiss one code-similarity flag. Unlike the scan-plagiarism
+// flow, confirming never auto-penalizes a submission's score — coding
+// assignments grade purely off test-case pass/fail, and silently zeroing
+// that would fight the judge's own authoritative result. Confirming is
+// purely a record for the teacher (e.g. to act on outside the platform);
+// dismissing just closes the flag.
+app.put('/api/admin/code-flags/:id', authenticateToken, requireAdminOrTeacher, async (req, res) => {
+  const { status } = req.body; // 'reviewed_confirmed' | 'reviewed_dismissed'
+  if (!['reviewed_confirmed', 'reviewed_dismissed'].includes(status)) {
+    return res.status(400).json({ error: 'status must be reviewed_confirmed or reviewed_dismissed' });
+  }
+  try {
+    const flagRes = await pool.query(
+      `SELECT f.id, p.subject_id FROM submission_plagiarism_flags f
+       JOIN problems p ON p.id = f.problem_id
+       WHERE f.id = $1 AND p.organization_id = $2`,
+      [req.params.id, req.user.organizationId]
+    );
+    if (flagRes.rows.length === 0) return res.status(404).json({ error: 'Flag not found' });
+    if (await enforceSubjectAuthority(req, res, flagRes.rows[0].subject_id)) return;
+
+    await pool.query('UPDATE submission_plagiarism_flags SET status = $1 WHERE id = $2', [status, req.params.id]);
+    res.status(200).json({ message: 'Flag updated' });
+  } catch (err) {
+    console.error('Update code flag error:', err);
+    res.status(500).json({ error: 'Failed to update flag' });
+  }
+});
+
 app.post('/api/problems/:id/submit', authenticateToken, async (req, res) => {
   const problemId = req.params.id;
   const { language, code } = req.body;
@@ -10054,11 +10898,15 @@ app.post('/api/problems/:id/submit', authenticateToken, async (req, res) => {
       }
     }
 
-    await pool.query(
+    const insertRes = await pool.query(
       `INSERT INTO submissions (user_id, problem_id, language, code, status, passed_count, total_count)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
       [req.user.userId, problemId, language, code, verdict, passedCount, testCases.length]
     );
+
+    if (verdict === 'Accepted') {
+      runCodePlagiarismComparator({ id: insertRes.rows[0].id, problem_id: Number(problemId), user_id: req.user.userId, code });
+    }
 
     const response = { verdict, passed: passedCount, total: testCases.length };
 
@@ -10514,7 +11362,7 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
   if (req.user.role !== 'student' && req.user.role !== 'teacher') return res.status(403).json({ error: 'Not available for this role' });
   try {
     const result = await pool.query(
-      `SELECT id, type, title, body, note_id, notice_id, read_at, created_at FROM notifications
+      `SELECT id, type, title, body, note_id, notice_id, problem_id, exam_id, read_at, created_at FROM notifications
        WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`,
       [req.user.userId]
     );
@@ -10525,6 +11373,8 @@ app.get('/api/notifications', authenticateToken, async (req, res) => {
       body: row.body,
       noteId: row.note_id,
       noticeId: row.notice_id,
+      problemId: row.problem_id,
+      examId: row.exam_id,
       read: row.read_at !== null,
       createdAt: row.created_at,
     }));

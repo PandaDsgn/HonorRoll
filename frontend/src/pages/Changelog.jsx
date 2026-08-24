@@ -14,6 +14,7 @@ const ENTRIES = [
       'Students and teachers now get an in-app notification, with an unread badge, whenever a new note or notice is posted that concerns them.',
       'The assignment submission screen no longer shows a scanning-specific title for assignments that don\'t actually have a scanned question, and now notes that a scanned answer is graded a little after the rest of your submission.',
       'Removed the Assignments and Exams tabs from teachers\' navigation — teachers manage those from their own dashboard rather than attempting them.',
+      'Added a calculator to exams, allowing students to use a calculator during exam attempts. The availability of the calculator and its type is configurable on the exam settings page by the teacher.'
     ],
   },
   {

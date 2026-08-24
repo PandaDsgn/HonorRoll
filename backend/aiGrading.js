@@ -22,16 +22,31 @@ function isGroqConfigured() {
   return !!process.env.GROQ_API_KEY;
 }
 
-function buildPrompt(questions, ocrText) {
+// isOcr distinguishes the two shapes of input this now serves: scanned
+// handwriting (one OCR'd blob that may jumble multiple answers together and
+// garble spelling, so the model needs to both disentangle it AND go easy on
+// exact wording) vs. a typed exam short/long answer (already cleanly
+// attributed to its own question, exactly as the student wrote it — no OCR
+// noise to excuse, so no leniency instruction and no "may not clearly
+// separate them" caveat that wouldn't apply).
+function buildPrompt(questions, text, { isOcr = true } = {}) {
   const questionList = questions.map((q, i) => `${i + 1}. (${q.marks} marks) ${q.prompt}`).join('\n');
-  return `You are assisting a teacher in grading a student's handwritten assignment. The student's answers were read by OCR (handwriting recognition) and may contain misread words or garbled spelling — be lenient about that, judge the underlying meaning, not exact spelling.
+  const intro = isOcr
+    ? "You are assisting a teacher in grading a student's handwritten assignment. The student's answers were read by OCR (handwriting recognition) and may contain misread words or garbled spelling — be lenient about that, judge the underlying meaning, not exact spelling."
+    : "You are assisting a teacher in grading a student's typed exam answer.";
+  const textLabel = isOcr
+    ? "OCR'd text of the student's full answer sheet (may cover multiple questions in any order, and may not clearly separate them)"
+    : "The student's answer, as typed";
+  const emptyPlaceholder = isOcr ? '(no text was recognized)' : '(no answer given)';
+
+  return `${intro}
 
 Questions:
 ${questionList}
 
-OCR'd text of the student's full answer sheet (may cover multiple questions in any order, and may not clearly separate them):
+${textLabel}:
 """
-${ocrText || '(no text was recognized)'}
+${text || emptyPlaceholder}
 """
 
 For EACH question above, assess whether the student's answer (if you can identify one) is correct, incorrect, or partially correct. If you cannot find an answer to a question at all in the text, say so.
@@ -45,7 +60,7 @@ Respond with ONLY a JSON object shaped exactly like:
 // the OCR text itself is still there for a teacher to grade manually.
 // Only throws for actual configuration/API failures, which the caller
 // (the deadline sweep) already wraps in a per-submission try/catch.
-async function assessAnswers(questions, ocrText) {
+async function assessAnswers(questions, text, options = {}) {
   if (!isGroqConfigured()) throw new Error('Groq is not configured (GROQ_API_KEY missing)');
   if (questions.length === 0) return [];
 
@@ -56,7 +71,7 @@ async function assessAnswers(questions, ocrText) {
       headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
-        messages: [{ role: 'user', content: buildPrompt(questions, ocrText) }],
+        messages: [{ role: 'user', content: buildPrompt(questions, text, options) }],
         response_format: { type: 'json_object' },
       }),
     });

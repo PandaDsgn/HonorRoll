@@ -71,6 +71,15 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
   // pick it for anything new, submissionMode is fixed at creation either way.
   const [submissionMode] = useState(initialData?.submissionMode || 'scan');
   const [assignmentNo, setAssignmentNo] = useState(initialData?.assignmentNo || '');
+  // Org admins set a org-wide default (0-1 float) elsewhere; this is an
+  // optional per-assignment override of that same value, shown here as a
+  // 0-100 percentage since that's the more natural unit for a teacher
+  // filling out one assignment (see ScanReview's own similarity display,
+  // which is also a rounded percentage) — converted back to a 0-1 float at
+  // submit time. Blank means "no override, use the org default".
+  const [plagiarismThreshold, setPlagiarismThreshold] = useState(
+    initialData?.plagiarismThreshold != null ? String(Math.round(initialData.plagiarismThreshold * 100)) : ''
+  );
   const [questions, setQuestions] = useState(
     initialData?.questions?.length ? initialData.questions.map(questionFromServer) : [emptyQuestion()]
   );
@@ -225,6 +234,11 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
       }
     }
 
+    if (plagiarismThreshold !== '' && (Number.isNaN(Number(plagiarismThreshold)) || Number(plagiarismThreshold) < 0 || Number(plagiarismThreshold) > 100)) {
+      setError('Plagiarism threshold must be a percentage between 0 and 100, or left blank to use the org default.');
+      return;
+    }
+
     if (opensAt && closesAt && new Date(closesAt) <= new Date(opensAt)) {
       setError('Deadline (closes) must be after the opening time.');
       return;
@@ -243,7 +257,11 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
             starterCode: Object.fromEntries(Object.entries(starterCode).filter(([, code]) => code.trim() !== '')),
             testCases: cleanCases,
           }
-        : { assignmentNo: assignmentNo.trim(), questions: cleanQuestions }),
+        : {
+            assignmentNo: assignmentNo.trim(),
+            questions: cleanQuestions,
+            plagiarismThreshold: plagiarismThreshold !== '' ? Number(plagiarismThreshold) / 100 : null,
+          }),
     };
 
     setSubmitting(true);
@@ -277,6 +295,19 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
           <div className="field">
             <label htmlFor="af-assignment-no">Assignment number</label>
             <input id="af-assignment-no" placeholder="e.g. 3 or HW-3" value={assignmentNo} onChange={(e) => setAssignmentNo(e.target.value)} required />
+          </div>
+        )}
+
+        {submissionMode === 'scan' && (
+          <div className="field">
+            <label htmlFor="af-plagiarism-threshold" title="How similar two students' answers have to be before they're flagged for your review. Leave blank to use your organization's default.">Plagiarism threshold % (optional)</label>
+            <input
+              id="af-plagiarism-threshold"
+              type="number" min="0" max="100" step="5"
+              placeholder="Org default"
+              value={plagiarismThreshold}
+              onChange={(e) => setPlagiarismThreshold(e.target.value)}
+            />
           </div>
         )}
 
