@@ -2247,6 +2247,86 @@ const LANGUAGE_CONFIG = {
     cpuSec: 8,
     noVirtualMemLimit: true,
   },
+  javascript: {
+    filename: 'main.js',
+    buildCmd: null,
+    runCmd: ['node', ['main.js']],
+    memKb: 131072,
+    cpuSec: 5,
+    // V8 reserves a large virtual address range on startup regardless of
+    // actual usage, same reasoning as java's noVirtualMemLimit above.
+    noVirtualMemLimit: true,
+  },
+  typescript: {
+    filename: 'main.ts',
+    // Plain `tsc main.ts` compiles to main.js next to it (no tsconfig/
+    // --outFile needed for a single free-standing file) — exits non-zero on
+    // type errors same as any other compiled language here, which is the
+    // right behavior for a language whose whole point is catching those.
+    buildCmd: ['tsc', ['main.ts']],
+    runCmd: ['node', ['main.js']],
+    memKb: 131072,
+    cpuSec: 12,     // tsc's own startup + typechecking is slow relative to just running node
+    noVirtualMemLimit: true,
+    // tsc (and npm-installed CLIs generally) can fail or warn noisily
+    // looking for a writable $HOME — see needsHome handling in
+    // executeInSandboxRaw.
+    needsHome: true,
+  },
+  go: {
+    filename: 'main.go',
+    // `go build main.go` (a file explicitly named on the command line)
+    // compiles in "file mode," which — unlike `go build .` — doesn't
+    // require a go.mod in the directory, so no extra module-init step
+    // is needed for a single free-standing file.
+    buildCmd: ['go', ['build', '-o', 'program', 'main.go']],
+    runCmd: ['./program', []],
+    memKb: 131072,
+    cpuSec: 10,
+    // The Go runtime reserves virtual address space up front like the
+    // JVM/V8 above.
+    noVirtualMemLimit: true,
+    // The go tool always needs a writable $HOME to create its build cache
+    // (GOCACHE defaults to $HOME/.cache/go-build) — without this it fails
+    // outright rather than just warning, unlike tsc above.
+    needsHome: true,
+    // Without a persistent GOCACHE, every single run recompiles the entire
+    // standard library dependency chain (fmt, reflect, sync, ...) from
+    // scratch — slow enough on its own to risk the cpuSec budget, and one
+    // of those intermediate package archives is what blew past the default
+    // ulimit -f below on a cold cache. Reusing one shared dir across runs
+    // (see GO_BUILD_CACHE_DIR in executeInSandboxRaw) fixes both: repeat
+    // builds hit the cache instead of recompiling stdlib, and the file
+    // that originally triggered "file too large" only gets written once.
+    usesGoBuildCache: true,
+    // Belt-and-braces on top of the cache fix above — a cold cache (this
+    // instance's very first Go run) still needs to write that same large
+    // intermediate archive at least once. Default 2048 blocks (1MB) is far
+    // too tight for that; every other language's binaries/object files
+    // stay well under this even at the default.
+    fileBlocks: 65536, // ulimit -f, in 512-byte blocks (~32MB)
+  },
+  rust: {
+    filename: 'main.rs',
+    buildCmd: ['rustc', ['main.rs', '-o', 'program']],
+    runCmd: ['./program', []],
+    memKb: 131072,
+    cpuSec: 10,
+  },
+  ruby: {
+    filename: 'main.rb',
+    buildCmd: null,
+    runCmd: ['ruby', ['main.rb']],
+    memKb: 65536,
+    cpuSec: 5,
+  },
+  php: {
+    filename: 'main.php',
+    buildCmd: null,
+    runCmd: ['php', ['main.php']],
+    memKb: 65536,
+    cpuSec: 5,
+  },
 };
 
 // Dedicated low-privilege user that student code actually runs as, so a
@@ -2265,6 +2345,14 @@ const SANDBOX_GID = Number(process.env.SANDBOX_GID || 1001);
 // layer, which isn't needed against your own local test runs anyway.
 const canDropPrivileges = typeof process.getuid === 'function' && process.getuid() === 0;
 
+// Shared across every Go execution (unlike executionDir, this is never
+// torn down) so the go tool's build cache actually does its job — see
+// LANGUAGE_CONFIG.go's usesGoBuildCache comment for why a fresh cache per
+// run defeats the point of having one at all. Only ever holds compiled
+// standard-library package archives, not student source itself (each run's
+// own main.go/program stay in its own disposable executionDir).
+const GO_BUILD_CACHE_DIR = path.join(tempDir, '.gocache');
+
 const { spawn } = require('child_process');
 
 /**
@@ -2273,7 +2361,7 @@ const { spawn } = require('child_process');
  * standalone binary, so it has to be set inside `sh -c` before exec'ing
  * the real program). Resolves { code, stdout, stderr, timedOut }.
  */
-function runLimited(cwd, memKb, cpuSec, [cmd, args], stdinData = '', skipVirtualMemLimit = false) {
+function runLimited(cwd, memKb, cpuSec, [cmd, args], stdinData = '', skipVirtualMemLimit = false, extraEnv = {}, fileBlocks = 2048) {
   return new Promise((resolve) => {
     const quotedArgs = args.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(' ');
     // -v and -u are Linux-only here. -v breaks dyld's shared-library loading
@@ -2293,13 +2381,13 @@ function runLimited(cwd, memKb, cpuSec, [cmd, args], stdinData = '', skipVirtual
     // rather than breaking every submission in that language.
     const memLimitLine = (isMac || skipVirtualMemLimit) ? '' : `ulimit -v ${memKb} 2>/dev/null || true;`;
     const procLimitLine = isMac ? '' : `ulimit -u 32 2>/dev/null || true;`;
-    const shellLine = `${memLimitLine} ulimit -t ${cpuSec} 2>/dev/null || true; ${procLimitLine} ulimit -f 2048 2>/dev/null || true; exec ${cmd} ${quotedArgs}`;
+    const shellLine = `${memLimitLine} ulimit -t ${cpuSec} 2>/dev/null || true; ${procLimitLine} ulimit -f ${fileBlocks} 2>/dev/null || true; exec ${cmd} ${quotedArgs}`;
 
     const child = spawn('sh', ['-c', shellLine], {
       cwd,
       ...(canDropPrivileges ? { uid: SANDBOX_UID, gid: SANDBOX_GID } : {}),
       timeout: (cpuSec + 3) * 1000,
-      env: { PATH: process.env.PATH },
+      env: { PATH: process.env.PATH, ...extraEnv },
     });
 
     let stdout = '';
@@ -2364,15 +2452,30 @@ async function executeInSandboxRaw(language, code, stdin = '') {
     return { success: false, timedOut: false, output: '', error: 'Failed to prepare execution files' };
   }
 
+  // Some toolchains (go, tsc) need a writable $HOME for their own cache
+  // dirs — executionDir is already chowned to the sandbox user above and
+  // gets torn down with everything else in cleanup(), so it doubles as a
+  // safe, per-run HOME with nothing left behind between runs.
+  const extraEnv = config.needsHome ? { HOME: executionDir } : {};
+
+  if (config.usesGoBuildCache) {
+    fs.mkdirSync(GO_BUILD_CACHE_DIR, { recursive: true, mode: 0o770 });
+    if (canDropPrivileges) fs.chownSync(GO_BUILD_CACHE_DIR, SANDBOX_UID, SANDBOX_GID);
+    // Overrides the $HOME-derived default above with the persistent dir —
+    // go still wants a writable $HOME for other bookkeeping, but the build
+    // cache itself should outlive this one executionDir.
+    extraEnv.GOCACHE = GO_BUILD_CACHE_DIR;
+  }
+
   if (config.buildCmd) {
-    const build = await runLimited(executionDir, config.memKb, config.cpuSec, config.buildCmd, '', config.noVirtualMemLimit);
+    const build = await runLimited(executionDir, config.memKb, config.cpuSec, config.buildCmd, '', config.noVirtualMemLimit, extraEnv, config.fileBlocks);
     if (build.code !== 0) {
       cleanup();
       return { success: false, timedOut: build.timedOut, output: '', error: build.stderr || 'Compilation failed' };
     }
   }
 
-  const run = await runLimited(executionDir, config.memKb, config.cpuSec, config.runCmd, stdin, config.noVirtualMemLimit);
+  const run = await runLimited(executionDir, config.memKb, config.cpuSec, config.runCmd, stdin, config.noVirtualMemLimit, extraEnv, config.fileBlocks);
   cleanup();
 
   if (run.timedOut) {

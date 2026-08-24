@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
+import { CODE_LANGUAGES } from '../lib/codeLanguages';
 import { API } from '../config';
 
 const ITEM_TYPES = [
@@ -42,7 +43,8 @@ function nextItemKey() {
   return `item-${itemKeySeq}-${Date.now()}`;
 }
 
-const CODING_LANGS = ['python', 'c', 'cpp', 'java'];
+const CODING_LANGS = CODE_LANGUAGES.map((l) => l.id);
+const emptyStarterCode = () => Object.fromEntries(CODING_LANGS.map((id) => [id, '']));
 const emptyItemTestCase = () => ({ input: '', expectedOutput: '', isHidden: true });
 
 function emptyItem(type = 'mcq') {
@@ -59,7 +61,7 @@ function emptyItem(type = 'mcq') {
     // coding-only, "custom question" mode (as opposed to 'reuse', which
     // just points problemId at an existing assignment)
     codingMode: 'reuse',
-    starterCode: { python: '', c: '', cpp: '', java: '' },
+    starterCode: emptyStarterCode(),
     testCases: [emptyItemTestCase()],
   };
 }
@@ -80,7 +82,7 @@ function itemFromServer(it) {
     wordLimit: it.word_limit != null ? String(it.word_limit) : '',
     problemId: it.problem_id != null ? String(it.problem_id) : '',
     codingMode: it.type === 'coding' && !it.problem_id ? 'custom' : 'reuse',
-    starterCode: { python: '', c: '', cpp: '', java: '', ...(it.starter_code || {}) },
+    starterCode: { ...emptyStarterCode(), ...(it.starter_code || {}) },
     testCases: Array.isArray(it.test_cases) && it.test_cases.length
       ? it.test_cases.map((tc) => ({ input: tc.input || '', expectedOutput: tc.expectedOutput || '', isHidden: !!tc.isHidden }))
       : [emptyItemTestCase()],

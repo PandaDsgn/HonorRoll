@@ -3,9 +3,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import axios from 'axios';
 import jscanify from 'jscanify/client';
 import CodeMirror from '@uiw/react-codemirror';
-import { python } from '@codemirror/lang-python';
-import { cpp } from '@codemirror/lang-cpp';
-import { java } from '@codemirror/lang-java';
+import { CODE_LANGUAGES, getCodeMirrorExtension } from '../lib/codeLanguages';
 import { useTheme } from '../hooks/useTheme';
 import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
@@ -18,17 +16,9 @@ import { API } from '../config';
 import './ScanCapture.css';
 import '../Exam.css';
 
-const CODING_LANGUAGES = [
-  { id: 'python', label: 'Python' },
-  { id: 'c', label: 'C' },
-  { id: 'cpp', label: 'C++' },
-  { id: 'java', label: 'Java' },
-];
+const CODING_LANGUAGES = CODE_LANGUAGES.map(({ id, label }) => ({ id, label }));
 function getLanguageExtension(language) {
-  if (language === 'python') return [python()];
-  if (language === 'c' || language === 'cpp') return [cpp()];
-  if (language === 'java') return [java()];
-  return [];
+  return getCodeMirrorExtension(language);
 }
 
 function formatScanDate(iso) {
@@ -565,18 +555,16 @@ export default function ScanCapture() {
 
                     {q.type === 'coding' && (
                       <div className="exam-coding-item">
-                        <div className="segmented" role="tablist">
+                        <select
+                          aria-label="Language"
+                          className="language-select"
+                          value={ans.language || ''}
+                          onChange={(e) => updateAnswer(q.id, { language: e.target.value, code: q.starterCode?.[e.target.value] || '' })}
+                        >
                           {CODING_LANGUAGES.map((l) => (
-                            <button
-                              key={l.id}
-                              type="button"
-                              className={ans.language === l.id ? 'active' : ''}
-                              onClick={() => updateAnswer(q.id, { language: l.id, code: q.starterCode?.[l.id] || '' })}
-                            >
-                              {l.label}
-                            </button>
+                            <option key={l.id} value={l.id}>{l.label}</option>
                           ))}
-                        </div>
+                        </select>
 
                         <div className="editor-panel lc-editor exam-editor">
                           <CodeMirror

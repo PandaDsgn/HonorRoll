@@ -58,7 +58,20 @@ export default function NotificationBell() {
   useEffect(() => {
     fetchNotifications();
     const interval = setInterval(fetchNotifications, 30000);
-    return () => clearInterval(interval);
+    // Browsers throttle setInterval heavily in background/inactive tabs (to
+    // save battery) — the 30s timer above can silently stall for minutes if
+    // the tab isn't focused, which is exactly what made this feel like "only
+    // a manual refresh ever shows new notifications." Re-fetching the moment
+    // the tab becomes visible again closes that gap without waiting for the
+    // throttled interval to eventually catch up.
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') fetchNotifications();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
   }, [fetchNotifications]);
 
   useEffect(() => {
@@ -89,7 +102,7 @@ export default function NotificationBell() {
     <div ref={containerRef} style={{ position: 'relative' }}>
       <button
         type="button"
-        className="btn btn-ghost"
+        className="icon-btn"
         aria-label="Notifications"
         aria-expanded={open}
         onClick={toggleOpen}

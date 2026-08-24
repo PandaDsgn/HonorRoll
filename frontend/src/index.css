@@ -449,6 +449,39 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity:
   color: var(--accent);
 }
 
+/* ---------- language picker ---------- */
+/* A dropdown rather than a .segmented button row — with 10 languages now
+   supported (see codeLanguages.js), a button per language stopped fitting
+   any screen size, not just mobile. Used by IDE.jsx, Sandbox.jsx,
+   ExamAttempt.jsx, and ScanCapture.jsx's coding-item editor. */
+.language-select {
+  /* appearance: none strips the native select chrome (including its own
+     arrow, which looks inconsistent across browsers/OSes) so the SVG
+     chevron below is the only one that ever shows. */
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  padding: 7px 30px 7px 12px;
+  background-color: var(--surface-2);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6' fill='none'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%237d8288' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+.language-select:hover { border-color: var(--text-dim); background-color: var(--surface-3); }
+.language-select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
 /* ---------- mobile hamburger nav (SpaceSwitcher, AdminDashboard tabs) ---------- */
 /* Below this width, a full row of segmented buttons (up to 8 for an admin)
    wraps into two-plus rows and pushes real content down the page — swap it
@@ -476,9 +509,9 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity:
 
 /* SpaceSwitcher's own drawer (the top-bar hamburger) opens centered below
    its toggle instead — that button sits further from the page edge, with
-   NotificationBell/ThemeToggle/Log-out to its right, so a left- or
-   right-pinned drawer would sit off-center under everything else in
-   .sb-actions rather than under the button that opened it. */
+   NotificationBell/ThemeToggle to its right, so a left- or right-pinned
+   drawer would sit off-center under everything else in .sb-actions rather
+   than under the button that opened it. */
 .space-nav-drawer-center {
   right: auto;
   left: 50%;
@@ -490,23 +523,83 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity:
   .space-nav-mobile { display: inline-flex; }
 }
 
-/* ---------- theme toggle ---------- */
-.theme-toggle {
+/* ---------- top bar icon buttons ---------- */
+/* Shared by every icon-only button in .sb-actions — ThemeToggle,
+   NotificationBell's toggle, and SpaceSwitcher/AdminDashboard's hamburger
+   menu toggles. One 32px square (not a circle — the app's other buttons
+   are all rounded rectangles) so the whole row of icon buttons reads as
+   one consistent set instead of each one having its own shape/size.
+   Highlights with the accent color while a dropdown driven by this button
+   is open (aria-expanded="true"), same "active means accent" convention
+   .segmented buttons already use — a plain toggle like ThemeToggle simply
+   never sets aria-expanded, so that rule never matches there. */
+.icon-btn {
   width: 32px;
   height: 32px;
+  padding: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 999px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   background: var(--surface-2);
   color: var(--text-dim);
   cursor: pointer;
   flex-shrink: 0;
-  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
 }
-.theme-toggle:hover { color: var(--text-h); border-color: var(--border-strong); transform: translateY(-1px); }
-.theme-toggle svg { width: 16px; height: 16px; }
+.icon-btn:hover { background: var(--surface-3); color: var(--text); border-color: var(--border-strong); }
+.icon-btn[aria-expanded="true"] {
+  background: var(--surface-3);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.icon-btn svg { width: 16px; height: 16px; }
+
+/* ---------- logout FAB ---------- */
+/* The only remaining way to log out — see LogoutFab.jsx's own comment for
+   why it's not in the top bar anymore. Fixed to the viewport (not the
+   page), so it stays put in the corner through scrolling on the long
+   dashboard pages that render it. */
+.logout-fab {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  width: 52px;
+  height: 52px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--danger);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  z-index: 100;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+}
+.logout-fab:hover {
+  background: var(--surface-3);
+  border-color: var(--danger);
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
+}
+
+/* Every button in the top bar — any plain .btn action there (e.g.
+   ExamAttempt's calculator toggle), the language/space nav tabs, and the
+   32px icon buttons above — sits at the same height regardless of its own
+   padding, so the row lines up cleanly; width is left free to vary with
+   each button's own label/content. Scoped to .sb-actions specifically (not
+   a blanket .btn/.segmented change) since those two classes are used for
+   plenty of buttons elsewhere in the app that were never part of this row
+   and shouldn't be forced to match it. */
+.sb-actions .btn,
+.sb-actions .segmented button {
+  height: 32px;
+  padding-top: 0;
+  padding-bottom: 0;
+}
 
 /* ---------- auth page ---------- */
 @keyframes riseIn {

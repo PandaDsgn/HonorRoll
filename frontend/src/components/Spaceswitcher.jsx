@@ -32,10 +32,18 @@ export default function SpaceSwitcher({ activeTab }) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const containerRef = useRef(null);
 
+  // One single priority order, filtered per role rather than reordered per
+  // role — every role sees a subsequence of this exact same list, so the
+  // relative hierarchy (whatever a role does see, it sees in this order)
+  // never drifts between roles: Dashboard (home base) > Notices
+  // (time-sensitive announcements) > Assignments/Exams (actionable, has a
+  // deadline) > Notes (reference material, no deadline) > IDE (a free
+  // scratch space, the least "important" item here since nothing about it
+  // is graded or due).
   const spaces = [
     ...(role === 'student' ? [{ id: 'performance', label: 'Dashboard', path: '/performance' }] : []),
-    ...(role === 'student' ? [{ id: 'notes', label: 'Notes', path: '/notes' }] : []),
     ...(role === 'admin' || role === 'teacher' ? [{ id: 'admin', label: 'Dashboard', path: '/admin' }] : []),
+    ...(role === 'student' || role === 'teacher' ? [{ id: 'notices', label: 'Notices', path: '/notices' }] : []),
     // A teacher/admin creates/grades assignments and exams from their own
     // admin dashboard tabs (see AssignmentsPanel/ExamsPanel there) — they
     // never attempt one themselves the way a student does, so these
@@ -43,8 +51,8 @@ export default function SpaceSwitcher({ activeTab }) {
     // student-only, same as Notes below.
     ...(role === 'student' ? [{ id: 'assignments', label: 'Assignments', path: '/assignments' }] : []),
     ...(role === 'student' ? [{ id: 'exams', label: 'Exams', path: '/exams' }] : []),
+    ...(role === 'student' ? [{ id: 'notes', label: 'Notes', path: '/notes' }] : []),
     ...(role === 'student' ? [{ id: 'ide', label: 'IDE', path: '/ide' }] : []),
-    ...(role === 'student' || role === 'teacher' ? [{ id: 'notices', label: 'Notices', path: '/notices' }] : []),
   ];
 
   useEffect(() => {
@@ -81,7 +89,7 @@ export default function SpaceSwitcher({ activeTab }) {
       <div className="space-nav-mobile" ref={containerRef}>
         <button
           type="button"
-          className="btn btn-ghost"
+          className="icon-btn"
           aria-label="Menu"
           aria-expanded={mobileOpen}
           onClick={() => setMobileOpen((v) => !v)}
@@ -105,8 +113,18 @@ export default function SpaceSwitcher({ activeTab }) {
           </div>
         )}
       </div>
-
-      {(role === 'student' || role === 'teacher') && <NotificationBell />}
     </Fragment>
   );
+}
+
+// Split out from SpaceSwitcher itself so pages can position it independently
+// in their own .sb-actions row without duplicating the student/teacher role
+// check in every page — this is the one place that check lives. (Used to
+// sit right after a top-bar Log out button; that button now lives only as
+// LogoutFab on each role's Dashboard page, but this component's own
+// position in .sb-actions was left as-is rather than relocated for no
+// reason.)
+export function SpaceNotifications() {
+  const { role } = useAuth();
+  return (role === 'student' || role === 'teacher') ? <NotificationBell /> : null;
 }

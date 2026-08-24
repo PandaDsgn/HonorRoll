@@ -2,10 +2,9 @@ import { useState, useEffect, useCallback, Fragment } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { useTheme } from '../hooks/useTheme';
-import { useAuth } from '../context/AuthContext';
 import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
-import SpaceSwitcher from '../components/SpaceSwitcher';
+import SpaceSwitcher, { SpaceNotifications } from '../components/SpaceSwitcher';
 import { NoteTypeIcon } from '../components/NoteTypeIcons';
 import { API } from '../config';
 import '../admin.css';
@@ -26,7 +25,6 @@ function formatDate(iso) {
 export default function Notes() {
   const navigate = useNavigate();
   const { theme, toggleTheme } = useTheme();
-  const { logout } = useAuth();
 
   const [subjects, setSubjects] = useState([]);
   const [subjectId, setSubjectId] = useState('');
@@ -61,19 +59,14 @@ export default function Notes() {
 
   useEffect(() => { fetchNotes(); }, [fetchNotes]);
 
-  const handleLogout = async () => {
-    await logout();
-    navigate('/', { replace: true });
-  };
-
   return (
     <div className="sb-shell">
       <header className="sb-topbar">
         <button type="button" className="brand" onClick={() => navigate('/')}><BrandMark /></button>
         <div className="sb-actions">
           <SpaceSwitcher activeTab="notes" />
+          <SpaceNotifications />
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
-          <button type="button" className="btn btn-ghost" onClick={handleLogout}>Log out</button>
         </div>
       </header>
 

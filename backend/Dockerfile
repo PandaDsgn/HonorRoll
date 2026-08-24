@@ -3,13 +3,22 @@ FROM node:20-slim
 # Compilers/interpreters baked into the image itself, no Docker-in-Docker.
 # curl is here purely for the HEALTHCHECK below (and for manually poking a
 # running container from a shell), not for anything the app itself uses.
+# node itself is already the base image's own runtime (no separate package
+# needed for JavaScript); typescript is installed globally via npm just
+# below since it isn't an apt package. See LANGUAGE_CONFIG in index.js for
+# what each of these is actually invoked as.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     gcc \
     g++ \
     default-jdk \
+    golang-go \
+    rustc \
+    ruby \
+    php-cli \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g typescript
 
 # Dedicated low-privilege user student code actually runs as (uid/gid 1001,
 # matching SANDBOX_UID/SANDBOX_GID defaults in index.js). nologin shell means

@@ -3,16 +3,14 @@ import { useNavigate, useParams } from 'react-router-dom';
 import axios from 'axios';
 import CodeMirror from '@uiw/react-codemirror';
 import { EditorView } from '@codemirror/view';
-import { python } from '@codemirror/lang-python';
-import { cpp } from '@codemirror/lang-cpp';
-import { java } from '@codemirror/lang-java';
+import { CODE_LANGUAGES, codeFileName, getCodeMirrorExtension } from '../lib/codeLanguages';
 import { useTheme } from '../hooks/useTheme';
 import { useFontSize } from '../hooks/useFontSize';
 import { usePanelSplit } from '../hooks/usePanelSplit';
 import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
-import SpaceSwitcher from '../components/SpaceSwitcher';
-import { useAuth, TOKEN_KEY } from '../context/AuthContext';
+import SpaceSwitcher, { SpaceNotifications } from '../components/SpaceSwitcher';
+import { TOKEN_KEY } from '../context/AuthContext';
 import { API } from '../config';
 import '../Sandbox.css';
 
@@ -144,12 +142,7 @@ function formatTimer(totalSeconds) {
   return hrs > 0 ? `${hrs}:${pad(mins)}:${pad(secs)}` : `${pad(mins)}:${pad(secs)}`;
 }
 
-const LANGUAGES = [
-  { id: 'python', label: 'Python', file: 'solution.py', dot: '#60a5fa' },
-  { id: 'c', label: 'C', file: 'solution.c', dot: '#a78bfa' },
-  { id: 'cpp', label: 'C++', file: 'solution.cpp', dot: '#f43f5e' },
-  { id: 'java', label: 'Java', file: 'Solution.java', dot: '#f472b6' },
-];
+const LANGUAGES = CODE_LANGUAGES.map((l) => ({ ...l, file: codeFileName(l.id, 'solution') }));
 
 const DIFFICULTY_CLASS = { Easy: 'chip-easy', Medium: 'chip-medium', Hard: 'chip-hard' };
 
@@ -236,12 +229,7 @@ export default function Sandbox() {
     setCode(starterCode[lang] || '// No starter code available');
   };
 
-  const getLanguageExtension = () => {
-    if (language === 'python') return [python()];
-    if (language === 'c' || language === 'cpp') return [cpp()];
-    if (language === 'java') return [java()];
-    return [];
-  };
+  const getLanguageExtension = () => getCodeMirrorExtension(language);
 
   const handleRun = async () => {
     if (isExecuting || isSubmitting) return;
@@ -338,11 +326,6 @@ export default function Sandbox() {
     }
   };
 
-  const { logout } = useAuth();
-  const handleLogout = async () => {
-    await logout();
-    navigate('/', { replace: true });
-  };
   const activeLang = LANGUAGES.find((l) => l.id === language);
   const activeTestCase = testCases[activeCaseIndex];
 
@@ -357,8 +340,8 @@ export default function Sandbox() {
         )}
         <div className="sb-actions">
           <SpaceSwitcher activeTab="assignments" />
+          <SpaceNotifications />
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
-          <button type="button" className="btn btn-ghost" onClick={handleLogout}>Log out</button>
         </div>
       </header>
 
@@ -398,18 +381,11 @@ export default function Sandbox() {
         <section className="sandbox-right" style={{ width: `${100 - leftPercent}%` }}>
           <div className="sb-toolbar">
             <div className="sb-toolbar-group">
-              <div className="segmented" role="tablist">
+              <select aria-label="Language" className="language-select" value={language} onChange={(e) => selectLanguage(e.target.value)}>
                 {LANGUAGES.map((l) => (
-                  <button
-                    key={l.id}
-                    type="button"
-                    className={language === l.id ? 'active' : ''}
-                    onClick={() => selectLanguage(l.id)}
-                  >
-                    {l.label}
-                  </button>
+                  <option key={l.id} value={l.id}>{l.label}</option>
                 ))}
-              </div>
+              </select>
 
               <div className="font-size-control">
                 <button type="button" className="btn btn-ghost font-size-btn" aria-label="Decrease font size" disabled={!canDecrease} onClick={decreaseFontSize}>−</button>

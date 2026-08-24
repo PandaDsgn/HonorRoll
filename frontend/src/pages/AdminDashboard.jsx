@@ -5,7 +5,8 @@ import { useTheme } from '../hooks/useTheme';
 import { useAuth } from '../context/AuthContext';
 import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
-import SpaceSwitcher from '../components/SpaceSwitcher';
+import SpaceSwitcher, { SpaceNotifications } from '../components/SpaceSwitcher';
+import LogoutFab from '../components/LogoutFab';
 import AssignmentForm from '../components/AssignmentForm';
 import ExamForm from '../components/ExamForm';
 import OrgStructureBuilder from '../components/OrgStructureBuilder';
@@ -63,7 +64,7 @@ export default function AdminDashboard() {
   const navigate = useNavigate();
   const location = useLocation();
   const { theme, toggleTheme } = useTheme();
-  const { logout, user } = useAuth();
+  const { user } = useAuth();
   const [tab, setTab] = useState('students');
   const [selectedStudentId, setSelectedStudentId] = useState(null);
   const [selectedMyStudentId, setSelectedMyStudentId] = useState(null);
@@ -95,19 +96,15 @@ export default function AdminDashboard() {
   // full page reload.
   const [unitsVersion, setUnitsVersion] = useState(0);
 
-  const handleLogout = async () => {
-    await logout();
-    navigate('/', { replace: true });
-  };
-
   return (
     <div className="sb-shell">
+      <LogoutFab />
       <header className="sb-topbar">
         <button type="button" className="brand" onClick={() => navigate('/')}><BrandMark /></button>
         <div className="sb-actions">
           <SpaceSwitcher activeTab="admin" />
+          <SpaceNotifications />
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
-          <button type="button" className="btn btn-ghost" onClick={handleLogout}>Log out</button>
         </div>
       </header>
 
@@ -150,7 +147,7 @@ export default function AdminDashboard() {
                   ))}
                 </div>
                 <div className="space-nav-mobile" ref={adminTabsMobileRef}>
-                  <button type="button" className="btn btn-ghost" aria-label="Section menu" aria-expanded={adminTabsMobileOpen} onClick={() => setAdminTabsMobileOpen((v) => !v)}>
+                  <button type="button" className="icon-btn" aria-label="Section menu" aria-expanded={adminTabsMobileOpen} onClick={() => setAdminTabsMobileOpen((v) => !v)}>
                     <MenuIcon />
                   </button>
                   {adminTabsMobileOpen && (

@@ -5,6 +5,7 @@ import { useTheme } from '../hooks/useTheme';
 import { useAuth } from '../context/AuthContext';
 import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
+import LogoutFab from '../components/LogoutFab';
 import { API } from '../config';
 import '../admin.css';
 
@@ -34,7 +35,7 @@ const PCR_STATUS_CLASS = { pending: 'chip-medium', escalated: 'chip-medium', app
 export default function SuperadminDashboard() {
   const navigate = useNavigate();
   const { theme, toggleTheme } = useTheme();
-  const { user, logout, setUser } = useAuth();
+  const { user, setUser } = useAuth();
   const [orgs, setOrgs] = useState(null);
   const [summary, setSummary] = useState(null);
   const [error, setError] = useState('');
@@ -55,11 +56,6 @@ export default function SuperadminDashboard() {
   }, []);
 
   useEffect(() => { fetchOrgs(); }, [fetchOrgs]);
-
-  const handleLogout = async () => {
-    await logout();
-    navigate('/', { replace: true });
-  };
 
   // Superadmin is the one role nothing else ever collects a display name
   // for — an admin sets theirs at signup, a teacher/student gets theirs
@@ -144,12 +140,12 @@ export default function SuperadminDashboard() {
 
   return (
     <div className="sb-shell">
+      <LogoutFab />
       <header className="sb-topbar">
         <button type="button" className="brand" onClick={() => navigate('/')}><BrandMark /></button>
         <div className="sb-actions">
           <span className="auth-sub">{user?.email}</span>
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
-          <button type="button" className="btn btn-ghost" onClick={handleLogout}>Log out</button>
         </div>
       </header>
 

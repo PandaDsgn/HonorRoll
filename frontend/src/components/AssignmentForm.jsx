@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
+import { CODE_LANGUAGES } from '../lib/codeLanguages';
 import { API } from '../config';
 
-const LANGS = ['python', 'c', 'cpp', 'java'];
+const LANGS = CODE_LANGUAGES.map((l) => l.id);
+const emptyStarterCode = () => Object.fromEntries(LANGS.map((id) => [id, '']));
 const QUESTION_TYPES = [
   { id: 'scan', label: 'Scanned (handwritten)' },
   { id: 'mcq', label: 'MCQ' },
@@ -24,7 +26,7 @@ function emptyQuestion(type = 'scan') {
     options: [{ id: 'a', text: '' }, { id: 'b', text: '' }],
     correctOptionId: '',
     wordLimit: '',
-    starterCode: { python: '', c: '', cpp: '', java: '' },
+    starterCode: emptyStarterCode(),
     testCases: [emptyTestCase()],
   };
 }
@@ -40,7 +42,7 @@ function questionFromServer(q) {
     options: Array.isArray(q.options) && q.options.length ? q.options : [{ id: 'a', text: '' }, { id: 'b', text: '' }],
     correctOptionId: q.correctOptionId || '',
     wordLimit: q.wordLimit != null ? String(q.wordLimit) : '',
-    starterCode: { python: '', c: '', cpp: '', java: '', ...(q.starterCode || {}) },
+    starterCode: { ...emptyStarterCode(), ...(q.starterCode || {}) },
     testCases: Array.isArray(q.testCases) && q.testCases.length ? q.testCases : [emptyTestCase()],
   };
 }
@@ -89,7 +91,7 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
   const [description, setDescription] = useState(initialData?.description || '');
 
   const [starterCode, setStarterCode] = useState(() => {
-    const def = { python: '', c: '', cpp: '', java: '' };
+    const def = emptyStarterCode();
     return initialData?.starterCode ? { ...def, ...initialData.starterCode } : def;
   });
 

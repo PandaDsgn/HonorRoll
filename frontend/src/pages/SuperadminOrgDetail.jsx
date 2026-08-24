@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { useNavigate, useLocation, useParams } from 'react-router-dom';
 import axios from 'axios';
 import { useTheme } from '../hooks/useTheme';
-import { useAuth, setOrgOverrideHeader } from '../context/AuthContext';
+import { setOrgOverrideHeader } from '../context/AuthContext';
 import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
 import { API } from '../config';
@@ -30,7 +30,6 @@ export default function SuperadminOrgDetail() {
   const location = useLocation();
   const { orgId } = useParams();
   const { theme, toggleTheme } = useTheme();
-  const { logout } = useAuth();
   const [orgName, setOrgName] = useState(location.state?.orgName || null);
   const [section, setSection] = useState('people');
 
@@ -44,11 +43,6 @@ export default function SuperadminOrgDetail() {
     return () => setOrgOverrideHeader(null);
   }, [orgId, orgName]);
 
-  const handleLogout = async () => {
-    await logout();
-    navigate('/', { replace: true });
-  };
-
   const SECTIONS = [
     { id: 'people', label: 'Admins, Teachers & Students' },
     { id: 'structure', label: 'Structure' },
@@ -61,7 +55,6 @@ export default function SuperadminOrgDetail() {
         <button type="button" className="brand" onClick={() => navigate('/')}><BrandMark /></button>
         <div className="sb-actions">
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
-          <button type="button" className="btn btn-ghost" onClick={handleLogout}>Log out</button>
         </div>
       </header>
 

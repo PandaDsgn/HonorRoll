@@ -4,8 +4,7 @@ import axios from 'axios';
 import { useTheme } from '../hooks/useTheme';
 import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
-import SpaceSwitcher from '../components/SpaceSwitcher';
-import { useAuth } from '../context/AuthContext';
+import SpaceSwitcher, { SpaceNotifications } from '../components/SpaceSwitcher';
 import { API } from '../config';
 
 const DIFFICULTY_CLASS = { Easy: 'chip-easy', Medium: 'chip-medium', Hard: 'chip-hard' };
@@ -78,22 +77,14 @@ export default function Problems() {
     return () => clearInterval(interval);
   }, []);
 
-  const { logout } = useAuth();
-  const handleLogout = async () => {
-    await logout();
-    navigate('/', { replace: true });
-  };
-
   return (
     <div className="sb-shell">
       <header className="sb-topbar">
         <button type="button" className="brand" onClick={() => navigate('/')}><BrandMark /></button>
         <div className="sb-actions">
           <SpaceSwitcher activeTab="assignments" />
+          <SpaceNotifications />
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
-          <button type="button" className="btn btn-ghost" onClick={handleLogout}>
-            Log out
-          </button>
         </div>
       </header>
 
