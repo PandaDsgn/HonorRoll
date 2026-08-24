@@ -595,6 +595,81 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity:
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
 }
 
+.logout-confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(3px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+  animation: logout-fade-in 0.15s ease-out;
+}
+
+.logout-confirm-card {
+  width: min(340px, calc(100vw - 48px));
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  padding: 28px 24px 20px;
+  text-align: center;
+  animation: logout-pop-in 0.18s cubic-bezier(0.2, 0.9, 0.3, 1.2);
+}
+
+.logout-confirm-icon {
+  width: 48px;
+  height: 48px;
+  margin: 0 auto 14px;
+  border-radius: 50%;
+  background: var(--danger-dim);
+  color: var(--danger);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.logout-confirm-card h3 {
+  margin: 0 0 6px;
+  font-size: 18px;
+  color: var(--text-h);
+}
+
+.logout-confirm-card p {
+  margin: 0 0 20px;
+  font-size: 14px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+.logout-confirm-actions {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+}
+
+.logout-confirm-btn {
+  background: var(--danger);
+  color: #fff;
+  border-color: var(--danger);
+}
+
+.logout-confirm-btn:hover {
+  background: var(--danger);
+  filter: brightness(1.1);
+}
+
+@keyframes logout-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes logout-pop-in {
+  from { opacity: 0; transform: scale(0.94) translateY(6px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
 /* Every button in the top bar — any plain .btn action there (e.g.
    ExamAttempt's calculator toggle), the language/space nav tabs, and the
    32px icon buttons above — sits at the same height regardless of its own
@@ -960,6 +1035,33 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity:
 .landing-cta {
   padding: 13px 30px;
   font-size: 15px;
+}
+
+.landing-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 20px 24px 28px;
+}
+
+.landing-footer-link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.landing-footer-link:hover {
+  color: var(--accent);
+}
+
+.landing-footer-dot {
+  color: var(--text-dim);
+  font-size: 13px;
 }
 
 @media (max-width: 560px) {

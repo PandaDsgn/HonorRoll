@@ -4,7 +4,7 @@ export default function Terms() {
   return (
     <LegalShell>
       <h1>Terms of Service</h1>
-      <p className="legal-updated">Last updated: [date] — replace before publishing</p>
+      <p className="legal-updated">Last updated: 24th August, 2026</p>
 
       <p>
         These Terms of Service ("Terms") govern access to and use of HonorRoll (the "Service"), a

@@ -4,7 +4,7 @@ export default function Privacy() {
   return (
     <LegalShell>
       <h1>Privacy Policy</h1>
-      <p className="legal-updated">Last updated: 22nd August, 2026</p>
+      <p className="legal-updated">Last updated: 24th August, 2026</p>
 
       <p>
         This Privacy Policy describes what information HonorRoll collects through the Service, why,

@@ -51,6 +51,12 @@ export default function Home() {
           )}
         </div>
       </main>
+
+      <footer className="landing-footer">
+        <button type="button" className="landing-footer-link" onClick={() => navigate('/terms')}>Terms of Service</button>
+        <span className="landing-footer-dot" aria-hidden="true">·</span>
+        <button type="button" className="landing-footer-link" onClick={() => navigate('/privacy')}>Privacy Policy</button>
+      </footer>
     </div>
   );
 }

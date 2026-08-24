@@ -278,6 +278,11 @@ export default function BillingPanel() {
           })}
         </div>
       </div>
+
+      <p className="auth-sub" style={{ margin: '16px 4px 0', fontSize: 12.5 }}>
+        All payments are final and non-refundable. Cancelling a subscription stops future billing but does not
+        refund charges already made for the current period — your plan stays active until the period ends.
+      </p>
     </div>
   );
 }

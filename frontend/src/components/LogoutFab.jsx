@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 
@@ -18,15 +19,33 @@ function DoorExitIcon() {
 export default function LogoutFab() {
   const navigate = useNavigate();
   const { logout } = useAuth();
+  const [confirming, setConfirming] = useState(false);
 
   const handleLogout = async () => {
+    setConfirming(false);
     await logout();
     navigate('/', { replace: true });
   };
 
   return (
-    <button type="button" className="logout-fab" onClick={handleLogout} aria-label="Log out" title="Log out">
-      <DoorExitIcon />
-    </button>
+    <>
+      <button type="button" className="logout-fab" onClick={() => setConfirming(true)} aria-label="Log out" title="Log out">
+        <DoorExitIcon />
+      </button>
+
+      {confirming && (
+        <div className="logout-confirm-backdrop" onClick={() => setConfirming(false)}>
+          <div className="logout-confirm-card" onClick={(e) => e.stopPropagation()}>
+            <div className="logout-confirm-icon"><DoorExitIcon /></div>
+            <h3>Log out?</h3>
+            <p>You'll need to sign in again to get back to your workspace.</p>
+            <div className="logout-confirm-actions">
+              <button type="button" className="btn btn-ghost btn-sm" onClick={() => setConfirming(false)}>Cancel</button>
+              <button type="button" className="btn btn-sm logout-confirm-btn" onClick={handleLogout}>Log out</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
