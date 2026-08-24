@@ -4,8 +4,11 @@
 export default function BrandMark() {
   return (
     <>
-      <span className="brand-honor">Honor</span>
-      <span className="brand-roll">Roll</span>
+      <img src={`${import.meta.env.BASE_URL}favicon.png`} alt="" className="brand-logo" />
+      <span className="brand-text">
+        <span className="brand-honor">Honor</span>
+        <span className="brand-roll">Roll</span>
+      </span>
     </>
   );
 }
