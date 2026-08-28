@@ -18,7 +18,7 @@
 // already-registered middleware once it's ready. Nothing downstream ever
 // sees the swap; `SwappableStore` just delegates each call to whichever
 // backing store is current.
-const { rateLimit, MemoryStore } = require('express-rate-limit');
+const { rateLimit, MemoryStore, ipKeyGenerator } = require('express-rate-limit');
 
 class SwappableStore {
   constructor() {
@@ -68,6 +68,31 @@ const authLimiter = rateLimit({
   message: { error: 'Too many attempts — please wait 15 minutes and try again.' },
 });
 
+// The AI assistant costs real Groq tokens per message, unlike everything
+// else globalLimiter already covers — its own tighter, per-USER (not
+// per-IP) ceiling on top. Keyed by the authenticated user's own id since
+// this route always sits behind authenticateToken first — per-user is the
+// right unit for an LLM-cost budget (an office/campus NAT sharing one IP
+// shouldn't share one chat budget). 20 messages / 10 minutes is generous
+// for real back-and-forth use while bounding a runaway/scripted client.
+const assistantStore = new SwappableStore();
+const assistantLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  store: assistantStore,
+  // req.user.userId is always set in practice — this route sits behind
+  // authenticateToken, which already 401s before this middleware ever
+  // runs on an unauthenticated request. The req.ip fallback only exists
+  // so this never throws if that assumption is ever violated; routed
+  // through ipKeyGenerator (rather than the raw string) so it doesn't
+  // let a whole IPv6 /64 share one bucket, per express-rate-limit's own
+  // validation.
+  keyGenerator: (req) => (req.user?.userId ? String(req.user.userId) : ipKeyGenerator(req.ip)),
+  message: { error: 'You\'ve sent a lot of messages — please wait a bit before asking the assistant something else.' },
+});
+
 // Fire-and-forget — called once at boot (see index.js). Never blocks
 // server startup on Redis being reachable, and a failed/slow connection
 // just leaves both limiters on MemoryStore, same as no REDIS_URL at all.
@@ -78,7 +103,8 @@ async function connectRedisAndUpgradeStores() {
   const { RedisStore } = require('rate-limit-redis');
   globalStore.swapTo(new RedisStore({ prefix: 'rl:global:', sendCommand: (...args) => client.sendCommand(args) }));
   authStore.swapTo(new RedisStore({ prefix: 'rl:auth:', sendCommand: (...args) => client.sendCommand(args) }));
+  assistantStore.swapTo(new RedisStore({ prefix: 'rl:assistant:', sendCommand: (...args) => client.sendCommand(args) }));
   console.log('Rate limiting backed by Redis (shared across replicas).');
 }
 
-module.exports = { globalLimiter, authLimiter, connectRedisAndUpgradeStores };
+module.exports = { globalLimiter, authLimiter, assistantLimiter, connectRedisAndUpgradeStores };

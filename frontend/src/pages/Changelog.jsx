@@ -14,6 +14,7 @@ const ENTRIES = [
       'Anyone belonging to more than one institution can now cycle between each one\'s ID card, and can keep several photos on file to choose which one backs a particular card.',
       'Teachers can now start their own institution — for a private coaching center or similar — directly from their Profile page, without leaving the app.',
       'Fixed a bug where a downloaded ID card could come out with the profile photo or institution logo missing.',
+      'Added an in-app assistant — a collapsible chat widget available to every role that helps you find your way around HonorRoll and answers "how do I..." questions. It\'s a navigation helper only: it won\'t solve assignments, answer exam questions, or help with coursework, and it stays hidden while an exam is in progress.',
     ],
   },
   {

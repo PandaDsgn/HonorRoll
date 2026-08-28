@@ -30,6 +30,7 @@ import Privacy from './pages/Privacy';
 import About from './pages/About';
 import Contact from './pages/Contact';
 import Changelog from './pages/Changelog';
+import AssistantWidget from './components/AssistantWidget';
 
 function App() {
   return (
@@ -106,6 +107,7 @@ function App() {
           <Route path="/playground" element={<Navigate to="/ide" replace />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
+        <AssistantWidget />
       </HashRouter>
     </AuthProvider>
   );

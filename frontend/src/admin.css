@@ -110,7 +110,7 @@
   color: var(--danger);
   border: 1px solid rgba(255, 92, 92, 0.35);
 }
-.btn-danger:hover:not(:disabled) { background: var(--danger); color: #2a0a0a; }
+.btn-danger:hover:not(:disabled) { background: var(--danger-dim); filter: brightness(1.15); }
 
 /* ---------- assignment creation form ---------- */
 .assignment-form {

@@ -239,16 +239,16 @@
 
 .exam-calc-equals {
   width: 100%;
-  background: var(--accent);
-  border: none;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  color: #fff;
+  color: var(--accent);
   font-weight: 600;
   font-size: 15px;
   padding: 10px;
   cursor: pointer;
 }
-.exam-calc-equals:hover { background: var(--accent-strong); }
+.exam-calc-equals:hover { background: var(--surface-3); border-color: var(--accent); }
 
 .exam-calc-basegrid {
   display: grid;

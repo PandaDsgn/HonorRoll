@@ -224,20 +224,28 @@ button.brand:hover .brand-honor { color: var(--accent); }
   white-space: nowrap;
 }
 .btn:disabled { cursor: not-allowed; opacity: 0.6; transform: none; }
-/* Text is hardcoded light rather than themed — var(--accent) is now a deep
-   sapphire in BOTH themes (unlike the old light-mode navy / dark-mode
-   sky-blue split), so a dark button label would be nearly unreadable in
-   either theme. */
-.btn-primary { background: var(--accent); color: #f5f7fa; }
-.btn-primary:hover:not(:disabled) { background: var(--accent-strong); transform: translateY(-1px); }
+/* Every button in the app now shares one "outlined" language — surface-
+   tinted background, colored text/icon, a plain border — same look as
+   .logout-fab/.assistant-fab (no solid color fill at rest, and no solid
+   fill on hover either — hover only shifts up one surface level and
+   picks up the accent/danger border, matching how those two FABs
+   themselves react to hover). btn-primary vs btn-ghost still reads as a
+   hierarchy since primary's text is accent-colored while ghost's stays a
+   plain dim gray — the weight comes from color/border now, not fill. */
+.btn-primary { background: var(--surface-2); color: var(--accent); border-color: var(--border); }
+.btn-primary:hover:not(:disabled) { background: var(--surface-3); border-color: var(--accent); transform: translateY(-1px); }
 .btn-ghost { background: transparent; color: var(--text-dim); border-color: var(--border); }
 .btn-ghost:hover { color: var(--text); border-color: var(--border-strong); background: var(--surface-2); }
 
+/* Border/track colors are theme tokens rather than a hardcoded near-white
+   — this used to assume it always sat on a solid --accent-filled button,
+   which is no longer true now that no button has a solid fill; themed
+   tokens read correctly against any surface it's dropped onto. */
 .spinner {
   width: 14px;
   height: 14px;
-  border: 2px solid rgba(245, 247, 250, 0.3);
-  border-top-color: #f5f7fa;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent);
   border-radius: 50%;
   animation: spin 0.6s linear infinite;
 }
@@ -650,14 +658,14 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity:
 }
 
 .logout-confirm-btn {
-  background: var(--danger);
-  color: #fff;
+  background: var(--danger-dim);
+  color: var(--danger);
   border-color: var(--danger);
 }
 
 .logout-confirm-btn:hover {
-  background: var(--danger);
-  filter: brightness(1.1);
+  background: var(--danger-dim);
+  filter: brightness(1.15);
 }
 
 @keyframes logout-fade-in {
