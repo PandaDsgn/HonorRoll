@@ -1,0 +1,44 @@
+name: Deploy frontend
+
+# main only — this automates the exact same thing `npm run deploy`
+# (predeploy: build, deploy: gh-pages -d dist) already does by hand, just
+# on every push to main instead of whenever someone remembers to run it
+# locally. Pushes to the same `gh-pages` branch GitHub Pages is presumably
+# already configured to serve from (Settings -> Pages -> Source), so no
+# change needed there.
+on:
+  push:
+    branches: [main]
+
+# Backend deploy isn't handled here at all — Render's own git integration
+# (if configured, which the lack of any render.yaml/deploy-hook secret in
+# this repo suggests it is) continues to own that independently.
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+      # A failed build stops the job here — nothing broken ever reaches
+      # the deploy step below.
+      - run: npm run build
+
+      - name: Deploy to gh-pages branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: frontend/dist

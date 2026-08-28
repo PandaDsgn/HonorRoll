@@ -1,0 +1,85 @@
+name: CI
+
+# Every push (any branch) and every PR targeting main — this is the gate,
+# not the deploy. Backend deploys via Render's own git integration and
+# frontend deploys via deploy-frontend.yml (main only); this workflow's
+# only job is to fail loudly before either of those ever sees broken code.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend-test:
+    runs-on: ubuntu-latest
+
+    # A real, disposable Postgres — the backend test suite (backend/tests/)
+    # is a full integration suite against real SQL, not mocks, so it needs
+    # an actual database. Same postgres:15-alpine image docker-compose.yml
+    # already uses for local dev, kept version-matched on purpose.
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: honorroll_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - run: npm ci
+
+      # python3 is preinstalled on the ubuntu-latest runner image — the one
+      # language the test suite actually executes code in (see
+      # tests/playground.test.js). No other language toolchain is needed
+      # here since nothing else gets exercised by this suite.
+      - name: Run test suite
+        run: npm test
+        env:
+          TEST_DATABASE_URL: postgresql://test:test@localhost:5432/honorroll_test
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+      # Non-blocking on purpose: this repo already has ~44 pre-existing
+      # lint errors (some real — e.g. setState-in-effect, an impure
+      # Date.now() in a useState initializer — not just style). Failing CI
+      # on every push over pre-existing issues unrelated to that push would
+      # make the CI badge permanently red and worthless. Still runs and
+      # reports so new lint errors are visible in the log; flip this to a
+      # hard gate once the existing backlog is cleaned up.
+      - run: npm run lint
+        continue-on-error: true
+      - run: npm run build
