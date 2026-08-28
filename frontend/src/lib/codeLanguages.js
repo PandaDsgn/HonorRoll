@@ -14,17 +14,22 @@ import { ruby as rubyMode } from '@codemirror/legacy-modes/mode/ruby';
 // the list can't drift between them. `id` must match backend/index.js's
 // LANGUAGE_CONFIG keys exactly — that's what actually gets sent to
 // POST /api/playground/execute/:language and /api/problems/:id/submit.
+//
+// `traceSupported` mirrors backend/index.js's TRACE_CONFIG keys — only
+// languages with a tracer harness (see backend/tracers/) can back the IDE's
+// "Visualize" line-by-line panel. Flip it on here once a language gets one;
+// nothing else in IDE.jsx needs to change.
 export const CODE_LANGUAGES = [
-  { id: 'python', label: 'Python', dot: '#60a5fa' },
-  { id: 'c', label: 'C', dot: '#a78bfa' },
-  { id: 'cpp', label: 'C++', dot: '#f43f5e' },
-  { id: 'java', label: 'Java', dot: '#f472b6' },
-  { id: 'javascript', label: 'JavaScript', dot: '#f7df1e' },
-  { id: 'typescript', label: 'TypeScript', dot: '#3178c6' },
-  { id: 'go', label: 'Go', dot: '#00add8' },
-  { id: 'rust', label: 'Rust', dot: '#dea584' },
-  { id: 'ruby', label: 'Ruby', dot: '#cc342d' },
-  { id: 'php', label: 'PHP', dot: '#8892be' },
+  { id: 'python', label: 'Python', dot: '#60a5fa', traceSupported: true },
+  { id: 'c', label: 'C', dot: '#a78bfa', traceSupported: true },
+  { id: 'cpp', label: 'C++', dot: '#f43f5e', traceSupported: true },
+  { id: 'java', label: 'Java', dot: '#f472b6', traceSupported: true },
+  { id: 'javascript', label: 'JavaScript', dot: '#f7df1e', traceSupported: true },
+  { id: 'typescript', label: 'TypeScript', dot: '#3178c6', traceSupported: true },
+  { id: 'go', label: 'Go', dot: '#00add8', traceSupported: true },
+  { id: 'rust', label: 'Rust', dot: '#dea584', traceSupported: true },
+  { id: 'ruby', label: 'Ruby', dot: '#cc342d', traceSupported: true },
+  { id: 'php', label: 'PHP', dot: '#8892be', traceSupported: true },
 ];
 
 const LANG_EXT = {

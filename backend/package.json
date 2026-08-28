@@ -29,6 +29,7 @@
     "pg": "^8.22.0",
     "rate-limit-redis": "^6.0.1",
     "razorpay": "^2.9.8",
-    "redis": "^6.2.1"
+    "redis": "^6.2.1",
+    "source-map-js": "^1.2.1"
   }
 }

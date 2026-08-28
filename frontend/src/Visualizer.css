@@ -1,0 +1,622 @@
+/* ---------- IDE "Visualize" panel ---------- */
+/* Shares layout rhythm with .console/.sandbox-right in index.css (same
+   flex:1/min-height so swapping panels doesn't reflow the page) but isn't
+   defined there since it's currently only used by IDE.jsx. */
+
+/* Object-type palette for the reference diagram — the one deliberate spot
+   in this app that departs from the "monochrome + one accent" rule the
+   rest of the UI follows (see index.css's .segmented comment). A memory
+   diagram for a younger audience benefits from color doing real work
+   (telling a list box apart from a dict box at a glance, an arrow visibly
+   matching the box it leads to), so each container type gets its own hue.
+   Values reuse colors ALREADY present elsewhere in this app (the language
+   picker's per-language dots in codeLanguages.js) rather than inventing a
+   new palette from scratch, and — like those dots — stay flat across
+   themes rather than swapping per light/dark, matching that existing
+   precedent. Kept as fixed hex (not swapped per theme) deliberately. */
+:root {
+  --viz-color-list: #60a5fa;  /* same blue as the Python language dot */
+  --viz-color-list-dim: rgba(96, 165, 250, 0.16);
+  --viz-color-dict: #a78bfa;  /* same violet as the C language dot */
+  --viz-color-dict-dim: rgba(167, 139, 250, 0.16);
+  --viz-color-tuple: #f472b6; /* same pink as the Java language dot */
+  --viz-color-tuple-dim: rgba(244, 114, 182, 0.16);
+  --viz-color-set: #00add8;   /* same cyan as the Go language dot */
+  --viz-color-set-dim: rgba(0, 173, 216, 0.16);
+}
+
+/* Drag handle directly BELOW the code editor (between .editor-panel and
+   .console) — lets a student grow the coding area specifically, not the
+   whole panel. Same visual language as .sandbox-divider in index.css (a
+   thin line inside a wider hit-area, accent on hover/drag) rotated to a
+   horizontal bar. Matters most right when Visualize is turned on, since
+   the diagram's own min-height (see .visualizer further down) then
+   squeezes the editor — this is the direct way to reclaim that room for
+   the code itself — but it works with Visualize off too. Sits inside
+   .sandbox-right, which already has its own row gap (see index.css), so
+   unlike the old page-bottom version this doesn't need negative margins
+   to make room for itself. Scoped to this page only (Visualizer.css is
+   IDE.jsx-only). */
+.editor-height-divider {
+  flex-shrink: 0;
+  height: 13px;
+  cursor: row-resize;
+  position: relative;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.editor-height-divider::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 6px;
+  height: 1px;
+  background: var(--border);
+  transition: background 0.15s ease;
+}
+.editor-height-divider:hover::before, .editor-height-divider.dragging::before {
+  background: var(--accent);
+  height: 2px;
+  top: 5.5px;
+}
+/* Small pill in the middle of the bar so the handle reads as grabbable at
+   a glance, not just as a stray divider line — the horizontal-resize
+   equivalent of the vertical divider having a visible width to begin with. */
+.editor-height-grip {
+  position: relative;
+  width: 36px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border-strong);
+  transition: background 0.15s ease;
+}
+.editor-height-divider:hover .editor-height-grip, .editor-height-divider.dragging .editor-height-grip {
+  background: var(--accent);
+}
+
+.sb-toolbar-buttons { display: flex; align-items: center; gap: 8px; }
+
+/* Persistent on/off setting (not a momentary action) — reuses the same
+   "accent border + tinted background" active-state language as .tc-tab.active
+   and .segmented button.active elsewhere in the app, so it reads as a toggle
+   rather than a button that just got clicked. */
+.viz-toggle.viz-toggle-on { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+
+/* Active-execution-line highlight inside CodeMirror (see lib/execLineHighlight.js).
+   Translucent so the underlying syntax highlighting stays fully readable. */
+.cm-exec-line { background: var(--accent-dim) !important; }
+/* Marks the executing line's number in the existing gutter — gutterLineClass
+   tags that one gutter cell, this just makes it read as a pointer. Kept to
+   color+weight (no overlaid glyph) since the gutter's own width isn't
+   reserved for one and an absolutely-positioned icon risks colliding with
+   the digits themselves at small font sizes. */
+.cm-gutterElement.cm-exec-line-gutter {
+  color: var(--accent) !important;
+  font-weight: 700;
+}
+
+/* flex:2 (not 1, unlike .console) and a taller min-height — this panel packs
+   in a header, two control rows, the reference diagram, AND an output
+   strip, so it needs real room. Below every child gets a fixed/natural
+   height instead of flex-growing to fill whatever's left (the old
+   approach) — with this many stacked sections, that fight for leftover
+   space was exactly what made things feel cramped and, worse, made
+   overflow:hidden here CLIP content with no way to reach it. overflow-y:
+   auto is the actual fix: if everything's natural height adds up to more
+   than this panel got allocated, the panel itself scrolls as one unit —
+   nothing is ever unreachable, it just may take a scroll to see. */
+.visualizer {
+  flex: 2;
+  min-height: 520px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Pinned while the rest of the panel scrolls underneath it — the step
+   counter/status LED stay visible no matter how far down you've scrolled. */
+.visualizer-header {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  flex-shrink: 0;
+}
+.viz-step-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.viz-event-badge {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  color: var(--text-dim);
+}
+.viz-event-call { color: var(--accent); }
+.viz-event-return { color: var(--teal); }
+.viz-event-exception { color: var(--danger); }
+
+.viz-empty {
+  padding: 16px 14px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-dim);
+  font-style: italic;
+}
+.viz-empty.viz-error { color: var(--danger); font-style: normal; }
+
+.viz-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+.viz-step-btn { padding: 6px 10px; }
+.viz-play-btn { min-width: 84px; }
+input[type='range'].viz-scrubber {
+  flex: 1;
+  min-width: 100px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* One combined second row — the call stack breadcrumb AND the
+   display-format controls used to be two separately bordered/padded
+   strips; merged into one flex-wrap row so they cost one row of chrome
+   between them instead of two whenever both fit, and still wrap onto
+   their own lines gracefully on a narrow panel rather than clipping. */
+.viz-secondary-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  flex-shrink: 0;
+}
+.viz-callstack-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.viz-secondary-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+/* Compact variant of the shared .segmented control (index.css) — small
+   multi-way toggles like dec/bin/oct/hex don't need full-size buttons. */
+.viz-mini-segmented button { padding: 4px 9px; font-size: 11.5px; }
+.viz-index-toggle, .viz-share-btn { padding: 5px 10px; font-size: 12px; }
+.viz-index-toggle.viz-toggle-on { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+.viz-speed-select {
+  appearance: none;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: 12px;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+
+/* ---------- formal view: literal text instead of the diagram ---------- */
+.viz-formal {
+  flex-shrink: 0;
+  min-height: 220px;
+  max-height: 420px;
+  overflow: auto;
+  padding: 14px;
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.9;
+}
+.viz-formal-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.viz-formal-name { color: var(--text-h); font-weight: 700; }
+.viz-formal-eq { color: var(--text-dim); }
+.viz-formal-value { color: var(--text); word-break: break-word; }
+
+.viz-panel-title {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.viz-empty-row { color: var(--text-dim); font-style: italic; text-align: center; padding: 14px 10px; }
+
+/* Call path ("<module> › add") — now the leading element inside
+   .viz-secondary-row rather than its own bordered strip (see above). */
+.viz-callstack-label {
+  font-family: var(--font-sans);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+.viz-callstack-item { display: inline-flex; align-items: center; gap: 6px; }
+.viz-callstack-chip {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+}
+.viz-callstack-chip-active { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); font-weight: 700; }
+.viz-callstack-arrow { color: var(--text-dim); font-size: 13px; }
+
+/* ---------- reference diagram: floating boxes + arrows ---------- */
+/* Wrap holds the small topbar (object count + PNG export) above the
+   scrolling canvas. flex-shrink:0 with its own min/max height (not
+   flex:1) — .visualizer scrolls as a whole now (see above), so this
+   doesn't need to fight editor/console/etc. for "remaining" space; it
+   just takes a sensible, capped amount and lets the outer panel scroll
+   past it if the rest of the content needs more room than fits at once. */
+.viz-diagram-wrap {
+  flex-shrink: 0;
+  min-height: 300px;
+  max-height: 460px;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.viz-diagram-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  flex-shrink: 0;
+}
+.viz-diagram-count {
+  font-family: var(--font-sans);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.viz-png-btn { padding: 4px 10px; font-size: 12px; }
+
+/* Outer scroller — the canvas inside can be wider/taller than the panel
+   once a program builds up several lists/dicts, so this is where the
+   overflow actually happens, not on the canvas itself (see the canvas
+   comment below for why that split matters for the SVG overlay). The
+   dotted-star background reuses the same pattern as the page body (see
+   index.css's --grid-dot) at a tighter scale, so the objects genuinely
+   read as floating in space rather than sitting on a plain card. */
+.viz-diagram {
+  flex: 1;
+  min-height: 220px;
+  overflow: auto;
+  background:
+    radial-gradient(circle at 1px 1px, var(--grid-dot) 1px, transparent 0) 0 0 / 22px 22px,
+    var(--surface);
+}
+/* A plain (non-scrolling) block that sizes itself to fit its content and
+   scrolls AS PART OF .viz-diagram's content — the arrow <svg> is absolutely
+   positioned against THIS element, not the scroller, so the overlay scrolls
+   together with the boxes instead of staying pinned to the viewport. */
+.viz-diagram-canvas {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 64px;
+  padding: 22px;
+  width: fit-content;
+  min-width: 100%;
+}
+.viz-diagram-vars {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 1;
+}
+
+/* Both box types float: real elevation (soft shadow, not just a border),
+   generous rounding, and a spring-y pop-in the moment they're first
+   mounted — because React reuses the same DOM node across steps for an
+   object/variable that already existed, this animation only plays once,
+   when something genuinely NEW appears in memory, not on every step. */
+@keyframes viz-float-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.92); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes viz-glow-pulse {
+  0% { box-shadow: var(--viz-box-shadow), 0 0 0 0 var(--teal-dim); }
+  45% { box-shadow: var(--viz-box-shadow), 0 0 0 7px var(--teal-dim); }
+  100% { box-shadow: var(--viz-box-shadow), 0 0 0 0 rgba(0, 0, 0, 0); }
+}
+
+.viz-var-box {
+  --viz-box-shadow: 0 8px 20px -8px rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.18);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  min-width: 118px;
+  box-shadow: var(--viz-box-shadow);
+  animation: viz-float-in 280ms cubic-bezier(0.2, 0.9, 0.3, 1.3) both;
+}
+.viz-var-box-changed { border-color: var(--teal); animation: viz-glow-pulse 1000ms ease-out; }
+.viz-var-name { font-family: var(--font-mono); font-size: 12.5px; font-weight: 700; color: var(--text-h); }
+.viz-var-value {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text);
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+}
+
+/* Objects flow left-to-right instead of stacking downward — as a program
+   creates more lists/dicts, the diagram grows WIDER (the panel scrolls
+   sideways, see .viz-diagram's overflow:auto) rather than pushing the
+   panel's already-tight height even further. nowrap is deliberate: wrapping
+   back onto a second row would just reintroduce vertical growth through
+   the back door. */
+.viz-diagram-heap {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: flex-start;
+  gap: 20px;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 1;
+}
+.viz-heap-box {
+  --viz-box-shadow: 0 10px 26px -10px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.18);
+  position: relative;
+  flex-shrink: 0;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  overflow: hidden;
+  min-width: 130px;
+  box-shadow: var(--viz-box-shadow);
+  animation: viz-float-in 280ms cubic-bezier(0.2, 0.9, 0.3, 1.3) both;
+}
+/* Small stable "#N" tag identifying this exact object — assigned once for
+   the whole trace (see CodeVisualizer's buildHeapIdLabels), so the same
+   list keeps the same tag on every step it appears in. Rendered inline as
+   the title bar's leading element (NOT absolutely positioned straddling
+   the box's edge) — .viz-heap-box has overflow:hidden so its own rounded
+   corners clip the title bar's flat background correctly, which would
+   also clip anything positioned to overlap that edge; staying in normal
+   flow inside the already-visible title bar sidesteps that entirely. */
+.viz-heap-badge {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid currentColor;
+  color: inherit;
+  flex-shrink: 0;
+}
+/* The glow ring layers on top regardless of type color below, so "this
+   just changed" stays legible without overriding "this is a list" — the
+   border briefly can't do both, so the ring alone carries that signal. */
+.viz-heap-box-changed { animation: viz-glow-pulse 1000ms ease-out; }
+.viz-heap-box-title {
+  font-family: var(--font-sans);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-3);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.viz-heap-box-brackets { color: currentColor; text-transform: none; letter-spacing: 0; opacity: 0.55; }
+
+/* Each container type gets its own frame color + tinted title bar — the
+   icon and "list"/"dict"/... label both inherit it via currentColor. */
+.viz-type-list { border-color: var(--viz-color-list); }
+.viz-type-list .viz-heap-box-title { background: var(--viz-color-list-dim); color: var(--viz-color-list); }
+.viz-type-dict { border-color: var(--viz-color-dict); }
+.viz-type-dict .viz-heap-box-title { background: var(--viz-color-dict-dim); color: var(--viz-color-dict); }
+.viz-type-tuple { border-color: var(--viz-color-tuple); }
+.viz-type-tuple .viz-heap-box-title { background: var(--viz-color-tuple-dim); color: var(--viz-color-tuple); }
+.viz-type-set { border-color: var(--viz-color-set); }
+.viz-type-set .viz-heap-box-title { background: var(--viz-color-set-dim); color: var(--viz-color-set); }
+
+.viz-heap-cells { display: flex; flex-wrap: wrap; }
+.viz-heap-cellwrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  border-right: 1px solid var(--border);
+}
+.viz-heap-cellwrap:last-child { border-right: none; }
+.viz-heap-idx { font-family: var(--font-sans); font-size: 8.5px; color: var(--text-dim); padding: 2px 0; }
+.viz-heap-cell {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text-h);
+  padding: 6px 11px;
+  min-width: 24px;
+  text-align: center;
+}
+
+.viz-heap-rows { display: flex; flex-direction: column; }
+.viz-heap-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px;
+  border-top: 1px solid var(--border);
+}
+.viz-heap-row:first-child { border-top: none; }
+.viz-heap-key { font-family: var(--font-mono); font-size: 12px; color: var(--text-dim); }
+.viz-heap-row .viz-heap-cell { padding: 0; text-align: right; }
+
+.viz-heap-more { padding: 6px 10px; font-family: var(--font-sans); font-size: 10.5px; color: var(--text-dim); font-style: italic; }
+
+/* The small solid dot a reference-holding slot shows instead of a value —
+   the arrow drawn from it IS the value, so there's nothing to print here.
+   Colored to match the object it points at (same palette as the box
+   itself), with the same "dot with a halo" treatment as the console's
+   status LEDs (see .led in index.css), plus a slow idle pulse so a
+   floating pointer still reads as "live" even sitting still between steps. */
+.viz-ref-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  animation: pulse 2.2s ease-in-out infinite;
+}
+.viz-ref-dot-list { background: var(--viz-color-list); box-shadow: 0 0 0 3px var(--viz-color-list-dim); }
+.viz-ref-dot-dict { background: var(--viz-color-dict); box-shadow: 0 0 0 3px var(--viz-color-dict-dim); }
+.viz-ref-dot-tuple { background: var(--viz-color-tuple); box-shadow: 0 0 0 3px var(--viz-color-tuple-dim); }
+.viz-ref-dot-set { background: var(--viz-color-set); box-shadow: 0 0 0 3px var(--viz-color-set-dim); }
+
+.viz-diagram-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+/* Dashed + animated so the connection itself has motion — a pointer reads
+   as something actively "flowing" from variable to object rather than a
+   static line, which is the whole point of drawing it at all for a
+   younger audience. Colored per-arrow to match its target box, so
+   following "which arrow leads where" doesn't require tracing the curve
+   with your eyes — the color already tells you. */
+.viz-diagram-arrow {
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-dasharray: 5 4;
+  opacity: 0.9;
+  animation: viz-arrow-flow 900ms linear infinite;
+}
+.viz-arrow-list { stroke: var(--viz-color-list); }
+.viz-arrow-dict { stroke: var(--viz-color-dict); }
+.viz-arrow-tuple { stroke: var(--viz-color-tuple); }
+.viz-arrow-set { stroke: var(--viz-color-set); }
+@keyframes viz-arrow-flow {
+  to { stroke-dashoffset: -18; }
+}
+.viz-arrowhead-fill-list { fill: var(--viz-color-list); }
+.viz-arrowhead-fill-dict { fill: var(--viz-color-dict); }
+.viz-arrowhead-fill-tuple { fill: var(--viz-color-tuple); }
+.viz-arrowhead-fill-set { fill: var(--viz-color-set); }
+
+/* Primitive values read like a syntax highlighter — numbers, strings, and
+   True/False each get their own color instead of one flat text color, so
+   the diagram gives the same "type at a glance" signal for plain values
+   that the container boxes give for lists/dicts. Reuses existing themed
+   tokens (already contrast-tuned for light/dark) rather than new hex. */
+.viz-val-number { color: var(--accent); font-weight: 600; }
+.viz-val-string { color: var(--warn); }
+.viz-val-true { color: var(--teal); font-weight: 600; }
+.viz-val-false { color: var(--danger); font-weight: 600; }
+.viz-val-none { color: var(--text-dim); font-style: italic; }
+.viz-val-placeholder { color: var(--text-dim); font-style: italic; }
+
+.viz-output {
+  border-top: 1px solid var(--border);
+  background: var(--console-bg);
+  flex-shrink: 0;
+  max-height: 160px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.viz-output .viz-panel-title { border-bottom: 1px solid var(--border); }
+.viz-output-body {
+  margin: 0;
+  padding: 10px 14px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--console-out);
+  white-space: pre-wrap;
+  overflow-y: auto;
+}
+
+.viz-exception {
+  padding: 10px 14px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--danger);
+  background: var(--danger-dim);
+  border-top: 1px solid rgba(255, 92, 92, 0.2);
+  white-space: pre-wrap;
+  flex-shrink: 0;
+}
+
+.viz-truncated-note {
+  padding: 8px 14px;
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  color: var(--warn);
+  background: var(--warn-dim);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+@media (max-width: 720px) {
+  .viz-diagram-canvas { flex-direction: column; gap: 28px; }
+}

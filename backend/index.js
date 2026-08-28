@@ -16,7 +16,7 @@ const { exec } = require('child_process');
 const path = require('path');
 const multer = require('multer');
 const archiver = require('archiver');
-const { isB2Configured, scanObjectKey, examScanObjectKey, notesObjectKey, noticesObjectKey, uploadScanPdf, deleteScanPdf, getScanPdfUrl, downloadScanPdf } = require('./storage');
+const { isB2Configured, scanObjectKey, examScanObjectKey, notesObjectKey, noticesObjectKey, avatarObjectKey, orgLogoObjectKey, uploadScanPdf, deleteScanPdf, getScanPdfUrl, downloadScanPdf } = require('./storage');
 const { isOcrConfigured, runOcr } = require('./ocrClient');
 const { isGroqConfigured, assessAnswers } = require('./aiGrading');
 const { parse: parseCsv } = require('csv-parse/sync');
@@ -49,6 +49,18 @@ const scanUpload = multer({
 const notesUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 200 * 1024 * 1024 },
+});
+
+// Backs both profile-photo and org-logo uploads (see POST /api/me/photos
+// and POST /api/admin/organization/logo) — same 5MB-ish sizing logic as
+// the others: generous for a headshot or a letterhead logo, nowhere near
+// notesUpload's 200MB video ceiling. Gated at the multer level (not
+// deferred to the route like notesUpload) since every caller of this
+// instance is always an image, unlike notesUpload's multi-type field.
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => cb(null, file.mimetype.startsWith('image/')),
 });
 
 const app = express();
@@ -1150,6 +1162,67 @@ async function ensureMembershipRollNumberColumn() {
   }
 }
 bootSchemaStep(ensureMembershipRollNumberColumn);
+
+// ---------------------------------------------------------------------------
+// ID CARDS — profile photos, org logos, per-membership photo choice.
+// ---------------------------------------------------------------------------
+
+// Photos belong to the global user identity (users), not any one
+// organization — same reasoning as "users is pure identity" in
+// ensureMembershipsSchema's own comment below: a photo uploaded once is
+// reusable as the picture on every institution's ID card the person holds,
+// not re-uploaded per org. ON DELETE CASCADE on user_id (a deleted account
+// takes its own photos with it); nothing else references this table by FK
+// except memberships.active_photo_id, added separately below once this
+// table exists to point at.
+async function ensureUserPhotosSchema() {
+  await ensureUsersSchema();
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS user_photos (
+        id SERIAL PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        storage_key TEXT NOT NULL,
+        original_filename TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    await pool.query('CREATE INDEX IF NOT EXISTS user_photos_user_idx ON user_photos(user_id)');
+  } catch (err) {
+    console.error('Failed to ensure user_photos schema:', err);
+  }
+}
+bootSchemaStep(ensureUserPhotosSchema);
+
+// One logo per organization, admin-uploaded — shown on every ID card
+// issued under that org. Nullable: an org with no logo yet just renders
+// its card without one, same "optional until set" posture as
+// organizations.default_org_unit_id above.
+async function ensureOrganizationLogoSchema() {
+  await ensureOrganizationsSchema();
+  try {
+    await pool.query('ALTER TABLE organizations ADD COLUMN IF NOT EXISTS logo_object_key TEXT');
+  } catch (err) {
+    console.error('Failed to ensure organizations.logo_object_key:', err);
+  }
+}
+bootSchemaStep(ensureOrganizationLogoSchema);
+
+// Which of the user's uploaded photos backs THIS SPECIFIC institution's ID
+// card — a per-enrollment choice (like org_unit_id/roll_number above), not
+// a global one, since someone might want a formal photo for one institution
+// and a casual one for another. ON DELETE SET NULL: deleting a photo should
+// never take out the membership row it happened to be attached to — the
+// card just falls back to "no photo" until a new one's picked.
+async function ensureMembershipActivePhotoColumn() {
+  await Promise.all([ensureMembershipsSchema(), ensureUserPhotosSchema()]);
+  try {
+    await pool.query('ALTER TABLE memberships ADD COLUMN IF NOT EXISTS active_photo_id INTEGER REFERENCES user_photos(id) ON DELETE SET NULL');
+  } catch (err) {
+    console.error('Failed to ensure memberships.active_photo_id:', err);
+  }
+}
+bootSchemaStep(ensureMembershipActivePhotoColumn);
 
 // A subject is attached at whatever tier an admin picks — one on
 // "Computer Science" (a Department-tier unit) is visible to every "Year"
@@ -2499,6 +2572,266 @@ function executeInSandbox(language, code, stdin = '') {
   return sandboxLimit(() => executeInSandboxRaw(language, code, stdin));
 }
 
+// ============================================================================
+// Execution Tracer â€” line-by-line trace for the IDE's "Visualize" panel
+// ============================================================================
+
+// Per-language config for the trace feature, deliberately separate from
+// LANGUAGE_CONFIG above: tracing needs a language-specific harness script
+// (see backend/tracers/), not just a run command, and only a subset of
+// languages have one yet. A language missing here just gets a "not
+// available yet" response from the route below — everything else about it
+// (editing, running via LANGUAGE_CONFIG) keeps working as normal.
+const TRACE_CONFIG = {
+  python: {
+    filename: 'main.py',
+    tracerSource: path.join(__dirname, 'tracers', 'python_tracer.py'),
+    tracerFilename: 'tracer.py',
+    interpreter: 'python3',
+    memKb: 98304,
+    cpuSec: 8, // tracing overhead is real â€” give it more headroom than a plain run
+  },
+  javascript: {
+    filename: 'main.js',
+    tracerSource: path.join(__dirname, 'tracers', 'js_tracer.js'),
+    tracerFilename: 'tracer.js',
+    interpreter: 'node',
+    memKb: 131072,
+    cpuSec: 10,
+    // V8 reserves a large virtual address range on startup regardless of
+    // actual usage — same reasoning as LANGUAGE_CONFIG.javascript's own
+    // noVirtualMemLimit, and just as necessary here: without it, node
+    // itself fails to start under a tight ulimit -v before ever reaching
+    // the student's code.
+    noVirtualMemLimit: true,
+  },
+  typescript: {
+    filename: 'main.ts',
+    tracerSource: path.join(__dirname, 'tracers', 'ts_tracer.js'),
+    tracerFilename: 'tracer.js',
+    // ts_tracer.js shells out to js_tracer.js by relative path — has to be
+    // copied alongside it in the same executionDir (see extraFiles handling
+    // above) since __dirname inside a copied file resolves to wherever it
+    // was copied TO, not tracers/ where it actually lives on disk.
+    extraFiles: [path.join(__dirname, 'tracers', 'js_tracer.js')],
+    interpreter: 'node',
+    memKb: 131072,
+    cpuSec: 15, // tsc's own compile step first, then a full JS trace on top
+    noVirtualMemLimit: true,
+    needsHome: true, // tsc needs a writable $HOME, same as plain execution's own LANGUAGE_CONFIG.typescript
+    needsNodeModules: true, // ts_tracer.js requires source-map-js
+  },
+  ruby: {
+    filename: 'main.rb',
+    tracerSource: path.join(__dirname, 'tracers', 'ruby_tracer.rb'),
+    tracerFilename: 'tracer.rb',
+    interpreter: 'ruby',
+    memKb: 98304,
+    cpuSec: 8,
+  },
+  php: {
+    filename: 'main.php',
+    tracerSource: path.join(__dirname, 'tracers', 'php_tracer.php'),
+    tracerFilename: 'tracer.php',
+    interpreter: 'php',
+    memKb: 98304,
+    cpuSec: 8,
+  },
+  // c_tracer.py itself compiles the student's source (with lldb, not gcc's
+  // own -o step here — it needs the exact same compiler either way) and
+  // drives lldb as a batch script; it tells C and C++ apart purely from
+  // the student filename's own extension (see its main()), so one script
+  // backs both entries here.
+  c: {
+    filename: 'main.c',
+    tracerSource: path.join(__dirname, 'tracers', 'c_tracer.py'),
+    tracerFilename: 'tracer.py',
+    interpreter: 'python3',
+    memKb: 131072,
+    cpuSec: 25, // compile + a batch of up to ~1200 lldb commands is slower than plain interpretation
+  },
+  cpp: {
+    filename: 'main.cpp',
+    tracerSource: path.join(__dirname, 'tracers', 'c_tracer.py'),
+    tracerFilename: 'tracer.py',
+    interpreter: 'python3',
+    memKb: 131072,
+    cpuSec: 25,
+  },
+  rust: {
+    filename: 'main.rs',
+    tracerSource: path.join(__dirname, 'tracers', 'rust_tracer.py'),
+    tracerFilename: 'tracer.py',
+    interpreter: 'python3',
+    memKb: 131072,
+    // rustc + rust-lldb driving a 3x-oversized batch (extra headroom to
+    // absorb unrecorded steps spent bouncing through std library
+    // internals — see rust_tracer.py's own comment) measured ~25s wall
+    // clock for a truncated (MAX_STEPS-hitting) trace, at only ~28% CPU
+    // utilization — mostly waiting on subprocess I/O, not burning CPU.
+    // That matters here specifically: runLimited's own child_process
+    // `timeout` option (see below) is wall-clock (cpuSec + 3 seconds),
+    // not CPU-time — a low-CPU-utilization process like this one would
+    // hit THAT wall before ulimit -t's actual CPU-time limit ever does,
+    // so cpuSec needs real margin above the observed wall-clock time, not
+    // just above true CPU seconds consumed.
+    cpuSec: 60,
+  },
+  // JdiTracer.java is precompiled (not run as source through an
+  // interpreter) — it IS the debugger client, using com.sun.jdi (the Java
+  // Debug Interface) directly rather than driving an external tool the
+  // way c_tracer.py/rust_tracer.py drive lldb. It compiles the student's
+  // own Main.java itself, then launches a SEPARATE JVM under debug
+  // control to trace — two live JVMs at once (this tracer's own, plus the
+  // one it launches), hence the generous memKb.
+  java: {
+    filename: 'Main.java',
+    tracerSource: path.join(__dirname, 'tracers', 'JdiTracer.class'),
+    tracerFilename: 'JdiTracer.class',
+    tracerIsClassName: true,
+    interpreter: 'java',
+    memKb: 393216,
+    cpuSec: 20,
+    noVirtualMemLimit: true, // same reasoning as LANGUAGE_CONFIG.java's own plain-execution entry — a JVM reserves large virtual address space up front regardless of actual usage
+  },
+  // go_tracer.py compiles the student's source with `go build` (same
+  // -gcflags=all=-N -l delve itself always applies, done explicitly here
+  // so a real compile error surfaces as this tracer's own clean message)
+  // then drives delve's ("dlv") real JSON-RPC-over-TCP debugger API —
+  // structurally closer to JdiTracer.java than to the lldb-based C/Rust
+  // tracers' text scraping. Requires `dlv` on PATH (same as `go` already
+  // is for LANGUAGE_CONFIG.go's plain-execution entry).
+  go: {
+    filename: 'main.go',
+    tracerSource: path.join(__dirname, 'tracers', 'go_tracer.py'),
+    tracerFilename: 'tracer.py',
+    interpreter: 'python3',
+    memKb: 131072,
+    needsHome: true, // `go build` needs a writable $HOME for its build cache (GOCACHE) — same reasoning as TRACE_CONFIG.typescript's own tsc requirement
+    // Same fix as LANGUAGE_CONFIG.go's own usesGoBuildCache — without a
+    // persistent GOCACHE, every trace request recompiles the entire
+    // standard library from a cold cache, which is both slow enough to
+    // risk cpuSec and produces a large intermediate archive that can blow
+    // past the default ulimit -f.
+    usesGoBuildCache: true,
+    fileBlocks: 65536,
+
+    // Measured worst case (a MAX_STEPS-truncating trace): ~12.6s wall /
+    // ~13.7s combined CPU (compiler + dlv + the traced binary all running
+    // at once — unlike Rust's I/O-bound lldb driving, this is genuinely
+    // CPU-heavy across multiple processes). cpuSec needs margin above
+    // BOTH numbers, since runLimited's own child_process `timeout` is
+    // wall-clock (cpuSec + 3s), not CPU-time.
+    cpuSec: 30,
+  },
+};
+
+/**
+ * Runs `code` once under its language's tracer harness and returns the
+ * parsed { steps, finalOutput, truncated, error } trace. Same sandboxed,
+ * unprivileged-user, run-once model as executeInSandboxRaw above â€” the
+ * harness itself (not this function) is responsible for capping trace size
+ * and running the student program to completion even past that cap.
+ */
+async function executeTraceRaw(language, code, stdin = '') {
+  const config = TRACE_CONFIG[language];
+  if (!config) {
+    return { success: false, error: `Line-by-line tracing isn't available for ${language} yet.` };
+  }
+
+  const executionDir = path.join(tempDir, crypto.randomUUID());
+  fs.mkdirSync(executionDir, { recursive: true, mode: 0o770 });
+
+  const cleanup = () => {
+    if (fs.existsSync(executionDir)) fs.rmSync(executionDir, { recursive: true, force: true });
+  };
+
+  const studentPath = path.join(executionDir, config.filename);
+  const tracerPath = path.join(executionDir, config.tracerFilename);
+
+  try {
+    fs.writeFileSync(studentPath, code);
+    fs.copyFileSync(config.tracerSource, tracerPath);
+    // TypeScript's tracer is a thin wrapper that shells out to js_tracer.js
+    // by relative path (__dirname/js_tracer.js) — __dirname resolves to
+    // THIS execution dir once copied here, not the real backend/tracers/
+    // source dir, so js_tracer.js has to be copied alongside it for that
+    // relative require/exec to find it. Every other TRACE_CONFIG entry
+    // needs nothing extra here, so extraFiles is empty/undefined for them.
+    for (const extra of config.extraFiles || []) {
+      fs.copyFileSync(extra, path.join(executionDir, path.basename(extra)));
+    }
+    if (canDropPrivileges) {
+      fs.chownSync(executionDir, SANDBOX_UID, SANDBOX_GID);
+      fs.chownSync(studentPath, SANDBOX_UID, SANDBOX_GID);
+      fs.chownSync(tracerPath, SANDBOX_UID, SANDBOX_GID);
+      for (const extra of config.extraFiles || []) {
+        fs.chownSync(path.join(executionDir, path.basename(extra)), SANDBOX_UID, SANDBOX_GID);
+      }
+    }
+  } catch (err) {
+    cleanup();
+    return { success: false, error: 'Failed to prepare trace files' };
+  }
+
+  // NODE_PATH lets a tracer running from the sandboxed executionDir (well
+  // outside backend/) still `require()` this project's own node_modules —
+  // ts_tracer.js needs source-map-js, which Node's normal upward node_modules
+  // walk would never reach from a temp dir. Nothing else needs this, so
+  // config.needsNodeModules is unset (falsy) for every other language.
+  const extraEnv = {
+    ...(config.needsHome ? { HOME: executionDir } : {}),
+    ...(config.needsNodeModules ? { NODE_PATH: path.join(__dirname, 'node_modules') } : {}),
+  };
+  // Same persistent-cache fix as executeInSandboxRaw's own usesGoBuildCache
+  // handling — go_tracer.py's `go build` step would otherwise recompile
+  // the entire standard library from scratch on every single trace request.
+  if (config.usesGoBuildCache) {
+    fs.mkdirSync(GO_BUILD_CACHE_DIR, { recursive: true, mode: 0o770 });
+    if (canDropPrivileges) fs.chownSync(GO_BUILD_CACHE_DIR, SANDBOX_UID, SANDBOX_GID);
+    extraEnv.GOCACHE = GO_BUILD_CACHE_DIR;
+  }
+  // JdiTracer.java runs as `java JdiTracer <studentPath>` — a compiled
+  // class invoked BY NAME, not `java <path-to-.class-file> <arg>` the way
+  // every interpreted-language tracer above passes its own tracerPath —
+  // config.tracerIsClassName carries that: the .class runs from
+  // executionDir (already this command's cwd, Java's own default
+  // classpath) via its bare class name (tracerFilename minus ".class")
+  // instead of the usual full tracerPath.
+  const tracerArgs = config.tracerIsClassName
+    ? [config.tracerFilename.replace(/\.class$/, ''), studentPath]
+    : [tracerPath, studentPath];
+  const run = await runLimited(executionDir, config.memKb, config.cpuSec, [config.interpreter, tracerArgs], stdin, config.noVirtualMemLimit, extraEnv, config.fileBlocks);
+  cleanup();
+
+  if (run.timedOut) {
+    return { success: false, error: 'Execution timed out (infinite loop detected)' };
+  }
+  if (run.code !== 0) {
+    return { success: false, error: run.stderr || `Tracer exited with code ${run.code}` };
+  }
+
+  let trace;
+  try {
+    trace = JSON.parse(run.stdout);
+  } catch {
+    return { success: false, error: 'Trace generation failed unexpectedly.' };
+  }
+  // A harness-reported error with no steps at all means the program never
+  // started (e.g. a SyntaxError) â€” treat that like a failed build, not a
+  // trace. An error WITH steps (an uncaught runtime exception mid-program)
+  // is still a successful, scrubbable trace â€” the frontend shows the error
+  // on its final step.
+  if (trace.error && (!trace.steps || trace.steps.length === 0)) {
+    return { success: false, error: trace.error };
+  }
+  return { success: true, trace };
+}
+
+function executeTrace(language, code, stdin = '') {
+  return sandboxLimit(() => executeTraceRaw(language, code, stdin));
+}
+
 function normalizeOutput(str) {
   return (str ?? '').replace(/\r\n/g, '\n').trim();
 }
@@ -3709,16 +4042,37 @@ app.post('/api/admin/students/csv-import', authenticateToken, requireAdmin, csvU
 // can't live in GET /api/me (which students also call).
 app.get('/api/admin/organization', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const result = await pool.query('SELECT name, webhook_secret, default_org_unit_id FROM organizations WHERE id = $1', [req.user.organizationId]);
+    const result = await pool.query('SELECT name, webhook_secret, default_org_unit_id, logo_object_key FROM organizations WHERE id = $1', [req.user.organizationId]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Organization not found' });
+    const logoObjectKey = result.rows[0].logo_object_key;
     res.status(200).json({
       name: result.rows[0].name,
       webhookSecret: result.rows[0].webhook_secret,
       defaultOrgUnitId: result.rows[0].default_org_unit_id,
+      logoUrl: logoObjectKey ? await getScanPdfUrl(logoObjectKey, 900).catch(() => null) : null,
     });
   } catch (err) {
     console.error('Get organization error:', err);
     res.status(500).json({ error: 'Failed to load organization' });
+  }
+});
+
+// Uploads/replaces the caller's own org's logo — shown on every ID card
+// issued under it (see GET /api/me/id-card/:organizationId). Overwrites the
+// same object key each time (see orgLogoObjectKey's own comment) rather
+// than keeping old versions around.
+app.post('/api/admin/organization/logo', authenticateToken, requireAdmin, avatarUpload.single('logo'), async (req, res) => {
+  if (!isB2Configured()) return res.status(503).json({ error: 'Logo storage is not configured yet' });
+  if (!req.file) return res.status(400).json({ error: 'A logo image is required' });
+  try {
+    const ext = path.extname(req.file.originalname || '') || '.png';
+    const storageKey = orgLogoObjectKey(req.user.organizationId, ext);
+    await uploadScanPdf(storageKey, req.file.buffer, req.file.mimetype);
+    await pool.query('UPDATE organizations SET logo_object_key = $1 WHERE id = $2', [storageKey, req.user.organizationId]);
+    res.status(200).json({ logoUrl: await getScanPdfUrl(storageKey, 900) });
+  } catch (err) {
+    console.error('Upload organization logo error:', err);
+    res.status(500).json({ error: 'Failed to upload logo' });
   }
 });
 
@@ -5307,6 +5661,37 @@ async function sendBillingEmail(organizationId, subject, text) {
 // (existing POST /api/admin/create-student, now org-scoped). Self-serve,
 // unauthenticated by necessity — this IS how an org's first account gets made.
 // ============================================================================
+// Shared by POST /api/organizations/signup (brand-new identity + new org)
+// and POST /api/me/start-institution (an already-authenticated identity
+// founding a SECOND org) — both just need "a fresh approved org with the
+// same starter defaults every org gets"; they differ only in how the admin
+// identity behind it comes to exist, not in what the org itself needs.
+// extra.emailDomain/verificationTokenHash/verificationTokenExpiry are only
+// ever supplied by the signup route (its own email-verification flow) —
+// left null for start-institution, which has no separate email to verify.
+async function createOrganizationWithDefaults(client, name, extra = {}) {
+  const webhookSecret = crypto.randomBytes(16).toString('hex');
+  const orgRes = await client.query(
+    `INSERT INTO organizations (name, webhook_secret, status, email_domain, verification_token_hash, verification_token_expiry)
+     VALUES ($1, $2, 'approved', $3, $4, $5) RETURNING id, name`,
+    [name, webhookSecret, extra.emailDomain || null, extra.verificationTokenHash || null, extra.verificationTokenExpiry || null]
+  );
+  const org = orgRes.rows[0];
+
+  // Same defaults every fresh install seeded before this was per-org.
+  await client.query(
+    `INSERT INTO grade_bands (label, min_percent, organization_id) VALUES
+      ('Excellent', 90, $1), ('Very good', 80, $1), ('Good', 70, $1),
+      ('Satisfactory', 60, $1), ('Pass', 40, $1), ('Unsatisfactory', 0, $1)`,
+    [org.id]
+  );
+  await client.query('INSERT INTO tag_visibility_settings (organization_id) VALUES ($1)', [org.id]);
+  // Every org starts on Free — no payment step required to sign up at all.
+  await client.query('INSERT INTO subscriptions (organization_id) VALUES ($1)', [org.id]);
+
+  return org;
+}
+
 app.post('/api/organizations/signup', async (req, res) => {
   const { organizationName, email, password, name, accessCode, acceptedTos } = req.body;
   if (!organizationName || !String(organizationName).trim()) {
@@ -5369,13 +5754,11 @@ app.post('/api/organizations/signup', async (req, res) => {
     const verificationToken = crypto.randomBytes(32).toString('hex');
     const verificationTokenHash = crypto.createHash('sha256').update(verificationToken).digest('hex');
 
-    const webhookSecret = crypto.randomBytes(16).toString('hex');
-    const orgRes = await client.query(
-      `INSERT INTO organizations (name, webhook_secret, status, email_domain, verification_token_hash, verification_token_expiry)
-       VALUES ($1, $2, 'approved', $3, $4, now() + interval '24 hours') RETURNING id, name`,
-      [organizationName.trim(), webhookSecret, emailDomain, verificationTokenHash]
-    );
-    const org = orgRes.rows[0];
+    const org = await createOrganizationWithDefaults(client, organizationName.trim(), {
+      emailDomain,
+      verificationTokenHash,
+      verificationTokenExpiry: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    });
 
     // Reuses the matched existing identity's password untouched if one
     // exists; only hashes+stores the supplied password for a brand-new one.
@@ -5403,17 +5786,6 @@ app.post('/api/organizations/signup', async (req, res) => {
       `INSERT INTO memberships (user_id, organization_id, role) VALUES ($1, $2, 'admin')`,
       [userId, org.id]
     );
-
-    // Same defaults every fresh install seeded before this was per-org.
-    await client.query(
-      `INSERT INTO grade_bands (label, min_percent, organization_id) VALUES
-        ('Excellent', 90, $1), ('Very good', 80, $1), ('Good', 70, $1),
-        ('Satisfactory', 60, $1), ('Pass', 40, $1), ('Unsatisfactory', 0, $1)`,
-      [org.id]
-    );
-    await client.query('INSERT INTO tag_visibility_settings (organization_id) VALUES ($1)', [org.id]);
-    // Every org starts on Free — no payment step required to sign up at all.
-    await client.query('INSERT INTO subscriptions (organization_id) VALUES ($1)', [org.id]);
 
     await client.query('COMMIT');
 
@@ -6993,6 +7365,264 @@ app.get('/api/me/organizations', authenticateToken, async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// ID CARDS — profile photos + per-institution card data.
+// ---------------------------------------------------------------------------
+
+const MAX_USER_PHOTOS = 5;
+
+// A user's own photo library (capped at MAX_USER_PHOTOS — see the count
+// check in the POST route below) — reusable across every institution's ID
+// card, not uploaded once per org.
+app.get('/api/me/photos', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, storage_key, original_filename, created_at FROM user_photos WHERE user_id = $1 ORDER BY created_at DESC',
+      [req.user.userId]
+    );
+    const photos = await Promise.all(result.rows.map(async (row) => ({
+      id: row.id,
+      originalFilename: row.original_filename,
+      createdAt: row.created_at,
+      url: await getScanPdfUrl(row.storage_key, 900),
+    })));
+    res.status(200).json({ photos });
+  } catch (err) {
+    console.error('List my photos error:', err);
+    res.status(500).json({ error: 'Failed to load photos' });
+  }
+});
+
+// Inserts a placeholder row first to get an id, THEN uploads under a key
+// that embeds that id (avatarObjectKey needs photoId) — same "row before
+// object key" ordering scanObjectKey's own callers use, unlike
+// notesObjectKey which keys on a fresh random UUID instead because it has
+// no such row-first step available (see storage.js's own comment on that).
+app.post('/api/me/photos', authenticateToken, avatarUpload.single('photo'), async (req, res) => {
+  if (!isB2Configured()) return res.status(503).json({ error: 'Photo storage is not configured yet' });
+  if (!req.file) return res.status(400).json({ error: 'A photo is required' });
+  try {
+    const countRes = await pool.query('SELECT COUNT(*)::int AS count FROM user_photos WHERE user_id = $1', [req.user.userId]);
+    if (countRes.rows[0].count >= MAX_USER_PHOTOS) {
+      return res.status(400).json({ error: `You can only keep up to ${MAX_USER_PHOTOS} photos — delete one first` });
+    }
+
+    const insertRes = await pool.query(
+      `INSERT INTO user_photos (user_id, storage_key, original_filename) VALUES ($1, '', $2) RETURNING id`,
+      [req.user.userId, req.file.originalname || null]
+    );
+    const photoId = insertRes.rows[0].id;
+    const ext = path.extname(req.file.originalname || '') || '.jpg';
+    const storageKey = avatarObjectKey(req.user.userId, photoId, ext);
+    await uploadScanPdf(storageKey, req.file.buffer, req.file.mimetype);
+    await pool.query('UPDATE user_photos SET storage_key = $1 WHERE id = $2', [storageKey, photoId]);
+
+    res.status(201).json({ id: photoId, url: await getScanPdfUrl(storageKey, 900) });
+  } catch (err) {
+    console.error('Upload photo error:', err);
+    res.status(500).json({ error: 'Failed to upload photo' });
+  }
+});
+
+app.delete('/api/me/photos/:photoId', authenticateToken, async (req, res) => {
+  const photoId = Number(req.params.photoId);
+  if (!Number.isInteger(photoId)) return res.status(400).json({ error: 'Invalid photo id' });
+  try {
+    const ownRes = await pool.query('SELECT storage_key FROM user_photos WHERE id = $1 AND user_id = $2', [photoId, req.user.userId]);
+    if (ownRes.rows.length === 0) return res.status(404).json({ error: 'Photo not found' });
+
+    await pool.query('DELETE FROM user_photos WHERE id = $1', [photoId]);
+    if (isB2Configured()) {
+      try {
+        await deleteScanPdf(ownRes.rows[0].storage_key);
+      } catch (err) {
+        // The DB row is already gone — a dangling object in the bucket is a
+        // storage-quota nit, not a correctness problem, so this isn't worth
+        // failing the whole delete over.
+        console.error('Failed to delete photo from storage (row already removed):', err);
+      }
+    }
+    res.status(200).json({ success: true });
+  } catch (err) {
+    console.error('Delete photo error:', err);
+    res.status(500).json({ error: 'Failed to delete photo' });
+  }
+});
+
+// Picks which of the user's photos backs ONE institution's card — a
+// per-membership choice, not global (see ensureMembershipActivePhotoColumn
+// above). photoId: null clears it back to "no photo".
+app.put('/api/me/organizations/:organizationId/photo', authenticateToken, async (req, res) => {
+  const organizationId = Number(req.params.organizationId);
+  const photoId = req.body.photoId === null || req.body.photoId === undefined ? null : Number(req.body.photoId);
+  if (!Number.isInteger(organizationId)) return res.status(400).json({ error: 'Invalid organization id' });
+  if (photoId !== null && !Number.isInteger(photoId)) return res.status(400).json({ error: 'Invalid photo id' });
+  try {
+    if (photoId !== null) {
+      const photoRes = await pool.query('SELECT id FROM user_photos WHERE id = $1 AND user_id = $2', [photoId, req.user.userId]);
+      if (photoRes.rows.length === 0) return res.status(404).json({ error: 'Photo not found' });
+    }
+    const result = await pool.query(
+      'UPDATE memberships SET active_photo_id = $1 WHERE user_id = $2 AND organization_id = $3 RETURNING id',
+      [photoId, req.user.userId, organizationId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "You aren't a member of that institution" });
+    res.status(200).json({ success: true });
+  } catch (err) {
+    console.error('Set membership photo error:', err);
+    res.status(500).json({ error: 'Failed to update card photo' });
+  }
+});
+
+// Lets an already-authenticated user (e.g. a teacher wanting to start
+// their own private coaching institute) found a NEW org and become its
+// admin, without going back through the logged-out signup form. Same
+// access-code gate as POST /api/organizations/signup above (this doesn't
+// loosen who's allowed to create an org — same platform-owner secret,
+// same 403 message — it just moves the button inside the app), but skips
+// that route's identity-creation and email-verification steps entirely
+// since the caller is already a known, authenticated identity.
+app.post('/api/me/start-institution', authenticateToken, async (req, res) => {
+  const { organizationName, accessCode } = req.body;
+  if (!organizationName || !String(organizationName).trim()) {
+    return res.status(400).json({ error: 'Organization name is required' });
+  }
+  if (!process.env.PLATFORM_OWNER_SECRET || accessCode !== process.env.PLATFORM_OWNER_SECRET) {
+    return res.status(403).json({ error: "Invalid or missing access code. If you don't have one, the highest authority at your institution must contact honorroll.admin@gmail.com to request one." });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const org = await createOrganizationWithDefaults(client, organizationName.trim());
+    await client.query(
+      `INSERT INTO memberships (user_id, organization_id, role) VALUES ($1, $2, 'admin')`,
+      [req.user.userId, org.id]
+    );
+    await client.query('COMMIT');
+
+    // Mints a session scoped to the new org right away — same shape as
+    // POST /api/login/select-organization's own token — so the caller can
+    // act as admin there immediately instead of needing a separate
+    // re-login step just to pick up the new membership.
+    const token = jwt.sign(
+      { userId: req.user.userId, role: 'admin', organizationId: org.id, orgUnitId: null },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRATION || '24h' }
+    );
+
+    res.status(201).json({
+      message: `"${org.name}" created — you're now its admin.`,
+      token,
+      organizationId: org.id,
+      organizationName: org.name,
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Start institution error:', err);
+    res.status(500).json({ error: 'Failed to create organization' });
+  } finally {
+    client.release();
+  }
+});
+
+// Everything needed to render one institution's ID card in one call — name/
+// role/org details plus presigned URLs for the photo and org logo (both
+// optional; a card just renders with blank slots for whichever is unset).
+// Ownership check is against the membership row itself (user_id = caller),
+// NOT the current session's organizationId — same posture as GET
+// /api/me/organizations above: a multi-org user can view every card they
+// hold without re-authenticating into each one first.
+app.get('/api/me/id-card/:organizationId', authenticateToken, async (req, res) => {
+  const organizationId = Number(req.params.organizationId);
+  if (!Number.isInteger(organizationId)) return res.status(400).json({ error: 'Invalid organization id' });
+  try {
+    const result = await pool.query(
+      `SELECT m.role, m.roll_number, m.created_at AS issued_at,
+              o.name AS organization_name, o.logo_object_key,
+              ou.name AS org_unit_name,
+              u.name AS user_name, u.email,
+              up.id AS photo_id, up.storage_key AS photo_storage_key
+       FROM memberships m
+       JOIN organizations o ON o.id = m.organization_id
+       JOIN users u ON u.id = m.user_id
+       LEFT JOIN org_units ou ON ou.id = m.org_unit_id
+       LEFT JOIN user_photos up ON up.id = m.active_photo_id
+       WHERE m.user_id = $1 AND m.organization_id = $2`,
+      [req.user.userId, organizationId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: "You aren't a member of that institution" });
+    const row = result.rows[0];
+
+    const [photoUrl, logoUrl] = await Promise.all([
+      row.photo_storage_key ? getScanPdfUrl(row.photo_storage_key, 900).catch(() => null) : null,
+      row.logo_object_key ? getScanPdfUrl(row.logo_object_key, 900).catch(() => null) : null,
+    ]);
+
+    res.status(200).json({
+      name: row.user_name || row.email,
+      email: row.email,
+      role: row.role,
+      organizationName: row.organization_name,
+      orgUnitName: row.org_unit_name,
+      cardId: row.roll_number || `HR-${String(req.user.userId).slice(0, 8).toUpperCase()}`,
+      issuedAt: row.issued_at,
+      photoId: row.photo_id,
+      photoUrl,
+      logoUrl,
+    });
+  } catch (err) {
+    console.error('Get ID card error:', err);
+    res.status(500).json({ error: 'Failed to load ID card' });
+  }
+});
+
+// Streams the photo or logo bytes through our own origin instead of the
+// presigned B2 URL the JSON route above returns — B2 sends no CORS headers
+// on these objects (confirmed: a plain GET succeeds but carries no
+// Access-Control-Allow-Origin), so a plain <img src> displays them fine,
+// but html2canvas's "Download PNG" needs to read pixels back out of the
+// canvas afterward, which the browser blocks for a cross-origin image with
+// no CORS grant. Our own /api origin already sends the right header (see
+// the cors() setup above), so IdCard.jsx's export path fetches through
+// here instead, just for the moment it builds the PNG.
+app.get('/api/me/id-card/:organizationId/:kind', authenticateToken, async (req, res) => {
+  const organizationId = Number(req.params.organizationId);
+  const kind = req.params.kind;
+  if (!Number.isInteger(organizationId) || !['photo', 'logo'].includes(kind)) {
+    return res.status(400).json({ error: 'Invalid request' });
+  }
+  try {
+    let storageKey;
+    if (kind === 'photo') {
+      const result = await pool.query(
+        `SELECT up.storage_key FROM memberships m
+         JOIN user_photos up ON up.id = m.active_photo_id
+         WHERE m.user_id = $1 AND m.organization_id = $2`,
+        [req.user.userId, organizationId]
+      );
+      storageKey = result.rows[0]?.storage_key;
+    } else {
+      const result = await pool.query(
+        `SELECT o.logo_object_key FROM memberships m
+         JOIN organizations o ON o.id = m.organization_id
+         WHERE m.user_id = $1 AND m.organization_id = $2`,
+        [req.user.userId, organizationId]
+      );
+      storageKey = result.rows[0]?.logo_object_key;
+    }
+    if (!storageKey) return res.status(404).json({ error: 'Not found' });
+
+    const { buffer, contentType } = await downloadScanPdf(storageKey);
+    res.setHeader('Content-Type', contentType || 'image/png');
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.status(200).send(buffer);
+  } catch (err) {
+    console.error('Get ID card asset error:', err);
+    res.status(500).json({ error: 'Failed to load image' });
+  }
+});
+
 // A student's own request to correct their roster info.
 // Routed to their institution's admin queue. Sends an email notification to the
 // organization's admin(s).
@@ -7443,6 +8073,28 @@ app.post('/api/playground/execute/:language', authenticateToken, async (req, res
   const result = await executeInSandbox(language, code, stdin || '');
   if (!result.success) return res.status(400).json({ error: result.error });
   res.status(200).json({ output: result.output });
+});
+
+/**
+ * Line-by-line execution trace for the IDE's "Visualize" panel. Runs the
+ * student's program through its language's tracer harness once and returns
+ * the full step-by-step trace for the frontend to scrub through client-side
+ * â€” same run-once-return-everything shape as the execute routes above,
+ * rather than a live/interactive stepping protocol. Only languages listed in
+ * TRACE_CONFIG have a harness so far; everything else gets a clear 400.
+ */
+app.post('/api/playground/trace/:language', authenticateToken, async (req, res) => {
+  const { language } = req.params;
+  const { code, stdin } = req.body;
+
+  if (!code) return res.status(400).json({ error: 'Code is required' });
+  if (!TRACE_CONFIG[language]) {
+    return res.status(400).json({ error: `Line-by-line tracing isn't available for ${language} yet.` });
+  }
+
+  const result = await executeTrace(language, code, stdin || '');
+  if (!result.success) return res.status(400).json({ error: result.error });
+  res.status(200).json(result.trace);
 });
 
 // ============================================================================
@@ -10207,7 +10859,7 @@ async function processOneScanSubmission(submissionId) {
     if (!isB2Configured()) throw new Error('B2 storage is not configured');
     if (!isOcrConfigured()) throw new Error('OCR Space is not configured');
 
-    const pdfBuffer = await downloadScanPdf(submission.storage_key);
+    const { buffer: pdfBuffer } = await downloadScanPdf(submission.storage_key);
     const { pages, handwriting_features: handwritingFeatures } = await runOcr(pdfBuffer);
     const ocrText = pages.map((p) => p.text).join('\n\n');
 
@@ -10276,7 +10928,7 @@ async function processOneExamScanAttempt(attemptId) {
     if (!isB2Configured()) throw new Error('B2 storage is not configured');
     if (!isOcrConfigured()) throw new Error('OCR is not configured');
 
-    const pdfBuffer = await downloadScanPdf(attempt.scan_storage_key);
+    const { buffer: pdfBuffer } = await downloadScanPdf(attempt.scan_storage_key);
     const { pages } = await runOcr(pdfBuffer);
     const ocrText = pages.map((p) => p.text).join('\n\n');
 

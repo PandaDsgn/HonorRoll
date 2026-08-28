@@ -8,9 +8,11 @@ import BrandMark from '../components/BrandMark';
 import SpaceSwitcher, { SpaceNotifications } from '../components/SpaceSwitcher';
 import LogoutFab from '../components/LogoutFab';
 import PercentBar from '../components/PercentBar';
+import IdCard from '../components/IdCard';
 import { PERF_STATUS_LABELS, PERF_STATUS_CLASS } from '../lib/performanceStatus';
 import { API } from '../config';
 import '../admin.css';
+import '../IdCard.css';
 
 const REQUEST_STATUS_LABELS = { pending: 'Pending review', approved: 'Approved', rejected: 'Rejected' };
 const REQUEST_STATUS_CLASS = { pending: 'chip-medium', approved: 'chip-easy', rejected: 'chip-hard' };
@@ -460,6 +462,8 @@ function MyInfoPanel() {
   const [requests, setRequests] = useState(null);
   const [error, setError] = useState('');
 
+  const [cardOrgId, setCardOrgId] = useState(null);
+
   const [field, setField] = useState('name');
   const [customField, setCustomField] = useState('');
   const [currentValue, setCurrentValue] = useState('');
@@ -520,7 +524,7 @@ function MyInfoPanel() {
         <p className="auth-sub" style={{ margin: '0 0 16px' }}>{user?.name || user?.email}{user?.name && ` — ${user.email}`}</p>
         <div className="admin-table-wrap">
           <table className="admin-table">
-            <thead><tr><th>Institution</th><th>Role</th><th>Unit</th><th>Roll number</th></tr></thead>
+            <thead><tr><th>Institution</th><th>Role</th><th>Unit</th><th>Roll number</th><th /></tr></thead>
             <tbody>
               {organizations.map((o) => (
                 <tr key={o.organization_id}>
@@ -528,6 +532,11 @@ function MyInfoPanel() {
                   <td><span className="chip chip-neutral"><span className="dot" />{o.role}</span></td>
                   <td>{o.org_unit_id != null ? o.org_unit_id : '—'}</td>
                   <td>{o.roll_number || '—'}</td>
+                  <td>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => setCardOrgId(o.organization_id)}>
+                      View ID Card
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -603,6 +612,10 @@ function MyInfoPanel() {
           </div>
         )}
       </div>
+
+      {cardOrgId && (
+        <IdCard organizations={organizations} initialOrganizationId={cardOrgId} onClose={() => setCardOrgId(null)} />
+      )}
     </div>
   );
 }

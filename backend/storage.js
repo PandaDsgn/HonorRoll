@@ -73,6 +73,23 @@ function noticesObjectKey(organizationId, fileId, extension = '.pdf') {
   return `notices/${organizationId}/${fileId}${extension}`;
 }
 
+// Profile photos belong to the global user identity (see memberships'
+// "users is pure identity" comment in index.js), not any one organization
+// — a student who uploads a headshot can reuse it as the photo on every
+// institution's ID card, hence userId (not organizationId) as the first
+// segment. photoId is the user_photos row's own id, so re-uploading never
+// collides with an earlier photo the user hasn't deleted yet.
+function avatarObjectKey(userId, photoId, extension = '.jpg') {
+  return `avatars/${userId}/${photoId}${extension}`;
+}
+
+// One logo per organization (no sub-id needed — uploading a new one just
+// overwrites the same key, same as how a real institution replaces its
+// letterhead rather than keeping every old version around).
+function orgLogoObjectKey(organizationId, extension = '.png') {
+  return `org-logos/${organizationId}${extension}`;
+}
+
 // contentType defaults to PDF for scanObjectKey/examScanObjectKey's own
 // callers (unchanged behavior for them); the notes feature passes the
 // uploaded file's real mimetype so an image/video/audio note is served back
@@ -98,14 +115,20 @@ async function getScanPdfUrl(objectKey, expiresInSeconds = 900) {
 
 // Used by the OCR pipeline (see index.js's deadline sweep) to get the
 // actual PDF bytes to send to the OCR Space — the presigned URL above is
-// for browser viewing, this is for server-side re-fetching.
+// for browser viewing, this is for server-side re-fetching. Also reused by
+// the ID card photo/logo proxy routes (see GET /api/me/id-card/:id/:kind)
+// to stream an image through our own origin — B2 doesn't send CORS
+// headers on these objects, so a browser-side canvas (html2canvas, for the
+// "Download PNG" button) can read a plain <img src> of one just fine but
+// can never read its pixels back out for export; proxying through a route
+// that already carries our own CORS headers sidesteps that entirely.
 async function downloadScanPdf(objectKey) {
   const client = getB2Client();
   if (!client) throw new Error('B2 is not configured');
   const res = await client.send(new GetObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: objectKey }));
   const chunks = [];
   for await (const chunk of res.Body) chunks.push(chunk);
-  return Buffer.concat(chunks);
+  return { buffer: Buffer.concat(chunks), contentType: res.ContentType };
 }
 
 // Called when a resubmission replaces an earlier one (only the final
@@ -118,4 +141,8 @@ async function deleteScanPdf(objectKey) {
   await client.send(new DeleteObjectCommand({ Bucket: process.env.B2_BUCKET_NAME, Key: objectKey }));
 }
 
-module.exports = { isB2Configured, scanObjectKey, examScanObjectKey, notesObjectKey, noticesObjectKey, uploadScanPdf, getScanPdfUrl, downloadScanPdf, deleteScanPdf };
+module.exports = {
+  isB2Configured, scanObjectKey, examScanObjectKey, notesObjectKey, noticesObjectKey,
+  avatarObjectKey, orgLogoObjectKey,
+  uploadScanPdf, getScanPdfUrl, downloadScanPdf, deleteScanPdf,
+};

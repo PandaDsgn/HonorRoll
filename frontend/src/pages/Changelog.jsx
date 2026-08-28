@@ -4,8 +4,21 @@ import LegalShell from '../components/LegalShell';
 // history, not a promise of exact release timestamps.
 const ENTRIES = [
   {
-    date: '24 August 2026',
+    date: '28 August 2026',
     tag: 'Latest',
+    items: [
+      'Added a step-by-step code visualizer to the IDE — watch your code run line by line alongside a live diagram of its variables, objects, and how they reference each other, with playback controls, a PNG export, and shareable links to a specific step.',
+      'The code visualizer now works for every language the IDE supports, not just Python — C, C++, Java, JavaScript, TypeScript, Go, Rust, Ruby, and PHP can all be stepped through line by line too.',
+      'The visualizer\'s number display can now show integers in octal, alongside the existing decimal, binary, and hex views.',
+      'Every student, teacher, and admin can now build a digital ID card from their new Profile page — upload a photo, crop and zoom it, and download the finished card as a PNG. Admins can upload (and crop) their institution\'s logo, shown on every card issued there.',
+      'Anyone belonging to more than one institution can now cycle between each one\'s ID card, and can keep several photos on file to choose which one backs a particular card.',
+      'Teachers can now start their own institution — for a private coaching center or similar — directly from their Profile page, without leaving the app.',
+      'Fixed a bug where a downloaded ID card could come out with the profile photo or institution logo missing.',
+    ],
+  },
+  {
+    date: '24 August 2026',
+    tag: 'Improved',
     items:[
       'The sign-in screen now actually enforces the account type you select — signing in with a student\'s credentials while "Teacher" is selected is correctly rejected, instead of silently logging you in as whatever role the account actually has.',
       'General performance and reliability improvements under heavier load.',

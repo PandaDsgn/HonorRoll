@@ -15,9 +15,11 @@ import TeacherUploadsPanel from '../components/TeacherUploadsPanel';
 import AdminNoticesPanel from '../components/AdminNoticesPanel';
 import BillingPanel from '../components/BillingPanel';
 import PercentBar from '../components/PercentBar';
+import ImageCropper from '../components/ImageCropper';
 import { PERF_STATUS_LABELS, PERF_STATUS_CLASS } from '../lib/performanceStatus';
 import { API } from '../config';
 import '../admin.css';
+import '../IdCard.css';
 const DIFFICULTY_CLASS = { Easy: 'chip-easy', Medium: 'chip-medium', Hard: 'chip-hard' };
 const STATUS_CLASS = { open: 'chip-easy', upcoming: 'chip-medium', closed: 'chip-hard' };
 
@@ -133,6 +135,7 @@ export default function AdminDashboard() {
               user?.role === 'admin' && { id: 'notices', label: 'Notices', onClick: () => setTab('notices') },
               user?.role === 'admin' && { id: 'grade-scale', label: 'Grading', onClick: () => setTab('grade-scale') },
               user?.role === 'admin' && { id: 'structure', label: 'Structure', onClick: () => setTab('structure') },
+              user?.role === 'admin' && { id: 'institution', label: 'Institution', onClick: () => setTab('institution') },
               user?.role === 'admin' && { id: 'billing', label: 'Billing', onClick: () => setTab('billing') },
               user?.role === 'admin' && { id: 'contact-superadmin', label: 'Contact Superadmin', onClick: () => setTab('contact-superadmin') },
             ].filter(Boolean);
@@ -206,6 +209,8 @@ export default function AdminDashboard() {
           ) : null
         ) : tab === 'billing' ? (
           user?.role === 'admin' ? <BillingPanel /> : null
+        ) : tab === 'institution' ? (
+          user?.role === 'admin' ? <OrgLogoPanel /> : null
         ) : tab === 'contact-superadmin' ? (
           user?.role === 'admin' ? (
             <>
@@ -2565,6 +2570,103 @@ function IntegrationsPanel() {
       <div className="testcase-row">
         <input value={webhookUrl} readOnly style={{ fontFamily: 'var(--font-mono)', fontSize: '12.5px', textOverflow: 'ellipsis', overflow: 'hidden', minWidth: 0, width: '100%' }} />
         <button type="button" className="btn btn-ghost btn-sm" onClick={copyUrl}>{copied ? 'Copied' : 'Copy'}</button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// INSTITUTION — lets an admin upload/replace their org's logo, shown on
+// every ID card issued under it (see IdCard.jsx and GET /api/me/id-card).
+// Same shape as IntegrationsPanel above (fetch GET /api/admin/organization
+// on mount, one focused control), lives under its own "Institution" tab
+// rather than folded into Grading's org-wide-policy panels since a logo
+// isn't a grading/plagiarism policy — it's branding.
+// ============================================================================
+function OrgLogoPanel() {
+  const [org, setOrg] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState('');
+  const [cropFile, setCropFile] = useState(null);
+  const fileInputRef = useRef(null);
+
+  const fetchOrg = () => {
+    axios.get(`${API}/api/admin/organization`, { withCredentials: true })
+      .then((res) => setOrg(res.data))
+      .catch(() => {});
+  };
+
+  useEffect(fetchOrg, []);
+
+  // Picking a file only opens the cropper (square, PNG output so a
+  // transparent-background logo stays transparent instead of getting
+  // flattened the way the JPEG profile-photo crop is) — the actual upload
+  // happens once the admin confirms a crop, same two-step flow PhotoPicker
+  // already uses for profile photos.
+  const handleFileChange = (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setCropFile(file);
+  };
+
+  const handleCropConfirm = async (blob) => {
+    setCropFile(null);
+    setUploading(true);
+    setError('');
+    const formData = new FormData();
+    formData.append('logo', blob, 'logo.png');
+    try {
+      await axios.post(`${API}/api/admin/organization/logo`, formData, { withCredentials: true });
+      fetchOrg();
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to upload logo.');
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  if (!org) return null;
+
+  return (
+    <div className="panel" style={{ padding: '20px', marginBottom: '24px' }}>
+      <h3 style={{ margin: '0 0 4px' }}>Institution logo</h3>
+      <p className="auth-sub" style={{ margin: '0 0 14px' }}>
+        Shown on every ID card issued under {org.name} (each member's own Profile page).
+      </p>
+      {error && <div className="alert" style={{ marginBottom: 10 }}><span className="alert-icon">!</span><span>{error}</span></div>}
+      {cropFile && (
+        <div className="cropper-overlay" role="dialog" aria-modal="true">
+          <ImageCropper
+            file={cropFile}
+            onCancel={() => setCropFile(null)}
+            onConfirm={handleCropConfirm}
+            mimeType="image/png"
+            quality={1}
+            confirmLabel="Use this logo"
+          />
+        </div>
+      )}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+        <div
+          style={{
+            width: 72, height: 72, borderRadius: 'var(--radius-sm)', border: '1px solid var(--border-strong)',
+            background: 'var(--surface-2)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+            overflow: 'hidden', flexShrink: 0,
+          }}
+        >
+          {org.logoUrl ? (
+            <img src={org.logoUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+          ) : (
+            <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>No logo</span>
+          )}
+        </div>
+        <div>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => fileInputRef.current?.click()} disabled={uploading}>
+            {uploading ? 'Uploading…' : org.logoUrl ? 'Replace logo' : 'Upload logo'}
+          </button>
+          <input ref={fileInputRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={handleFileChange} />
+        </div>
       </div>
     </div>
   );

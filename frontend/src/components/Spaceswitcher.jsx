@@ -53,6 +53,11 @@ export default function SpaceSwitcher({ activeTab }) {
     ...(role === 'student' ? [{ id: 'exams', label: 'Exams', path: '/exams' }] : []),
     ...(role === 'student' ? [{ id: 'notes', label: 'Notes', path: '/notes' }] : []),
     ...(role === 'student' ? [{ id: 'ide', label: 'IDE', path: '/ide' }] : []),
+    // Unconditional — every role gets an ID card/photo page, so unlike
+    // everything above it this isn't filtered by role at all. Placed last:
+    // same reasoning as IDE being last for a student, nothing about it is
+    // time-sensitive or actionable the way the entries above it are.
+    { id: 'profile', label: 'Profile', path: '/profile' },
   ];
 
   useEffect(() => {
