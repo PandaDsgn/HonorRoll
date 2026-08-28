@@ -20,6 +20,17 @@
 // backing store is current.
 const { rateLimit, MemoryStore, ipKeyGenerator } = require('express-rate-limit');
 
+// The integration test suite (tests/) exercises real signup/login flows
+// dozens of times per run, all from the same loopback IP — real, correct
+// production behavior for a human attacker attempting that many auth
+// requests, but it means the test suite itself trips its own rate limiter
+// well before covering everything it needs to. Skipping enforcement (not
+// skipping the middleware entirely — `skip` still runs standardHeaders
+// bookkeeping, just never counts/blocks) under NODE_ENV=test is the
+// standard fix for this class of conflict; nothing about the exported
+// limiter's real behavior changes for an actual deployment.
+const skipInTest = () => process.env.NODE_ENV === 'test';
+
 class SwappableStore {
   constructor() {
     this.target = new MemoryStore();
@@ -49,6 +60,7 @@ const globalLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   store: globalStore,
+  skip: skipInTest,
   message: { error: 'Too many requests — please slow down and try again shortly.' },
 });
 
@@ -65,6 +77,7 @@ const authLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   store: authStore,
+  skip: skipInTest,
   message: { error: 'Too many attempts — please wait 15 minutes and try again.' },
 });
 
@@ -82,6 +95,7 @@ const assistantLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   store: assistantStore,
+  skip: skipInTest,
   // req.user.userId is always set in practice — this route sits behind
   // authenticateToken, which already 401s before this middleware ever
   // runs on an unauthenticated request. The req.ip fallback only exists
