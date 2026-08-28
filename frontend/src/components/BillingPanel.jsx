@@ -239,7 +239,7 @@ export default function BillingPanel() {
                   <div className="admin-cell-strong" style={{ fontSize: 15, marginBottom: 4 }}>Custom</div>
                   <div style={{ fontSize: 13, color: 'var(--text-dim)', marginBottom: 10 }}>10,000+ students</div>
                   <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 12 }}>Contact us</div>
-                  <button type="button" className="btn btn-primary btn-sm" onClick={() => navigate('/admin/billing/custom-quote')}>
+                  <button type="button" className="btn btn-secondary-choice btn-sm" onClick={() => navigate('/admin/billing/custom-quote')}>
                     Request Invoice
                   </button>
                 </div>

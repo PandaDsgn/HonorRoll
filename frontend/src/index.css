@@ -32,6 +32,15 @@
   --warn: #ffd166;
   --warn-dim: rgba(255, 209, 102, 0.14);
 
+  /* Buttons for an available-but-secondary action — a real, working path
+     that isn't the main thing most people on that screen are there to do
+     (e.g. "Start your own institution" next to the actual ID-card content,
+     "Request Invoice" next to the real plan-upgrade buttons). Same fixed
+     gold in both themes — deliberately its own color, not derived from
+     --warn, so it never gets visually confused with an actual warning. */
+  --gold: #cfa748;
+  --gold-dim: rgba(207, 167, 72, 0.14);
+
   /* Blue Colors for the Console LED */
   --blue: #3b82f6;
   --blue-dim: rgba(59, 130, 246, 0.15);
@@ -78,6 +87,9 @@
 
   --warn: #b3690a;
   --warn-dim: rgba(179, 105, 10, 0.12);
+
+  --gold: #cfa748;
+  --gold-dim: rgba(207, 167, 72, 0.16);
 
   /* Light mode blue variants */
   --blue: #2563eb;
@@ -236,6 +248,13 @@ button.brand:hover .brand-honor { color: var(--accent); }
 .btn-primary:hover:not(:disabled) { background: var(--surface-3); border-color: var(--accent); transform: translateY(-1px); }
 .btn-ghost { background: transparent; color: var(--text-dim); border-color: var(--border); }
 .btn-ghost:hover { color: var(--text); border-color: var(--border-strong); background: var(--surface-2); }
+/* A real, working action that isn't the main path on its screen — e.g. it
+   sits beside an actual primary CTA (a real "Choose Plan"/"Add admin"
+   button) without being that. Same outlined recipe as btn-primary, gold
+   instead of accent-blue so it reads as "also available" rather than
+   "do this." */
+.btn-secondary-choice { background: var(--surface-2); color: var(--gold); border-color: var(--border); }
+.btn-secondary-choice:hover:not(:disabled) { background: var(--surface-3); border-color: var(--gold); transform: translateY(-1px); }
 
 /* Border/track colors are theme tokens rather than a hardcoded near-white
    — this used to assume it always sat on a solid --accent-filled button,

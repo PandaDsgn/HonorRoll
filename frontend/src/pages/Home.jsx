@@ -45,7 +45,7 @@ export default function Home() {
             {loading ? 'Loading…' : user ? 'Continue to your workspace' : 'Sign in to your workspace'}
           </button>
           {!user && !loading && (
-            <button type="button" className="btn btn-ghost landing-cta" onClick={() => navigate('/signup', { replace: true })}>
+            <button type="button" className="btn btn-secondary-choice landing-cta" onClick={() => navigate('/signup', { replace: true })}>
               Set up your school or college
             </button>
           )}

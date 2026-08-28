@@ -507,7 +507,7 @@ function BillingSection({ orgId }) {
             <label htmlFor="ov-period-end">Renews/expires (optional)</label>
             <input id="ov-period-end" type="date" value={form.currentPeriodEnd} onChange={(e) => setForm((f) => ({ ...f, currentPeriodEnd: e.target.value }))} />
           </div>
-          <button type="submit" className="btn btn-primary btn-sm" disabled={saving}>{saving ? 'Saving…' : 'Apply override'}</button>
+          <button type="submit" className="btn btn-secondary-choice btn-sm" disabled={saving}>{saving ? 'Saving…' : 'Apply override'}</button>
         </form>
       </div>
     </div>

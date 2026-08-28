@@ -138,7 +138,7 @@ export default function MyProfile() {
           {canStartInstitution && (
             <div style={{ marginTop: 20, paddingTop: 20, borderTop: '1px solid var(--border)' }}>
               {!showStartForm ? (
-                <button type="button" className="btn btn-ghost btn-sm" onClick={() => setShowStartForm(true)}>
+                <button type="button" className="btn btn-secondary-choice btn-sm" onClick={() => setShowStartForm(true)}>
                   Start your own institution
                 </button>
               ) : (
