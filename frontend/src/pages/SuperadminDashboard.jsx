@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, Fragment } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { useTheme } from '../hooks/useTheme';
@@ -7,6 +7,7 @@ import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
 import LogoutFab from '../components/LogoutFab';
 import { API } from '../config';
+import LoginMapGlobe from '../components/LoginMapGlobe';
 import '../admin.css';
 
 function formatDate(iso) {
@@ -217,6 +218,8 @@ export default function SuperadminDashboard() {
 
         {summary && <SummaryCards summary={summary} />}
 
+        <LoginMapGlobe />
+
         <ProfileChangeRequestsPanel />
 
         <AdminMessagesPanel />
@@ -226,6 +229,8 @@ export default function SuperadminDashboard() {
         <AddAdminRequestsPanel />
 
         <UserSearchPanel onEnterOrg={enterOrg} />
+
+        <SecurityEventsPanel orgs={orgs} />
 
         <div className="panel" style={{ padding: 20, marginBottom: 16 }}>
           <h3 style={{ margin: '0 0 12px' }}>Organizations</h3>
@@ -898,6 +903,170 @@ function UserSearchPanel({ onEnterOrg }) {
             </table>
           </div>
         )
+      )}
+    </div>
+  );
+}
+
+// Coarse coloring for the event-type chip — a heuristic on the name itself
+// rather than a hardcoded per-type table, so a new event_type introduced
+// later in lib/securityEvents.js call sites (see that file's own comment)
+// gets a sensible color for free instead of silently falling through to
+// "neutral" until someone remembers to list it here too.
+function securityEventClass(eventType) {
+  if (/failed|denied|blocked|deleted|removed|locked/.test(eventType)) return 'chip-hard';
+  if (/success|created|granted|signup|completed/.test(eventType)) return 'chip-easy';
+  return 'chip-medium';
+}
+
+// ============================================================================
+// SECURITY EVENTS — read-only view onto the in-app SIEM's audit trail (see
+// backend lib/securityEvents.js / GET /api/superadmin/security-events):
+// every login/logout/password-reset, every 403 from requireAdmin/
+// requireAdminOrTeacher/requireSuperadmin, and every admin/superadmin
+// action that touches an account, a role, or a grade. Superadmin-only —
+// there's no per-org admin equivalent of this panel (yet).
+// ============================================================================
+function SecurityEventsPanel({ orgs }) {
+  const [events, setEvents] = useState(null);
+  const [eventTypes, setEventTypes] = useState([]);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [eventTypeFilter, setEventTypeFilter] = useState('');
+  const [orgFilter, setOrgFilter] = useState('');
+  const [actorEmailFilter, setActorEmailFilter] = useState('');
+  const [fromFilter, setFromFilter] = useState('');
+  const [toFilter, setToFilter] = useState('');
+  const [expandedId, setExpandedId] = useState(null);
+
+  const fetchEvents = useCallback(() => {
+    setLoading(true);
+    setError('');
+    axios.get(`${API}/api/superadmin/security-events`, {
+      params: {
+        eventType: eventTypeFilter || undefined,
+        organizationId: orgFilter || undefined,
+        actorEmail: actorEmailFilter.trim() || undefined,
+        from: fromFilter || undefined,
+        to: toFilter || undefined,
+      },
+      withCredentials: true,
+    })
+      .then((res) => { setEvents(res.data.events); setEventTypes(res.data.eventTypes); })
+      .catch((err) => setError(err.response?.data?.error || 'Failed to load security events.'))
+      .finally(() => setLoading(false));
+  }, [eventTypeFilter, orgFilter, actorEmailFilter, fromFilter, toFilter]);
+
+  useEffect(() => { fetchEvents(); }, [fetchEvents]);
+
+  const downloadCsv = () => {
+    if (!events || events.length === 0) return;
+    const headers = ['Time', 'Event', 'Actor email', 'Actor role', 'Organization', 'IP address', 'Detail'];
+    const escape = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const rows = events.map((e) => [
+      e.created_at, e.event_type, e.actor_email || '', e.actor_role || '', e.organization_name || '',
+      e.ip_address || '', e.detail ? JSON.stringify(e.detail) : '',
+    ]);
+    const csv = [headers, ...rows].map((r) => r.map(escape).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `security-events-${new Date().toISOString().slice(0, 10)}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="panel" style={{ padding: 20, marginBottom: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 4, flexWrap: 'wrap' }}>
+        <h3 style={{ margin: 0 }}>Security Events</h3>
+        <button type="button" className="btn btn-ghost btn-sm" onClick={downloadCsv} disabled={!events || events.length === 0}>
+          Export CSV
+        </button>
+      </div>
+      <p className="auth-sub" style={{ margin: '0 0 16px' }}>
+        Logins, logouts, password resets, access-denied attempts, and account/role/grade changes across every
+        organization — most recent {events?.length ?? '…'} shown.
+      </p>
+
+      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 16 }}>
+        <select value={eventTypeFilter} onChange={(e) => setEventTypeFilter(e.target.value)} style={{ minWidth: 160 }}>
+          <option value="">All event types</option>
+          {eventTypes.map((t) => <option key={t} value={t}>{t}</option>)}
+        </select>
+        <select value={orgFilter} onChange={(e) => setOrgFilter(e.target.value)} style={{ minWidth: 180 }}>
+          <option value="">All organizations</option>
+          {(orgs || []).map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
+        </select>
+        <input
+          placeholder="Actor email contains…"
+          value={actorEmailFilter}
+          onChange={(e) => setActorEmailFilter(e.target.value)}
+          style={{ minWidth: 200 }}
+        />
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+          From
+          <input type="date" value={fromFilter} onChange={(e) => setFromFilter(e.target.value)} />
+        </label>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 }}>
+          To
+          <input type="date" value={toFilter} onChange={(e) => setToFilter(e.target.value)} />
+        </label>
+      </div>
+
+      {error && <div className="alert" style={{ marginBottom: 16 }}><span className="alert-icon">!</span><span>{error}</span></div>}
+      {loading && <p className="sb-loading">Loading…</p>}
+      {!loading && events && events.length === 0 && <p className="sb-loading">No events match.</p>}
+
+      {!loading && events && events.length > 0 && (
+        <div className="admin-table-wrap">
+          <table className="admin-table">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Event</th>
+                <th>Actor</th>
+                <th>Organization</th>
+                <th>IP address</th>
+                <th aria-label="Detail" />
+              </tr>
+            </thead>
+            <tbody>
+              {events.map((e) => (
+                <Fragment key={e.id}>
+                  <tr>
+                    <td style={{ whiteSpace: 'nowrap' }}>{formatDate(e.created_at)}</td>
+                    <td><span className={`chip ${securityEventClass(e.event_type)}`}><span className="dot" />{e.event_type}</span></td>
+                    <td className="admin-cell-strong">
+                      {e.actor_email || <span style={{ color: 'var(--text-dim)', fontWeight: 400 }}>—</span>}
+                      {e.actor_role && <div style={{ color: 'var(--text-dim)', fontSize: '12px', fontWeight: 400 }}>{e.actor_role}</div>}
+                    </td>
+                    <td>{e.organization_name || '—'}</td>
+                    <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12.5 }}>{e.ip_address || '—'}</td>
+                    <td className="admin-cell-actions">
+                      {e.detail && (
+                        <button type="button" className="btn btn-ghost btn-sm" onClick={() => setExpandedId(expandedId === e.id ? null : e.id)}>
+                          {expandedId === e.id ? 'Hide' : 'Detail'}
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                  {expandedId === e.id && (
+                    <tr>
+                      <td colSpan={6} style={{ background: 'var(--surface-2)' }}>
+                        <pre style={{ whiteSpace: 'pre-wrap', margin: '8px 0', fontFamily: 'var(--font-mono)', fontSize: 12.5 }}>
+                          {JSON.stringify(e.detail, null, 2)}
+                        </pre>
+                        {e.user_agent && <p className="auth-sub" style={{ margin: '0 0 8px' }}>User agent: {e.user_agent}</p>}
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </div>
   );

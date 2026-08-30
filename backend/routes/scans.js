@@ -14,6 +14,7 @@ const { gradeCodingAnswer } = require('../lib/examGrading');
 const { jaccardSimilarity, runCodePlagiarismComparator } = require('../lib/plagiarism');
 const { ocrLimit } = require('../lib/examScanPipeline');
 const { scanUpload } = require('../lib/uploads');
+const { logSecurityEvent } = require('../lib/securityEvents');
 const {
   isB2Configured, scanObjectKey, uploadScanPdf, deleteScanPdf, getScanPdfUrl, downloadScanPdf,
 } = require('../storage');
@@ -1060,6 +1061,10 @@ router.put('/api/admin/scan-submissions/:id/grade', authenticateToken, requireAd
 
     if (overallRemarks !== undefined) {
       await pool.query('UPDATE scan_submissions SET overall_remarks = $1 WHERE id = $2', [String(overallRemarks).trim() || null, req.params.id]);
+    }
+
+    if (updates.some((u) => u.marksAwarded !== undefined)) {
+      logSecurityEvent(req, 'grade_overridden', { detail: { kind: 'scan_submission', submissionId: req.params.id, questionsGraded: updates.filter((u) => u.marksAwarded !== undefined).length } });
     }
 
     res.status(200).json({ message: 'Grade saved' });

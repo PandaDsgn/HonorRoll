@@ -131,6 +131,23 @@ async function ensureUsersTosColumn() {
 }
 bootSchemaStep(ensureUsersTosColumn);
 
+// Backs the brute-force lockout in POST /api/login (see that route's own
+// comment): set once this account has racked up LOGIN_FAILURE_THRESHOLD
+// bad-password attempts within the trailing window, cleared implicitly by
+// simply aging past it (every check is `failed_login_lockout_until > now()`,
+// never a separate "is this still active" flag) — no sweep needed to
+// un-lock an account, unlike the security_events retention sweep, which
+// really does need one to actually delete old rows.
+async function ensureUsersFailedLoginLockoutColumn() {
+  await ensureUsersSchema();
+  try {
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_lockout_until TIMESTAMPTZ');
+  } catch (err) {
+    console.error('Failed to ensure users.failed_login_lockout_until:', err);
+  }
+}
+bootSchemaStep(ensureUsersFailedLoginLockoutColumn);
+
 // The other founding table nothing ever created — same gap as `users`
 // (see ensureUsersSchema's own comment): every ALTER-column function below
 // (org/subject/submission_mode/time_limit) and everything that joins
@@ -1557,6 +1574,161 @@ async function ensureExamsSubjectColumn() {
 }
 bootSchemaStep(ensureExamsSubjectColumn);
 
+// ============================================================================
+// SECURITY EVENTS — append-only audit log backing lib/securityEvents.js's
+// logSecurityEvent(), the in-app SIEM: authentication (login/logout,
+// password reset), authorization denials (403s from requireAdmin/
+// requireAdminOrTeacher/requireSuperadmin), and admin/superadmin actions
+// that touch accounts, roles, or grades. organization_id and actor_user_id
+// are both nullable and ON DELETE SET NULL rather than CASCADE — deleting
+// an org or a user must never silently erase the audit trail of what was
+// done to/by them, which is exactly the record most worth keeping once
+// something is gone. actor_email is stored denormalized alongside
+// actor_user_id for the same reason, and additionally covers events where
+// no user id exists yet at all (a failed login against an email with no
+// account). Superadmin-only surface (GET /api/superadmin/security-events);
+// no per-org admin view exists yet, so no organization_id index beyond the
+// plain btree below is needed today.
+// ============================================================================
+let securityEventsSchemaPromise = null;
+function ensureSecurityEventsSchema() {
+  if (!securityEventsSchemaPromise) {
+    securityEventsSchemaPromise = ensureOrganizationsSchema().then(() => ensureUsersSchema()).then(async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS security_events (
+          id BIGSERIAL PRIMARY KEY,
+          event_type TEXT NOT NULL,
+          actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+          actor_email TEXT,
+          actor_role TEXT,
+          organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL,
+          ip_address TEXT,
+          user_agent TEXT,
+          detail JSONB,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `);
+      // created_at DESC first — every read path (the audit-log table, CSV
+      // export) lists newest-first with optional event_type/organization_id
+      // filters layered on top, never the other two alone.
+      await pool.query('CREATE INDEX IF NOT EXISTS security_events_created_at_idx ON security_events(created_at DESC)');
+      await pool.query('CREATE INDEX IF NOT EXISTS security_events_event_type_idx ON security_events(event_type)');
+      await pool.query('CREATE INDEX IF NOT EXISTS security_events_organization_id_idx ON security_events(organization_id)');
+    }).catch((err) => console.error('Failed to ensure security_events schema:', err));
+  }
+  return securityEventsSchemaPromise;
+}
+bootSchemaStep(ensureSecurityEventsSchema);
+
+// ============================================================================
+// GEO LOCATIONS — a pure IP->place cache backing lib/geoip.js's
+// lookupIpLocation(). Every IP is sent to ip-api.com's free tier AT MOST
+// ONCE, ever; every later login from that same IP (the overwhelmingly
+// common case — most people log in from a small handful of networks)
+// reads this table instead of making another external call. No expiry/
+// refresh on purpose: an IP's rough geographic location is effectively
+// static for this app's purposes (the superadmin login-map globe), so a
+// stale-but-still-correct cache entry is never actually wrong in a way
+// that matters here.
+// ============================================================================
+let geoLocationsSchemaPromise = null;
+function ensureGeoLocationsSchema() {
+  if (!geoLocationsSchemaPromise) {
+    geoLocationsSchemaPromise = pool.query(`
+      CREATE TABLE IF NOT EXISTS geo_locations (
+        ip_address TEXT PRIMARY KEY,
+        country TEXT,
+        country_code TEXT,
+        city TEXT,
+        lat DOUBLE PRECISION,
+        lon DOUBLE PRECISION,
+        fetched_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `).catch((err) => console.error('Failed to ensure geo_locations schema:', err));
+  }
+  return geoLocationsSchemaPromise;
+}
+bootSchemaStep(ensureGeoLocationsSchema);
+
+// ============================================================================
+// LOGIN LOCATIONS — one row per successful login, carrying that login's
+// resolved geo_locations lookup (see lib/geoip.js). Backs GET /api/
+// superadmin/login-map's globe: "generally" is computed as the most
+// frequent (country, city) among a person's own rows here; "last" is
+// simply the newest row. role/organization_id are captured at login time
+// (not re-joined from memberships later) because a person's role/org can
+// legitimately change after the fact — this is a historical record of
+// what was true THEN, same reasoning as security_events' own denormalized
+// actor_role. Pruned by the same retention sweep as security_events (see
+// lib/securityEvents.js) — the globe is a "where has activity actually
+// been recently" view, not a permanent location history.
+// ============================================================================
+let loginLocationsSchemaPromise = null;
+function ensureLoginLocationsSchema() {
+  if (!loginLocationsSchemaPromise) {
+    loginLocationsSchemaPromise = ensureUsersSchema().then(() => ensureOrganizationsSchema()).then(async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS login_locations (
+          id BIGSERIAL PRIMARY KEY,
+          user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          organization_id INTEGER REFERENCES organizations(id) ON DELETE SET NULL,
+          role TEXT,
+          ip_address TEXT,
+          country TEXT,
+          country_code TEXT,
+          city TEXT,
+          lat DOUBLE PRECISION,
+          lon DOUBLE PRECISION,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `);
+      await pool.query('CREATE INDEX IF NOT EXISTS login_locations_user_id_created_at_idx ON login_locations(user_id, created_at DESC)');
+      await pool.query('CREATE INDEX IF NOT EXISTS login_locations_organization_id_idx ON login_locations(organization_id)');
+      await pool.query('CREATE INDEX IF NOT EXISTS login_locations_created_at_idx ON login_locations(created_at)');
+    }).catch((err) => console.error('Failed to ensure login_locations schema:', err));
+  }
+  return loginLocationsSchemaPromise;
+}
+bootSchemaStep(ensureLoginLocationsSchema);
+
+// ============================================================================
+// TRUSTED DEVICES — backs the new-device OTP step-up in POST /api/login
+// (see that route's own comment). device_id is a random token the
+// frontend generates once and persists in localStorage (see config.js's
+// counterpart) — there's no way to derive "this is the same device" from
+// IP/user-agent alone (IPs rotate constantly on mobile networks; a
+// spoofed user-agent proves nothing), so identity here is exactly as
+// strong as "this browser still has that localStorage value," which is
+// the same trust model every "remember this device" flow relies on.
+// trusted_until is a SLIDING window — extended forward by 30 days on
+// every trusted login (see the UPDATE in POST /api/login), not fixed at
+// creation — so an actively-used trusted device never suddenly expires
+// mid-use, only a genuinely abandoned one does.
+// ============================================================================
+let trustedDevicesSchemaPromise = null;
+function ensureTrustedDevicesSchema() {
+  if (!trustedDevicesSchemaPromise) {
+    trustedDevicesSchemaPromise = ensureUsersSchema().then(async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS trusted_devices (
+          id SERIAL PRIMARY KEY,
+          user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          device_id TEXT NOT NULL,
+          trusted_until TIMESTAMPTZ NOT NULL,
+          user_agent TEXT,
+          ip_address TEXT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          last_used_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          UNIQUE(user_id, device_id)
+        )
+      `);
+      await pool.query('CREATE INDEX IF NOT EXISTS trusted_devices_user_id_device_id_idx ON trusted_devices(user_id, device_id)');
+    }).catch((err) => console.error('Failed to ensure trusted_devices schema:', err));
+  }
+  return trustedDevicesSchemaPromise;
+}
+bootSchemaStep(ensureTrustedDevicesSchema);
+
 module.exports = {
   ensureAddAdminRequestsSchema,
   ensureAdminRequestsSchema,
@@ -1566,9 +1738,11 @@ module.exports = {
   ensureExamSchemaImpl,
   ensureExamSubmissionSchema,
   ensureExamsSubjectColumn,
+  ensureGeoLocationsSchema,
   ensureGradeBandsSchema,
   ensureJudgeDataSchema,
   ensureLegacyScoresSchema,
+  ensureLoginLocationsSchema,
   ensureMembershipActivePhotoColumn,
   ensureMembershipRollNumberColumn,
   ensureMembershipsSchema,
@@ -1595,13 +1769,16 @@ module.exports = {
   ensureScanSubmissionPenalizedColumn,
   ensureScanSubmissionProcessingStartedColumn,
   ensureScanSubmissionsSchema,
+  ensureSecurityEventsSchema,
   ensureSubjectsSchema,
   ensureSubmissionPlagiarismFlagsSchema,
   ensureSubscriptionsSchema,
   ensureTagVisibilitySchema,
   ensureTimeLimitColumn,
   ensureTimeTrackingSchema,
+  ensureTrustedDevicesSchema,
   ensureUserPhotosSchema,
+  ensureUsersFailedLoginLockoutColumn,
   ensureUsersNameColumn,
   ensureUsersOrgColumn,
   ensureUsersSchema,

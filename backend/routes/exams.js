@@ -23,6 +23,7 @@ const {
 const { ocrLimit, examScanOcrInFlight, processOneExamScanAttempt } = require('../lib/examScanPipeline');
 const { isB2Configured, examScanObjectKey, uploadScanPdf, getScanPdfUrl, deleteScanPdf } = require('../storage');
 const { scanUpload } = require('../lib/uploads');
+const { logSecurityEvent } = require('../lib/securityEvents');
 
 
 
@@ -1115,6 +1116,7 @@ router.put('/api/admin/exam-answers/:answerId/grade', authenticateToken, require
         return res.status(400).json({ error: `Marks must be between 0 and ${answer.marks}` });
       }
       await pool.query('UPDATE exam_answers SET marks_awarded = $1 WHERE id = $2', [Math.round(marksAwarded), answer.id]);
+      logSecurityEvent(req, 'grade_overridden', { detail: { kind: 'exam_answer', answerId: answer.id, attemptId: answer.attempt_id, marksAwarded: Math.round(marksAwarded) } });
     }
 
     if (req.body.remarks !== undefined) {
@@ -1157,6 +1159,7 @@ router.put('/api/admin/exam-scan-answers/:answerId/grade', authenticateToken, re
         return res.status(400).json({ error: `Marks must be between 0 and ${answer.marks}` });
       }
       await pool.query('UPDATE exam_scan_answers SET marks_awarded = $1 WHERE id = $2', [Math.round(marksAwarded), answer.id]);
+      logSecurityEvent(req, 'grade_overridden', { detail: { kind: 'exam_scan_answer', answerId: answer.id, attemptId: answer.attempt_id, marksAwarded: Math.round(marksAwarded) } });
     }
 
     if (req.body.remarks !== undefined) {

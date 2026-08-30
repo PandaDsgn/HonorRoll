@@ -18,6 +18,7 @@ const { pool } = require('../lib/db');
 const { authenticateToken, requireSuperadmin, applySuperadminOrgOverride, mintSessionToken } = require('../lib/auth');
 const { PLAN_CATALOG, BILLING_CYCLES } = require('../lib/billing');
 const { findOrCreateGlobalUser } = require('../lib/misc');
+const { logSecurityEvent } = require('../lib/securityEvents');
 const { sendEmail } = require('../mailer');
 
 // ============================================================================
@@ -95,6 +96,7 @@ function makeSetOrgStatusRoute(status, actionLabel) {
       const actorRes = await pool.query('SELECT email FROM users WHERE id = $1', [req.user.userId]);
       const org = await setOrganizationStatus(req.params.id, status, actorRes.rows[0]?.email || 'superadmin');
       if (!org) return res.status(404).json({ error: 'Organization not found' });
+      logSecurityEvent(req, 'org_status_changed', { organizationId: org.id, detail: { organizationName: org.name, newStatus: status, action: actionLabel } });
       res.status(200).json({ organization: org });
     } catch (err) {
       console.error(`Superadmin ${actionLabel} organization error:`, err);
@@ -298,6 +300,7 @@ router.delete('/api/superadmin/organizations/:id', authenticateToken, requireSup
       client.release();
     }
 
+    logSecurityEvent(req, 'org_deleted', { organizationId: orgId, detail: { organizationName: org.name } });
     res.status(200).json({ message: `${org.name} and all its data have been permanently deleted. A full export was emailed to ${recipients.join(', ')}.` });
   } catch (err) {
     console.error('Superadmin delete organization error:', err);
@@ -628,6 +631,10 @@ router.post('/api/superadmin/add-admin-requests/:id/approve', authenticateToken,
       [req.user.userId, note, req.params.id]
     );
     await client.query('COMMIT');
+    logSecurityEvent(req, 'admin_granted', {
+      organizationId: request.organization_id,
+      detail: { targetUserId: addResult.userId, email: request.new_admin_email, via: 'add_admin_request' },
+    });
 
     await sendAddAdminEmail({
       email: request.new_admin_email, name: request.new_admin_name, organizationName: request.organization_name, ...addResult,
@@ -759,6 +766,7 @@ router.delete('/api/superadmin/organizations/:orgId/members/:userId', authentica
       [userId]
     );
     await client.query('COMMIT');
+    logSecurityEvent(req, 'member_removed', { organizationId: orgId, detail: { targetUserId: userId, email, role } });
     res.status(200).json({ message: `${email} (${role}) was removed from this organization` });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -786,6 +794,10 @@ router.post('/api/superadmin/organizations/:orgId/admins', authenticateToken, re
     await client.query('BEGIN');
     const addResult = await addAdminToOrganization(client, req.params.orgId, email, name);
     await client.query('COMMIT');
+    logSecurityEvent(req, 'admin_granted', {
+      organizationId: req.params.orgId,
+      detail: { targetUserId: addResult.userId, email, via: 'direct' },
+    });
 
     await sendAddAdminEmail({ email, name, organizationName: orgRes.rows[0].name, ...addResult });
     res.status(200).json({ userId: addResult.userId, isNew: addResult.isNew });
@@ -827,10 +839,176 @@ router.post('/api/superadmin/organizations/:orgId/billing/override', authenticat
        RETURNING *`,
       [req.params.orgId, planKey, status, billingCycle, currentPeriodEnd]
     );
+    logSecurityEvent(req, 'billing_overridden', { organizationId: req.params.orgId, detail: { planKey, status, billingCycle } });
     res.status(200).json({ subscription: result.rows[0] });
   } catch (err) {
     console.error('Superadmin billing override error:', err);
     res.status(500).json({ error: 'Failed to override billing' });
+  }
+});
+
+// ============================================================================
+// SECURITY EVENTS — read side of the in-app SIEM (see lib/securityEvents.js
+// for the write side and schema/index.js's ensureSecurityEventsSchema for
+// the table). Superadmin-only: this is a platform-wide audit trail across
+// every organization, not a per-org admin feature. Filters are all
+// optional and combine with AND; `eventTypes` is returned alongside the
+// rows so the frontend's filter dropdown always lists every type that's
+// ever actually been logged, not just whatever happens to be on the
+// current filtered/paginated page.
+// ============================================================================
+router.get('/api/superadmin/security-events', authenticateToken, requireSuperadmin, async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), 1000);
+  const conditions = [];
+  const params = [];
+
+  if (req.query.eventType) {
+    params.push(req.query.eventType);
+    conditions.push(`event_type = $${params.length}`);
+  }
+  if (req.query.organizationId) {
+    params.push(Number(req.query.organizationId));
+    conditions.push(`organization_id = $${params.length}`);
+  }
+  if (req.query.actorEmail) {
+    params.push(`%${req.query.actorEmail}%`);
+    conditions.push(`actor_email ILIKE $${params.length}`);
+  }
+  if (req.query.from) {
+    params.push(new Date(req.query.from));
+    conditions.push(`created_at >= $${params.length}`);
+  }
+  if (req.query.to) {
+    params.push(new Date(req.query.to));
+    conditions.push(`created_at <= $${params.length}`);
+  }
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  try {
+    params.push(limit);
+    const result = await pool.query(
+      `SELECT se.id, se.event_type, se.actor_user_id, se.actor_email, se.actor_role,
+              se.organization_id, o.name AS organization_name, se.ip_address, se.user_agent,
+              se.detail, se.created_at
+       FROM security_events se
+       LEFT JOIN organizations o ON o.id = se.organization_id
+       ${whereClause}
+       ORDER BY se.created_at DESC
+       LIMIT $${params.length}`,
+      params
+    );
+    const eventTypesRes = await pool.query('SELECT DISTINCT event_type FROM security_events ORDER BY event_type');
+    res.status(200).json({
+      events: result.rows,
+      eventTypes: eventTypesRes.rows.map((r) => r.event_type),
+      limit,
+    });
+  } catch (err) {
+    console.error('Superadmin list security events error:', err);
+    res.status(500).json({ error: 'Failed to load security events' });
+  }
+});
+
+// ============================================================================
+// LOGIN MAP — feeds the superadmin dashboard's globe: where every person
+// (and every institution as a whole) logs in from. "General" is that
+// person's/institution's single most-frequent (country, city) across
+// their own login_locations history (see that table's own comment in
+// schema/index.js — bounded by the same 90-day retention as security_
+// events, so this is "recent normal," not "all-time"); "last" is simply
+// their most recent login. isAnomaly is true exactly when those two
+// differ — the frontend only needs to actually SHOW the last-login pin
+// instead of the general one when this is true (see this feature's own
+// design conversation for why: showing "last" every single time would
+// bury the one signal — an unusual location — under everyone's ordinary
+// day-to-day noise).
+// ============================================================================
+router.get('/api/superadmin/login-map', authenticateToken, requireSuperadmin, async (req, res) => {
+  try {
+    const peopleRes = await pool.query(`
+      WITH ranked_general AS (
+        SELECT user_id, organization_id, role, country, country_code, city, lat, lon,
+               COUNT(*) AS cnt,
+               ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY COUNT(*) DESC, MAX(created_at) DESC) AS rn
+        FROM login_locations
+        WHERE lat IS NOT NULL
+        GROUP BY user_id, organization_id, role, country, country_code, city, lat, lon
+      ),
+      general AS (
+        SELECT * FROM ranked_general WHERE rn = 1
+      ),
+      ranked_last AS (
+        SELECT ll.*, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at DESC) AS rn
+        FROM login_locations ll
+        WHERE lat IS NOT NULL
+      ),
+      last_login AS (
+        SELECT * FROM ranked_last WHERE rn = 1
+      )
+      SELECT
+        u.id AS user_id, u.email, u.name,
+        last_login.role, last_login.organization_id, o.name AS organization_name,
+        general.country AS general_country, general.city AS general_city,
+        general.lat AS general_lat, general.lon AS general_lon,
+        last_login.country AS last_country, last_login.city AS last_city,
+        last_login.lat AS last_lat, last_login.lon AS last_lon, last_login.created_at AS last_login_at
+      FROM last_login
+      JOIN users u ON u.id = last_login.user_id
+      JOIN general ON general.user_id = last_login.user_id
+      LEFT JOIN organizations o ON o.id = last_login.organization_id
+    `);
+
+    const people = peopleRes.rows.map((r) => {
+      const generalLocation = { country: r.general_country, city: r.general_city, lat: r.general_lat, lon: r.general_lon };
+      const lastLocation = { country: r.last_country, city: r.last_city, lat: r.last_lat, lon: r.last_lon };
+      const isAnomaly = r.general_city !== r.last_city || r.general_country !== r.last_country;
+      return {
+        userId: r.user_id, email: r.email, name: r.name,
+        role: r.role, organizationId: r.organization_id, organizationName: r.organization_name,
+        generalLocation, lastLocation, isAnomaly,
+        displayLocation: isAnomaly ? lastLocation : generalLocation,
+        lastLoginAt: r.last_login_at,
+      };
+    });
+
+    const orgRes = await pool.query(`
+      WITH org_general AS (
+        SELECT organization_id, country, city, lat, lon, COUNT(*) AS cnt,
+               ROW_NUMBER() OVER (PARTITION BY organization_id ORDER BY COUNT(*) DESC) AS rn
+        FROM login_locations
+        WHERE lat IS NOT NULL AND organization_id IS NOT NULL
+        GROUP BY organization_id, country, city, lat, lon
+      ),
+      org_last AS (
+        SELECT DISTINCT ON (organization_id) organization_id, country, city, lat, lon, created_at
+        FROM login_locations
+        WHERE lat IS NOT NULL AND organization_id IS NOT NULL
+        ORDER BY organization_id, created_at DESC
+      )
+      SELECT o.id AS organization_id, o.name AS organization_name,
+             g.country AS general_country, g.city AS general_city, g.lat AS general_lat, g.lon AS general_lon,
+             l.country AS last_country, l.city AS last_city, l.lat AS last_lat, l.lon AS last_lon, l.created_at AS last_login_at
+      FROM organizations o
+      JOIN org_general g ON g.organization_id = o.id AND g.rn = 1
+      LEFT JOIN org_last l ON l.organization_id = o.id
+    `);
+
+    const institutions = orgRes.rows.map((r) => {
+      const generalLocation = { country: r.general_country, city: r.general_city, lat: r.general_lat, lon: r.general_lon };
+      const lastLocation = { country: r.last_country, city: r.last_city, lat: r.last_lat, lon: r.last_lon };
+      const isAnomaly = r.last_city != null && (r.general_city !== r.last_city || r.general_country !== r.last_country);
+      return {
+        organizationId: r.organization_id, organizationName: r.organization_name,
+        generalLocation, lastLocation, isAnomaly,
+        displayLocation: isAnomaly ? lastLocation : generalLocation,
+        lastLoginAt: r.last_login_at,
+      };
+    });
+
+    res.status(200).json({ people, institutions });
+  } catch (err) {
+    console.error('Superadmin login-map error:', err);
+    res.status(500).json({ error: 'Failed to load login map' });
   }
 });
 

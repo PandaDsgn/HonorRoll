@@ -20,6 +20,7 @@ const {
 } = require('../lib/performance');
 const { checkStudentCap } = require('../lib/billing');
 const { findOrCreateGlobalUser, sendStudentWelcomeEmail } = require('../lib/misc');
+const { logSecurityEvent } = require('../lib/securityEvents');
 const { isB2Configured, orgLogoObjectKey, uploadScanPdf, getScanPdfUrl } = require('../storage');
 const { avatarUpload, csvUpload } = require('../lib/uploads');
 const { sendEmail } = require('../mailer');
@@ -179,6 +180,7 @@ router.post('/api/admin/create-student', authenticateToken, requireAdmin, async 
       await sendStudentWelcomeEmail(email, name, orgRes.rows[0].name, temporaryPassword);
     }
 
+    logSecurityEvent(req, 'student_created', { detail: { studentUserId: userId, email, isNewAccount: isNew } });
     const student = { id: userId, email, name: name || null, role: 'student' };
     if (isNew) {
       res.status(201).json({ message: 'Student account created successfully — credentials emailed to them', student, temporaryPassword });
@@ -239,6 +241,7 @@ router.post('/api/admin/create-teacher', authenticateToken, requireAdmin, async 
 
     await client.query('COMMIT');
 
+    logSecurityEvent(req, 'teacher_created', { detail: { teacherUserId: userId, email, isNewAccount: isNew } });
     const teacher = { id: userId, email, name: name || null, role: 'teacher' };
     if (isNew) {
       res.status(201).json({ message: 'Teacher account created successfully', teacher, temporaryPassword });
@@ -320,6 +323,7 @@ router.put('/api/admin/teachers/:id', authenticateToken, requireAdmin, async (re
        WHERE u.id = $1 AND m.organization_id = $2`,
       [teacherId, req.user.organizationId]
     );
+    logSecurityEvent(req, 'teacher_updated', { detail: { teacherUserId: teacherId, fields: { name: name !== undefined, orgUnitId: orgUnitId !== undefined } } });
     res.status(200).json({ teacher: result.rows[0] });
   } catch (err) {
     console.error('Update teacher error:', err);
@@ -437,6 +441,7 @@ router.post('/api/admin/teachers/csv-import', authenticateToken, requireAdmin, c
   }
 
   results.unitsCreated = [...seenCreatedUnits];
+  logSecurityEvent(req, 'teacher_bulk_import', { detail: { created: results.created, existingAdded: results.existingAdded, errors: results.errors.length } });
   res.status(200).json(results);
 });
 
@@ -580,6 +585,7 @@ router.post('/api/admin/students/csv-import', authenticateToken, requireAdmin, c
   await Promise.allSettled(newAccounts.map((a) => sendStudentWelcomeEmail(a.email, a.name, orgRes.rows[0].name, a.temporaryPassword)));
 
   results.unitsCreated = [...seenCreatedUnits];
+  logSecurityEvent(req, 'student_bulk_import', { detail: { created: results.created, existingAdded: results.existingAdded, errors: results.errors.length } });
   res.status(200).json(results);
 });
 
@@ -1572,6 +1578,9 @@ router.put('/api/admin/students/:id', authenticateToken, requireAdmin, async (re
        WHERE u.id = $1`,
       [studentId, req.user.organizationId]
     );
+    logSecurityEvent(req, 'student_updated', {
+      detail: { studentUserId: studentId, fields: { name: name !== undefined, orgUnitId: orgUnitId !== undefined, rollNumber: rollNumber !== undefined } },
+    });
     res.status(200).json({ message: 'Student updated', student: updated.rows[0] });
   } catch (err) {
     console.error('Update student error:', err);
@@ -1621,6 +1630,7 @@ router.delete('/api/admin/students/:id', authenticateToken, requireAdmin, async 
     );
 
     await client.query('COMMIT');
+    logSecurityEvent(req, 'student_removed', { detail: { studentUserId: studentId, email: target.rows[0].email } });
     res.status(200).json({ message: `${target.rows[0].email} was removed from the platform` });
   } catch (error) {
     await client.query('ROLLBACK');

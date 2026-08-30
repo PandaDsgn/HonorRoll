@@ -3,6 +3,7 @@
 // any function's behavior changed, only where it lives.
 const jwt = require('jsonwebtoken');
 const { pool } = require('./db');
+const { logSecurityEvent } = require('./securityEvents');
 
 /**
  * Verifies the JWT cookie set at login and attaches { userId, role } to req.user.
@@ -69,6 +70,7 @@ function applySuperadminOrgOverride(req) {
 
 function requireAdmin(req, res, next) {
   if (req.user?.role !== 'admin' && !applySuperadminOrgOverride(req)) {
+    logSecurityEvent(req, 'access_denied', { detail: { requiredRole: 'admin', path: req.originalUrl, method: req.method } });
     return res.status(403).json({ error: 'Admin access required' });
   }
   next();
@@ -81,6 +83,7 @@ function requireAdmin(req, res, next) {
 // below), not by this middleware alone.
 function requireAdminOrTeacher(req, res, next) {
   if (req.user?.role !== 'admin' && req.user?.role !== 'teacher' && !applySuperadminOrgOverride(req)) {
+    logSecurityEvent(req, 'access_denied', { detail: { requiredRole: 'admin_or_teacher', path: req.originalUrl, method: req.method } });
     return res.status(403).json({ error: 'Admin or teacher access required' });
   }
   next();
@@ -101,6 +104,7 @@ function getSuperadminEmails() {
 
 function requireSuperadmin(req, res, next) {
   if (req.user?.role !== 'superadmin') {
+    logSecurityEvent(req, 'access_denied', { detail: { requiredRole: 'superadmin', path: req.originalUrl, method: req.method } });
     return res.status(403).json({ error: 'Superadmin access required' });
   }
   next();

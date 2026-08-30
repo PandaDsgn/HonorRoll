@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const { pool } = require('../lib/db');
 const { DENYLISTED_EMAIL_DOMAINS, requirePlatformSecret } = require('../lib/auth');
 const { createOrganizationWithDefaults } = require('../lib/org');
+const { logSecurityEvent } = require('../lib/securityEvents');
 const { sendEmail } = require('../mailer');
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
@@ -111,6 +112,10 @@ router.post('/api/organizations/signup', async (req, res) => {
     );
 
     await client.query('COMMIT');
+    logSecurityEvent(req, 'organization_signup', {
+      actorUserId: userId, actorEmail: email, actorRole: 'admin', organizationId: org.id,
+      detail: { organizationName: org.name },
+    });
 
     // Admin can log in immediately and start building their org structure
     // while verification/approval is pending — see the status check inside
