@@ -71,18 +71,6 @@ export default function LoginMapGlobe() {
     return () => window.removeEventListener('resize', updateSize);
   }, []);
 
-  // A slow, subtle auto-rotate — enough to read as "a living globe" at a
-  // glance without spinning so fast hovering a point becomes a moving
-  // target. Stops the instant someone drags to look around (react-globe.
-  // gl's own OrbitControls behavior), so it never fights a superadmin
-  // actually trying to inspect something.
-  useEffect(() => {
-    if (!globeRef.current) return;
-    const controls = globeRef.current.controls();
-    controls.autoRotate = true;
-    controls.autoRotateSpeed = 0.4;
-  }, [data]);
-
   const points = useMemo(() => {
     if (!data) return [];
     const institutionPoints = data.institutions.map((o) => toPoint(o, { color: INSTITUTION_COLOR, kind: 'institution' })).filter(Boolean);
@@ -138,33 +126,35 @@ export default function LoginMapGlobe() {
       </div>
 
       {error && <div className="alert" style={{ marginBottom: 12 }}><span className="alert-icon">!</span><span>{error}</span></div>}
-      {!error && !data && <p className="sb-loading">Loading login map…</p>}
       {!error && data && points.length === 0 && (
-        <p className="sb-loading">No geolocated logins yet — the map fills in as people sign in.</p>
+        <p className="sb-loading" style={{ marginBottom: 12 }}>No geolocated logins yet — the map fills in as people sign in.</p>
       )}
 
+      {/* The globe itself renders unconditionally — it's the map, not a
+          per-login visual, so it has no reason to wait for data (or for
+          the fetch above to even finish) before showing up. pointsData/
+          ringsData are simply empty arrays until login-map data arrives,
+          same globe either way. */}
       <div ref={containerRef} style={{ width: '100%' }}>
-        {points.length > 0 && (
-          <Globe
-            ref={globeRef}
-            width={size.width}
-            height={size.height}
-            backgroundColor="rgba(0,0,0,0)"
-            globeImageUrl="//unpkg.com/three-globe/example/img/earth-blue-marble.jpg"
-            bumpImageUrl="//unpkg.com/three-globe/example/img/earth-topology.png"
-            pointsData={points}
-            pointColor="color"
-            pointAltitude={0.012}
-            pointRadius={0.35}
-            pointLabel="label"
-            onPointClick={handlePointClick}
-            ringsData={anomalyRings}
-            ringColor={() => (t) => `rgba(255, 90, 90, ${1 - t})`}
-            ringMaxRadius={2.2}
-            ringPropagationSpeed={1.5}
-            ringRepeatPeriod={1400}
-          />
-        )}
+        <Globe
+          ref={globeRef}
+          width={size.width}
+          height={size.height}
+          backgroundColor="rgba(0,0,0,0)"
+          globeImageUrl="//unpkg.com/three-globe/example/img/earth-blue-marble.jpg"
+          bumpImageUrl="//unpkg.com/three-globe/example/img/earth-topology.png"
+          pointsData={points}
+          pointColor="color"
+          pointAltitude={0.012}
+          pointRadius={0.35}
+          pointLabel="label"
+          onPointClick={handlePointClick}
+          ringsData={anomalyRings}
+          ringColor={() => (t) => `rgba(255, 90, 90, ${1 - t})`}
+          ringMaxRadius={2.2}
+          ringPropagationSpeed={1.5}
+          ringRepeatPeriod={1400}
+        />
       </div>
 
       {selected && (

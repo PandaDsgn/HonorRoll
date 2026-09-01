@@ -17,23 +17,35 @@ const { pool, bootSchemaStep } = require('./lib/db');
 require('./schema');
 
 const app = express();
-// Without this, req.ip (what rateLimiter.js keys every limit on) is always
-// the DIRECT TCP peer — which, once this sits behind the nginx load
-// balancer in docker-compose.yml/nginx.conf, is nginx's own container IP
-// on every single request, for every user. That collapses every visitor
-// into one shared rate-limit bucket: one busy legitimate user can lock
-// everyone else out, and an attacker gets the SAME 10-attempts-per-15-min
-// budget as the entire rest of the platform combined instead of their own.
-// `1` trusts exactly one hop — the immediate connecting proxy — matching
-// this deployment's actual topology (browser -> nginx -> this app, nothing
-// else in between). Express then reads the real client IP as the last
-// entry nginx's own $proxy_add_x_forwarded_for appended, and does NOT
-// trust anything further back that a client could have forged in an
-// X-Forwarded-For header of their own. Harmless with no proxy in front
-// (e.g. hitting this directly on localhost in dev) — there's simply
-// nothing at that one trusted hop to read a header from, so req.ip falls
-// back to the direct connection either way.
-app.set('trust proxy', 1);
+// Without this, req.ip (what rateLimiter.js keys every limit on, and what
+// lib/geoip.js's login-map geolocation resolves) is always the DIRECT TCP
+// peer — which, once this sits behind ANY reverse proxy, is the proxy's
+// own address on every single request, for every user. That collapses
+// every visitor into one shared rate-limit bucket (one busy legitimate
+// user can lock everyone else out, and an attacker gets the SAME
+// 10-attempts-per-15-min budget as the entire rest of the platform
+// combined instead of their own) and makes every login's geolocation
+// resolve to wherever the proxy happens to run, not the actual visitor.
+//
+// A fixed hop count (e.g. `1`, matching the docker-compose nginx setup's
+// single-proxy topology) breaks the moment the real topology has a
+// DIFFERENT number of hops — which is exactly what happened on Render:
+// its own edge/internal routing adds more than one hop, so `trust proxy:
+// 1` was reading an address still one hop short of the real client — a
+// private Render-internal address (10.x.x.x), not the visitor's public
+// IP. `'loopback, linklocal, uniquelocal'` fixes this for ANY number of
+// private-network hops in front of the app: it walks the X-Forwarded-For
+// chain from the app backwards, trusting each entry only while it's a
+// loopback/link-local/RFC1918-private address (which every hop of Render's
+// own infrastructure genuinely is), and stops — using that address as
+// req.ip — at the first entry that ISN'T, which is the real public client.
+// A spoofed X-Forwarded-For from an actual attacker can't forge its way
+// into this trust boundary either: their own IP is never in a private
+// range, so it can never masquerade as one of the trusted internal hops.
+// Harmless with no proxy in front too (e.g. hitting this directly on
+// localhost in dev) — nothing there is a private-range hop to trust past,
+// so req.ip just falls back to the direct connection either way.
+app.set('trust proxy', 'loopback, linklocal, uniquelocal');
 // The `verify` callback stashes the raw request-body bytes on req.rawBody —
 // needed by the Razorpay webhook route to check X-Razorpay-Signature, which
 // must be computed over the exact raw bytes Razorpay sent, not a

@@ -1,5 +1,3 @@
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
-
 /* ---------- tokens ---------- */
 :root {
   --bg: #0b0d0e;
@@ -45,9 +43,20 @@
   --blue: #3b82f6;
   --blue-dim: rgba(59, 130, 246, 0.15);
 
-  /* Apple Font Stacks */
-  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", Arial, sans-serif;
-  --font-mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Consolas, monospace;
+  /* Apple font stacks, exclusively — -apple-system/BlinkMacSystemFont
+     resolve to San Francisco on macOS/iOS/iPadOS; "SF Pro Text"/"SF Pro
+     Display" are named explicitly for the rare case a browser doesn't
+     recognize the system-font keyword but the font itself is still
+     installed. No Helvetica Neue/Arial/Consolas fallback beyond that on
+     purpose — those are real fonts with their own identity (Linotype's
+     and Microsoft's respectively), not Apple's, so naming them here would
+     mean "we chose Helvetica" rather than "we use Apple's font." Whatever
+     comes after SF Pro is a GENERIC keyword (system-ui/monospace) that
+     resolves to each OS's own native font, never a specific non-Apple
+     typeface named by this app. Menlo is the one exception on the mono
+     side — it ships as part of macOS itself, unlike Consolas (Microsoft). */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, monospace;
 
   --radius: 10px;
   --radius-sm: 6px;

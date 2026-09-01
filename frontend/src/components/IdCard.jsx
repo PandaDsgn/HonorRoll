@@ -1,9 +1,23 @@
 import { useEffect, useRef, useState } from 'react';
 import axios from 'axios';
+import { QRCodeCanvas } from 'qrcode.react';
 import BrandMark from './BrandMark';
 import PhotoPicker from './PhotoPicker';
 import { API } from '../config';
 import '../IdCard.css';
+
+// Same role-to-landing-page mapping as Login.jsx's own landingPathFor —
+// duplicated rather than imported, since that's a page component and this
+// is a shared one; trivial enough to re-derive here rather than add a
+// cross-module dependency for three lines. Scanning this QR is meant for
+// the cardholder's OWN device (see this card's own comment on the QR
+// below) — anyone else scanning it just lands on the sign-in screen,
+// since dashboardUrl carries no token or identifying data of any kind,
+// only a route.
+function landingPathFor(role) {
+  if (role === 'superadmin') return 'superadmin';
+  return role === 'admin' || role === 'teacher' ? 'admin' : 'assignments';
+}
 
 // Renders one institution's digital ID card, fetched from
 // GET /api/me/id-card/:organizationId — and, if the viewer belongs to more
@@ -133,6 +147,18 @@ export default function IdCard({ organizations, initialOrganizationId, onClose }
     ? new Date(data.issuedAt).toLocaleDateString(undefined, { month: 'short', year: 'numeric' }).toUpperCase()
     : '';
 
+  // import.meta.env.BASE_URL is vite.config.js's own `base` ('/HonorRoll/'
+  // in both dev and prod — this app is always served under that path, see
+  // vite.config.js), and the app itself is a HashRouter, so the real route
+  // has to sit after a literal '#/' for React Router to ever see it — a
+  // bare path would just load the SPA shell at "/" and silently ignore the
+  // rest. Points at the role-appropriate dashboard, not any particular
+  // sub-page, so it stays correct even if this card is downloaded once and
+  // scanned months later.
+  const dashboardUrl = data
+    ? `${window.location.origin}${import.meta.env.BASE_URL}#/${landingPathFor(data.role)}`
+    : '';
+
   return (
     <div className="idcard-overlay" role="dialog" aria-modal="true" onClick={(e) => { if (e.target === e.currentTarget) onClose?.(); }}>
       <div className="idcard-modal">
@@ -165,54 +191,77 @@ export default function IdCard({ organizations, initialOrganizationId, onClose }
             <div className="idcard bracket-frame" ref={cardRef}>
               <span className="corner tl" /><span className="corner tr" /><span className="corner bl" /><span className="corner br" />
 
-              <div className="idcard-toprow">
+              <div className="idcard-band">
                 <div className="idcard-brand brand"><BrandMark /></div>
-                <div className="idcard-toprow-meta">
-                  <div className="idcard-toprow-role">{data.role}</div>
-                  <div className="idcard-toprow-issued">Issued {issuedLabel}</div>
-                </div>
+                <div className="idcard-band-role">{data.role}</div>
               </div>
 
-              <div className="idcard-main">
-                <div
-                  className={`idcard-photo-wrap${!data.photoUrl ? ' idcard-photo-wrap-empty' : ''}`}
-                  onClick={() => setPickingPhoto((v) => !v)}
-                  role="button"
-                  tabIndex={0}
-                  aria-label={data.photoUrl ? 'Change photo' : 'Add a photo'}
-                >
-                  {data.photoUrl
-                    ? <img ref={photoImgRef} src={data.photoUrl} alt="" className="idcard-photo" />
-                    : (
-                      <div className="idcard-photo idcard-photo-empty">
-                        <span className="idcard-photo-plus">+</span>
-                        <span>Add photo</span>
-                      </div>
-                    )}
-                </div>
-                <div className="idcard-identity">
-                  <div className="idcard-name">{data.name}</div>
-                  <div className="idcard-handle">{data.email}</div>
-                  <span className="idcard-role-pill">{data.role}</span>
-                </div>
-              </div>
-
-              <div className="idcard-detail-box">
-                <div className="idcard-detail-label">Institution</div>
-                <div className="idcard-detail-value">{data.organizationName}</div>
-                {data.orgUnitName && <div className="idcard-detail-sub">{data.orgUnitName}</div>}
-              </div>
-
-              <div className="idcard-footer-row">
-                <div className="idcard-barcode-wrap">
-                  <div className="idcard-barcode" aria-hidden="true" />
-                  <div className="idcard-barcode-caption">*{data.cardId}*</div>
-                </div>
-                {data.logoUrl && (
-                  <div className="idcard-logo-wrap">
-                    <img ref={logoImgRef} src={data.logoUrl} alt="" className="idcard-org-logo" />
+              <div className="idcard-body">
+                <div className="idcard-main">
+                  <div
+                    className={`idcard-photo-wrap${!data.photoUrl ? ' idcard-photo-wrap-empty' : ''}`}
+                    onClick={() => setPickingPhoto((v) => !v)}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={data.photoUrl ? 'Change photo' : 'Add a photo'}
+                  >
+                    {data.photoUrl
+                      ? <img ref={photoImgRef} src={data.photoUrl} alt="" className="idcard-photo" />
+                      : (
+                        <div className="idcard-photo idcard-photo-empty">
+                          <span className="idcard-photo-plus">+</span>
+                          <span>Add photo</span>
+                        </div>
+                      )}
                   </div>
-                )}
+                  <div className="idcard-identity">
+                    <div className="idcard-name">{data.name}</div>
+                    <div className="idcard-handle">{data.email}</div>
+                  </div>
+                </div>
+
+                <div className="idcard-detail-grid">
+                  <div className="idcard-detail-cell">
+                    <div className="idcard-detail-label">Institution</div>
+                    <div className="idcard-detail-value">{data.organizationName}</div>
+                    {data.orgUnitName && <div className="idcard-detail-sub">{data.orgUnitName}</div>}
+                  </div>
+                  <div className="idcard-detail-cell idcard-detail-cell-right">
+                    <div className="idcard-detail-label">Card ID</div>
+                    <div className="idcard-detail-value idcard-detail-value-mono">{data.cardId}</div>
+                    <div className="idcard-detail-sub">Issued {issuedLabel}</div>
+                  </div>
+                </div>
+
+                <div className="idcard-footer-row">
+                  <div className="idcard-qr-wrap">
+                    {/* size=144 sets the canvas's actual pixel buffer (crisp
+                        on retina displays and in the 2x-scaled PNG export —
+                        handleDownload's own html2canvas scale — instead of
+                        visibly upscaling a 72px-native canvas); the style
+                        override below is what actually displays it at the
+                        wrapper's own 72px box. qrcode.react sets inline
+                        height/width={size} by default, which as an INLINE
+                        style beats .idcard-qr-wrap canvas's own width/
+                        height: 100% rule in the stylesheet — passing style
+                        explicitly here overrides that default instead of
+                        fighting it from the CSS side. */}
+                    <QRCodeCanvas
+                      value={dashboardUrl}
+                      size={144}
+                      bgColor="#ffffff"
+                      fgColor="#0a0a0d"
+                      level="M"
+                      style={{ width: '100%', height: '100%' }}
+                    />
+                  </div>
+                  <div className="idcard-qr-caption">Scan to open<br />dashboard</div>
+                  {data.logoUrl && (
+                    <div className="idcard-logo-wrap">
+                      <img ref={logoImgRef} src={data.logoUrl} alt="" className="idcard-org-logo" />
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
 

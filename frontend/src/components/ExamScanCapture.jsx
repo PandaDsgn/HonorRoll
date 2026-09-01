@@ -246,7 +246,7 @@ export default function ExamScanCapture({ items, onDone }) {
           <p className="auth-sub" style={{ margin: '0 0 12px' }}>
             Line the page up within the frame, then capture — you'll get a chance to adjust the crop next.
           </p>
-          {debugInfo && <p className="auth-sub" style={{ margin: '8px 0 0', fontFamily: 'monospace', fontSize: 11 }}>{debugInfo}</p>}
+          {debugInfo && <p className="auth-sub" style={{ margin: '8px 0 0', fontFamily: 'var(--font-mono)', fontSize: 11 }}>{debugInfo}</p>}
           {captureError && (
             <div className="alert" role="alert" style={{ marginTop: 12 }}>
               <span className="alert-icon">!</span>

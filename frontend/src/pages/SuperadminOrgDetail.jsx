@@ -32,15 +32,37 @@ export default function SuperadminOrgDetail() {
   const { theme, toggleTheme } = useTheme();
   const [orgName, setOrgName] = useState(location.state?.orgName || null);
   const [section, setSection] = useState('people');
+  // Every admin-scoped fetch below (teachers/students/structure/billing —
+  // anything routed through requireAdmin's applySuperadminOrgOverride,
+  // rather than a genuinely superadmin-only endpoint like AdminsSection's
+  // own /api/superadmin/organizations) depends on the X-Organization-Id
+  // header this effect sets. React runs a CHILD's effects before its
+  // PARENT's on mount — so PeopleSection/StructureSection/BillingSection's
+  // own child components (TeachersSection, StudentsSection, ...) would
+  // otherwise fire their fetches before this effect ever ran, hitting
+  // requireAdmin with no override header and a hard "Admin access
+  // required" 403 on every single page load, deterministically. Gating
+  // those sections behind headerReady means they don't even mount — so
+  // their fetch effects can't fire — until the header is already set.
+  const [headerReady, setHeaderReady] = useState(false);
 
   useEffect(() => {
     setOrgOverrideHeader(orgId);
-    if (!orgName) {
-      axios.get(`${API}/api/superadmin/organizations/${orgId}`, { withCredentials: true })
-        .then((res) => setOrgName(res.data.organization.name))
-        .catch(() => setOrgName('this organization'));
-    }
-    return () => setOrgOverrideHeader(null);
+    setHeaderReady(true);
+    return () => { setOrgOverrideHeader(null); setHeaderReady(false); };
+  }, [orgId]);
+
+  // Split out from the header effect above (rather than one effect
+  // depending on both orgId and orgName) — sharing a dependency array
+  // would re-run the header effect's own cleanup+re-fire every time this
+  // fetch resolves and calls setOrgName, briefly flipping headerReady
+  // false-then-true and unmounting/remounting every child section for no
+  // reason.
+  useEffect(() => {
+    if (orgName) return;
+    axios.get(`${API}/api/superadmin/organizations/${orgId}`, { withCredentials: true })
+      .then((res) => setOrgName(res.data.organization.name))
+      .catch(() => setOrgName('this organization'));
   }, [orgId, orgName]);
 
   const SECTIONS = [
@@ -80,7 +102,9 @@ export default function SuperadminOrgDetail() {
           </div>
         </div>
 
-        {section === 'people' ? (
+        {!headerReady ? (
+          <p className="sb-loading">Loading…</p>
+        ) : section === 'people' ? (
           <PeopleSection orgId={orgId} orgName={orgName} highlightStudentId={location.state?.selectStudentId} />
         ) : section === 'structure' ? (
           <StructureSection orgId={orgId} />
