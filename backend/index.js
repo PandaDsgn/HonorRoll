@@ -1,4 +1,5 @@
 require('dotenv').config();
+const http = require('http');
 const dns = require('dns');
 // Render's network doesn't support outbound IPv6, but Node 18+ resolves
 // hostnames with both A/AAAA records (like smtp.gmail.com) IPv6-first by
@@ -143,6 +144,8 @@ app.use(require('./routes/assistant'));
 app.use(require('./routes/notes'));
 app.use(require('./routes/notices'));
 app.use(require('./routes/notifications'));
+app.use(require('./routes/doubts'));
+app.use(require('./routes/chat'));
 app.use(require('./routes/auth'));
 app.use(require('./routes/organizations'));
 app.use(require('./routes/me'));
@@ -250,8 +253,18 @@ const PORT = process.env.PORT || 3000;
 // for supertest must NOT also bind a real port, both because it'd collide
 // with an already-running dev server on the same PORT and because Jest
 // would hang afterward waiting for that open listener to close.
+//
+// http.createServer(app) instead of the old plain app.listen(PORT, ...) —
+// a WebSocketServer (lib/realtime.js) needs the actual http.Server object
+// to attach its own 'upgrade' listener to, which app.listen() creates
+// internally but never exposes. Express apps are themselves just request
+// handlers, so wrapping one in http.createServer changes nothing about
+// how any existing route behaves.
 if (require.main === module) {
-  app.listen(PORT, () => {
+  const { attachRealtime } = require('./lib/realtime');
+  const server = http.createServer(app);
+  attachRealtime(server);
+  server.listen(PORT, () => {
     console.log(`HonorRoll API running on http://localhost:${PORT}`);
   });
 }

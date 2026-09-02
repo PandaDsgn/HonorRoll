@@ -10,6 +10,33 @@ const { logSecurityEvent } = require('./securityEvents');
  * Every route that touches the Docker sandbox or student data should sit behind this —
  * previously nothing did, which meant /api/execute/* was callable by anyone, logged in or not.
  */
+// Shared by authenticateToken (HTTP, reads the Authorization header) and
+// the WebSocket upgrade handler (lib/realtime.js, reads a ?token= query
+// param instead — a browser WebSocket can't set custom headers on its
+// handshake request). Both need the exact same "is this a real, complete
+// session" rule; keeping it in one place means they can never quietly
+// drift apart. Returns the decoded payload on a real session token, or
+// throws — the two callers each translate that into their own transport's
+// rejection shape (a 401 JSON body vs. closing the socket).
+function verifySessionToken(token) {
+  const payload = jwt.verify(token, process.env.JWT_SECRET);
+  // A pre-auth token (minted mid-login, before the caller has picked which
+  // organization to enter — see POST /api/login) carries no role/org at
+  // all, so it must never be usable against a real route.
+  if (payload.type === 'preauth') {
+    throw new Error('Login not complete — select an organization first');
+  }
+  // A tos-pending token (see mintTosPendingToken) DOES carry a full
+  // role/organizationId/orgUnitId claim set — unlike preauth, it would
+  // otherwise pass through here as if it were a real session token,
+  // letting someone use it directly on real routes and skip accepting
+  // the Terms of Service/Privacy Policy entirely. Must never reach here.
+  if (payload.type === 'tos-pending') {
+    throw new Error('Login not complete — accept the Terms of Service to continue');
+  }
+  return payload;
+}
+
 function authenticateToken(req, res, next) {
   // Authorization header, not a cookie — deliberately. Frontend (github.io)
   // and backend (onrender.com) don't share a domain, and iOS forces every
@@ -22,25 +49,10 @@ function authenticateToken(req, res, next) {
     return res.status(401).json({ error: 'Not authenticated' });
   }
   try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    // A pre-auth token (minted mid-login, before the caller has picked which
-    // organization to enter — see POST /api/login) carries no role/org at
-    // all, so it must never be usable against a real route.
-    if (payload.type === 'preauth') {
-      return res.status(401).json({ error: 'Login not complete — select an organization first' });
-    }
-    // A tos-pending token (see mintTosPendingToken) DOES carry a full
-    // role/organizationId/orgUnitId claim set — unlike preauth, it would
-    // otherwise pass through here as if it were a real session token,
-    // letting someone use it directly on real routes and skip accepting
-    // the Terms of Service/Privacy Policy entirely. Must never reach here.
-    if (payload.type === 'tos-pending') {
-      return res.status(401).json({ error: 'Login not complete — accept the Terms of Service to continue' });
-    }
-    req.user = payload;
+    req.user = verifySessionToken(token);
     next();
   } catch (err) {
-    return res.status(401).json({ error: 'Invalid or expired session' });
+    return res.status(401).json({ error: err.message.startsWith('Login not complete') ? err.message : 'Invalid or expired session' });
   }
 }
 
@@ -204,6 +216,7 @@ function mintTosPendingToken(membership) {
 
 module.exports = {
   authenticateToken,
+  verifySessionToken,
   applySuperadminOrgOverride,
   requireAdmin,
   requireAdminOrTeacher,

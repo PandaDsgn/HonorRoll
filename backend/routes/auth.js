@@ -16,6 +16,7 @@ const {
   logSecurityEvent, countRecentBadPasswordFailures, LOGIN_FAILURE_THRESHOLD, LOGIN_FAILURE_WINDOW_MINUTES,
 } = require('../lib/securityEvents');
 const { recordLoginLocation } = require('../lib/geoip');
+const { getClientIp } = require('../lib/requestIp');
 const { sendEmail } = require('../mailer');
 
 // Best-effort — a failed alert email must never turn an otherwise-correct
@@ -131,7 +132,7 @@ async function completeLoginForUser(req, res, user, email, audience) {
     if ((audience === null || audience === 'superadmin') && getSuperadminEmails().includes(email.toLowerCase())) {
       const token = jwt.sign({ userId: user.id, role: 'superadmin' }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRATION || '24h' });
       logSecurityEvent(req, 'login_success', { actorUserId: user.id, actorEmail: email, actorRole: 'superadmin', organizationId: null });
-      recordLoginLocation(user.id, null, 'superadmin', req.ip);
+      recordLoginLocation(user.id, null, 'superadmin', getClientIp(req));
       return res.status(200).json({
         message: 'Login successful',
         token,
@@ -187,7 +188,7 @@ async function completeLoginForUser(req, res, user, email, audience) {
     // logged once here rather than in both, so a tos-pending completion
     // is never double-counted as two separate logins.
     logSecurityEvent(req, 'login_success', { actorUserId: user.id, actorEmail: email, actorRole: m.role, organizationId: m.organization_id });
-    recordLoginLocation(user.id, m.organization_id, m.role, req.ip);
+    recordLoginLocation(user.id, m.organization_id, m.role, getClientIp(req));
     // Admin already accepted at signup — never gated. Teacher/student
     // accounts are created BY an admin, so this first login is their one
     // chance to collect it (see mintTosPendingToken's own comment).
@@ -509,7 +510,7 @@ router.post('/api/login/verify-device-otp', async (req, res) => {
          VALUES ($1, $2, now() + interval '30 days', $3, $4)
          ON CONFLICT (user_id, device_id) DO UPDATE SET
            trusted_until = now() + interval '30 days', last_used_at = now(), user_agent = $3, ip_address = $4`,
-        [user.id, payload.deviceId, req.headers['user-agent'] || null, req.ip]
+        [user.id, payload.deviceId, req.headers['user-agent'] || null, getClientIp(req)]
       );
       logSecurityEvent(req, 'device_trusted', { actorUserId: user.id, actorEmail: user.email });
     }
@@ -623,7 +624,7 @@ router.post('/api/login/select-organization', async (req, res) => {
 
     const m = result.rows[0];
     logSecurityEvent(req, 'login_success', { actorUserId: m.user_id, actorEmail: m.email, actorRole: m.role, organizationId: m.organization_id });
-    recordLoginLocation(m.user_id, m.organization_id, m.role, req.ip);
+    recordLoginLocation(m.user_id, m.organization_id, m.role, getClientIp(req));
     // Same gate as the single-membership fast path in POST /api/login —
     // see mintTosPendingToken's own comment for why teacher/student is
     // checked here and admin never is.

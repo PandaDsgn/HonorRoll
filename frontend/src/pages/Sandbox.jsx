@@ -381,7 +381,7 @@ export default function Sandbox() {
         <section className="sandbox-right" style={{ width: `${100 - leftPercent}%` }}>
           <div className="sb-toolbar">
             <div className="sb-toolbar-group">
-              <select aria-label="Language" className="language-select" value={language} onChange={(e) => selectLanguage(e.target.value)}>
+              <select aria-label="Language" value={language} onChange={(e) => selectLanguage(e.target.value)}>
                 {LANGUAGES.map((l) => (
                   <option key={l.id} value={l.id}>{l.label}</option>
                 ))}

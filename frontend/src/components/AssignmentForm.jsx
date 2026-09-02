@@ -386,7 +386,7 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
 
                   <div className="field">
                     <label>Type</label>
-                    <select className="assignment-select" value={q.type} onChange={(e) => changeQuestionType(idx, e.target.value)}>
+                    <select value={q.type} onChange={(e) => changeQuestionType(idx, e.target.value)}>
                       {QUESTION_TYPES.map((t) => <option key={t.id} value={t.id}>{t.label}</option>)}
                     </select>
                   </div>

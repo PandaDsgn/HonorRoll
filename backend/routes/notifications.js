@@ -17,7 +17,7 @@ router.get('/api/notifications', authenticateToken, async (req, res) => {
   if (req.user.role !== 'student' && req.user.role !== 'teacher') return res.status(403).json({ error: 'Not available for this role' });
   try {
     const result = await pool.query(
-      `SELECT id, type, title, body, note_id, notice_id, problem_id, exam_id, read_at, created_at FROM notifications
+      `SELECT id, type, title, body, note_id, notice_id, problem_id, exam_id, doubt_id, read_at, created_at FROM notifications
        WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`,
       [req.user.userId]
     );
@@ -30,6 +30,7 @@ router.get('/api/notifications', authenticateToken, async (req, res) => {
       noticeId: row.notice_id,
       problemId: row.problem_id,
       examId: row.exam_id,
+      doubtId: row.doubt_id,
       read: row.read_at !== null,
       createdAt: row.created_at,
     }));

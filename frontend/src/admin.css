@@ -23,6 +23,13 @@
 .admin-toolbar {
   display: flex;
   justify-content: flex-end;
+  /* Flex's own default (stretch) was letting a <select>/<input> get
+     stretched to match whichever sibling in the row happened to be
+     tallest — harmless for a plain text input (its own text still centers
+     fine in a taller box), but a <select>'s selected-option text stays
+     pinned near the top of a stretched box instead of centering in it,
+     leaving a tall mostly-empty control with the label sitting up top. */
+  align-items: center;
   flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 16px;
@@ -91,20 +98,6 @@
 
 /* Assignment-scope dropdown on the Students panel — filters the sortable
    table down to one assignment's stats instead of the combined total. */
-.assignment-select {
-  padding: 8px 10px;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  color: var(--text);
-  font-size: 13px;
-}
-.assignment-select:focus {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-dim);
-}
-
 .btn-danger {
   background: var(--danger-dim);
   color: var(--danger);

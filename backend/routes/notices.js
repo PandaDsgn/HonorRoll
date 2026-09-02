@@ -8,6 +8,7 @@ const { pool } = require('../lib/db');
 const { authenticateToken, requireAdmin } = require('../lib/auth');
 const { notesUpload } = require('../lib/uploads');
 const { isB2Configured, noticesObjectKey, uploadScanPdf, deleteScanPdf, getScanPdfUrl } = require('../storage');
+const { createNotificationsBulk } = require('../lib/notifications');
 
 
 // ============================================================================
@@ -107,12 +108,16 @@ router.post('/api/admin/notices', authenticateToken, requireAdmin, notesUpload.s
     // admins already see it directly in their own shared notices list, same
     // as the poster does, with no separate bell needed for that).
     try {
-      await pool.query(
-        `INSERT INTO notifications (organization_id, user_id, type, title, body, notice_id)
-         SELECT $1, m.user_id, 'notice', $2, 'New notice posted', $3
-         FROM memberships m WHERE m.organization_id = $1 AND m.role IN ('student', 'teacher')`,
-        [req.user.organizationId, title, insertRes.rows[0].id]
-      );
+      await createNotificationsBulk({
+        selectSql: `SELECT m.user_id FROM memberships m WHERE m.organization_id = $1 AND m.role IN ('student', 'teacher')`,
+        selectParams: [req.user.organizationId],
+        organizationId: req.user.organizationId,
+        type: 'notice',
+        title,
+        body: 'New notice posted',
+        extraColumn: 'notice_id',
+        extraId: insertRes.rows[0].id,
+      });
     } catch (err) {
       console.error('Failed to notify org of new notice (continuing anyway):', err);
     }

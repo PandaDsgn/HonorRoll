@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
+import { useAuth } from '../context/AuthContext';
 import { API } from '../config';
+import { on } from '../lib/realtime';
 
 // Where clicking a notification of a given type sends the student — the
 // list pages, deliberately, not a specific item's detail route: an exam's
@@ -9,6 +11,23 @@ import { API } from '../config';
 // jumping straight there from a notification click would surprise-start an
 // exam rather than just show the student what's new.
 const NOTIFICATION_LINK_BY_TYPE = { assignment: '/assignments', exam: '/exams' };
+
+// 'doubt' isn't in the plain map above — this bell serves both students and
+// teachers (see SpaceNotifications), and the two roles need to land in
+// completely different places: a student's own /doubts page vs. a
+// teacher's Doubts tab inside /admin, which (unlike every route above) has
+// no route of its own to link to — AdminDashboard reads router state to
+// pick its initial tab instead (see its own location.state?.tab).
+function doubtLinkFor(role) {
+  return role === 'teacher' ? { path: '/admin', state: { tab: 'doubts' } } : { path: '/doubts', state: undefined };
+}
+
+// Same reasoning, same shape, for the encrypted chat feature — a
+// teacher's own chat inbox is a tab inside /admin, a student's is its own
+// top-level page.
+function chatLinkFor(role) {
+  return role === 'teacher' ? { path: '/admin', state: { tab: 'chat' } } : { path: '/chat', state: undefined };
+}
 
 function BellIcon() {
   return (
@@ -41,6 +60,7 @@ function timeAgo(iso) {
 // clears on open, not on a per-item basis).
 export default function NotificationBell() {
   const navigate = useNavigate();
+  const { role } = useAuth();
   const [notifications, setNotifications] = useState([]);
   const [open, setOpen] = useState(false);
   const containerRef = useRef(null);
@@ -57,20 +77,24 @@ export default function NotificationBell() {
 
   useEffect(() => {
     fetchNotifications();
-    const interval = setInterval(fetchNotifications, 30000);
+    // The realtime WS push (below) is the primary delivery path now — this
+    // interval is just a safety net for a socket that silently died without
+    // its close/error handlers firing (rare, but not impossible), so it's
+    // deliberately slow rather than the old 30s primary-path cadence.
+    const interval = setInterval(fetchNotifications, 120000);
     // Browsers throttle setInterval heavily in background/inactive tabs (to
-    // save battery) — the 30s timer above can silently stall for minutes if
-    // the tab isn't focused, which is exactly what made this feel like "only
-    // a manual refresh ever shows new notifications." Re-fetching the moment
-    // the tab becomes visible again closes that gap without waiting for the
-    // throttled interval to eventually catch up.
+    // save battery) — re-fetching the moment the tab becomes visible again
+    // closes that gap without waiting for the throttled interval (or a
+    // throttled/suspended WS reconnect) to eventually catch up.
     const onVisibilityChange = () => {
       if (document.visibilityState === 'visible') fetchNotifications();
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
+    const offNotification = on('notification', fetchNotifications);
     return () => {
       clearInterval(interval);
       document.removeEventListener('visibilitychange', onVisibilityChange);
+      offNotification();
     };
   }, [fetchNotifications]);
 
@@ -113,7 +137,7 @@ export default function NotificationBell() {
           <span
             style={{
               position: 'absolute', top: 2, right: 2, minWidth: 15, height: 15, padding: '0 3px',
-              borderRadius: 999, background: 'var(--danger, #e5484d)', color: '#fff',
+              borderRadius: 999, background: 'var(--amber)', color: '#1a1006',
               fontSize: 10, fontWeight: 700, lineHeight: '15px', textAlign: 'center',
             }}
           >
@@ -134,16 +158,18 @@ export default function NotificationBell() {
             <p className="sb-loading" style={{ margin: '12px 8px' }}>No notifications yet.</p>
           ) : (
             notifications.map((n) => {
-              const linkTo = NOTIFICATION_LINK_BY_TYPE[n.type];
+              const roleAwareLink = n.type === 'doubt' ? doubtLinkFor(role) : n.type === 'chat' ? chatLinkFor(role) : null;
+              const linkTo = roleAwareLink ? roleAwareLink.path : NOTIFICATION_LINK_BY_TYPE[n.type];
               return (
                 <div
                   key={n.id}
                   role={linkTo ? 'button' : undefined}
                   tabIndex={linkTo ? 0 : undefined}
-                  onClick={linkTo ? () => { setOpen(false); navigate(linkTo); } : undefined}
+                  onClick={linkTo ? () => { setOpen(false); navigate(linkTo, roleAwareLink?.state ? { state: roleAwareLink.state } : undefined); } : undefined}
                   style={{
                     padding: '8px 10px', borderRadius: 'var(--radius-sm)',
-                    background: n.read ? 'transparent' : 'var(--surface-2)',
+                    background: n.read ? 'transparent' : 'var(--amber-dim)',
+                    borderLeft: n.read ? '2px solid transparent' : '2px solid var(--amber)',
                     cursor: linkTo ? 'pointer' : 'default',
                   }}
                 >

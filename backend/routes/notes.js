@@ -9,6 +9,7 @@ const { authenticateToken, requireAdminOrTeacher } = require('../lib/auth');
 const { getVisibleSubjectIds, getTeacherScope } = require('../lib/performance');
 const { notesUpload } = require('../lib/uploads');
 const { isB2Configured, notesObjectKey, uploadScanPdf, deleteScanPdf, getScanPdfUrl } = require('../storage');
+const { createNotificationsBulk } = require('../lib/notifications');
 
 // ============================================================================
 // NOTES — teacher-posted subject media, six types (see ensureNotesSchema
@@ -175,18 +176,22 @@ router.post('/api/teacher/notes', authenticateToken, requireAdminOrTeacher, note
     // unit), just seeded from this one subject's org_unit_id instead of a
     // teacher's whole subject list.
     try {
-      await pool.query(
-        `WITH RECURSIVE descendant_units AS (
+      await createNotificationsBulk({
+        selectSql: `WITH RECURSIVE descendant_units AS (
            SELECT id FROM org_units WHERE id = $1
            UNION
            SELECT ou.id FROM org_units ou JOIN descendant_units d ON ou.parent_unit_id = d.id
          )
-         INSERT INTO notifications (organization_id, user_id, type, title, body, note_id)
-         SELECT $2, m.user_id, 'note', $3, $4, $5
-         FROM memberships m
+         SELECT m.user_id FROM memberships m
          WHERE m.organization_id = $2 AND m.role = 'student' AND m.org_unit_id IN (SELECT id FROM descendant_units)`,
-        [subject.rows[0].org_unit_id, req.user.organizationId, title, `New ${type} in ${subject.rows[0].name}`, insertRes.rows[0].id]
-      );
+        selectParams: [subject.rows[0].org_unit_id, req.user.organizationId],
+        organizationId: req.user.organizationId,
+        type: 'note',
+        title,
+        body: `New ${type} in ${subject.rows[0].name}`,
+        extraColumn: 'note_id',
+        extraId: insertRes.rows[0].id,
+      });
     } catch (err) {
       console.error('Failed to notify students of new note (continuing anyway):', err);
     }

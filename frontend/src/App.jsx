@@ -22,6 +22,8 @@ import MyPerformance from './pages/MyPerformance';
 import MyProfile from './pages/MyProfile';
 import Notes from './pages/Notes';
 import Notices from './pages/Notices';
+import Doubts from './pages/Doubts';
+import Chat from './pages/Chat';
 import ScanReview from './pages/ScanReview';
 import SuperadminDashboard from './pages/SuperadminDashboard';
 import SuperadminOrgDetail from './pages/SuperadminOrgDetail';
@@ -63,9 +65,11 @@ function App() {
           <Route path="/exams/:id/result" element={<ProtectedRoute><ExamResult /></ProtectedRoute>} />
 
           <Route path="/performance" element={<ProtectedRoute roles={['student']}><MyPerformance /></ProtectedRoute>} />
-          <Route path="/profile" element={<ProtectedRoute><MyProfile /></ProtectedRoute>} />
+          <Route path="/profile" element={<ProtectedRoute roles={['admin', 'teacher', 'superadmin']}><MyProfile /></ProtectedRoute>} />
           <Route path="/notes" element={<ProtectedRoute roles={['student']}><Notes /></ProtectedRoute>} />
           <Route path="/notices" element={<ProtectedRoute roles={['student', 'teacher']}><Notices /></ProtectedRoute>} />
+          <Route path="/doubts" element={<ProtectedRoute roles={['student']}><Doubts /></ProtectedRoute>} />
+          <Route path="/chat" element={<ProtectedRoute roles={['student']}><Chat /></ProtectedRoute>} />
 
           <Route
             path="/admin"

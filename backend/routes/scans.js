@@ -18,6 +18,7 @@ const { logSecurityEvent } = require('../lib/securityEvents');
 const {
   isB2Configured, scanObjectKey, uploadScanPdf, deleteScanPdf, getScanPdfUrl, downloadScanPdf,
 } = require('../storage');
+const { createNotificationsBulk } = require('../lib/notifications');
 const { isOcrConfigured, runOcr } = require('../ocrClient');
 const { isGroqConfigured, assessAnswers } = require('../aiGrading');
 const { ensureScanSubmissionsSchema, ensureNotificationsSchema } = require('../schema');
@@ -716,25 +717,23 @@ async function notifyStudentsOfNewItem(organizationId, subjectId, type, title, e
     const subjectRes = await pool.query('SELECT org_unit_id FROM subjects WHERE id = $1 AND organization_id = $2', [subjectId, organizationId]);
     const orgUnitId = subjectRes.rows[0]?.org_unit_id;
     if (!orgUnitId) return;
-    await pool.query(
-      `WITH RECURSIVE descendant_units AS (
+    await createNotificationsBulk({
+      selectSql: `WITH RECURSIVE descendant_units AS (
          SELECT id FROM org_units WHERE id = $1
          UNION
          SELECT ou.id FROM org_units ou JOIN descendant_units d ON ou.parent_unit_id = d.id
        )
-       INSERT INTO notifications (organization_id, user_id, type, title, ${extraColumn})
-       SELECT $2, m.user_id, $3, $4, $5
-       FROM memberships m
+       SELECT m.user_id FROM memberships m
        WHERE m.organization_id = $2 AND m.role = 'student' AND m.org_unit_id IN (SELECT id FROM descendant_units)`,
-      [orgUnitId, organizationId, type, title, extraId]
-    );
+      selectParams: [orgUnitId, organizationId],
+      organizationId, type, title, extraColumn, extraId,
+    });
   } else {
-    await pool.query(
-      `INSERT INTO notifications (organization_id, user_id, type, title, ${extraColumn})
-       SELECT $1, m.user_id, $2, $3, $4
-       FROM memberships m WHERE m.organization_id = $1 AND m.role = 'student'`,
-      [organizationId, type, title, extraId]
-    );
+    await createNotificationsBulk({
+      selectSql: `SELECT m.user_id FROM memberships m WHERE m.organization_id = $1 AND m.role = 'student'`,
+      selectParams: [organizationId],
+      organizationId, type, title, extraColumn, extraId,
+    });
   }
 }
 

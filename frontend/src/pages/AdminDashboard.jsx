@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { useTheme } from '../hooks/useTheme';
 import { useAuth } from '../context/AuthContext';
 import ThemeToggle from '../components/ThemeToggle';
@@ -24,14 +24,21 @@ import {
 import TeachersPanel from './admin/TeachersPanel';
 import PromoteStudentsPanel from './admin/PromoteStudentsPanel';
 import { RequestAddAdminPanel, AdminRequestsPanel } from './admin/SuperadminContactPanels';
+import DoubtsPanel from './admin/DoubtsPanel';
+import ChatPanel from './admin/ChatPanel';
 import '../admin.css';
 import '../IdCard.css';
 
 export default function AdminDashboard() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { theme, toggleTheme } = useTheme();
   const { user } = useAuth();
-  const [tab, setTab] = useState('students');
+  // Defaults to 'students' same as always — location.state?.tab only ever
+  // arrives from NotificationBell's doubtLinkFor, landing a teacher
+  // straight on their Doubts tab from a "new doubt"/"doubt replied to"
+  // notification instead of wherever this dashboard would otherwise open.
+  const [tab, setTab] = useState(location.state?.tab || 'students');
   const [selectedStudentId, setSelectedStudentId] = useState(null);
   const [selectedMyStudentId, setSelectedMyStudentId] = useState(null);
 
@@ -96,6 +103,8 @@ export default function AdminDashboard() {
               { id: 'exams', label: 'Exams', onClick: () => setTab('exams') },
               { id: 'gradebook', label: 'Gradebook', onClick: () => setTab('gradebook') },
               user?.role === 'teacher' && { id: 'uploads', label: 'Uploads', onClick: () => setTab('uploads') },
+              user?.role === 'teacher' && { id: 'doubts', label: 'Doubts', onClick: () => setTab('doubts') },
+              user?.role === 'teacher' && { id: 'chat', label: 'Chat', onClick: () => setTab('chat') },
               user?.role === 'admin' && { id: 'notices', label: 'Notices', onClick: () => setTab('notices') },
               user?.role === 'admin' && { id: 'grade-scale', label: 'Grading', onClick: () => setTab('grade-scale') },
               user?.role === 'admin' && { id: 'structure', label: 'Structure', onClick: () => setTab('structure') },
@@ -160,6 +169,10 @@ export default function AdminDashboard() {
           <GradebookPanel />
         ) : tab === 'uploads' ? (
           user?.role === 'teacher' ? <TeacherUploadsPanel /> : null
+        ) : tab === 'doubts' ? (
+          user?.role === 'teacher' ? <DoubtsPanel /> : null
+        ) : tab === 'chat' ? (
+          user?.role === 'teacher' ? <ChatPanel /> : null
         ) : tab === 'notices' ? (
           user?.role === 'admin' ? <AdminNoticesPanel /> : null
         ) : tab === 'structure' ? (

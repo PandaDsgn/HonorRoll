@@ -8,6 +8,7 @@ import BrandMark from '../components/BrandMark';
 import { EyeIcon, EyeOffIcon } from '../components/EyeIcons';
 import { API } from '../config';
 import { getDeviceId } from '../lib/deviceId';
+import { ensureE2eeKeys } from '../lib/e2eeKeyStore';
 
 // Routes a freshly-issued session token to the right landing page, shared
 // by the direct-login path and the post-picker path below.
@@ -169,6 +170,16 @@ export default function Login() {
 
   const audienceLabel = AUDIENCES.find((a) => a.key === audience)?.label || 'Student';
 
+  // Best-effort, fire-and-forget — chat's encrypted-key setup must never
+  // block or delay a successful login. Called with whatever the `password`
+  // field currently holds right at the moment each of the 4 login-
+  // completion points below fires; see ensureE2eeKeys's own comment for
+  // why the plaintext password (not persisted anywhere) is what a fresh
+  // device needs to recover or set up this account's chat key.
+  const setUpChatKeys = () => {
+    ensureE2eeKeys(password).catch((err) => console.error('Failed to set up encrypted chat keys (continuing anyway):', err));
+  };
+
   // Separate from handleLogin's onSubmit wrapper below so handleVerifyOtp
   // can replay the exact same login attempt once the OTP clears the lock,
   // without duplicating the requiresOrgSelection/requiresTosAcceptance/
@@ -204,6 +215,7 @@ export default function Login() {
 
       if (response.status === 200) {
         login(response.data.token, response.data.user);
+        setUpChatKeys();
         // replace, not push — otherwise /login stays one swipe/back-button
         // press behind the dashboard forever, and a signed-in user landing
         // back on the login form (then having to swipe forward again to
@@ -270,6 +282,7 @@ export default function Login() {
       }
       if (response.data.token) {
         login(response.data.token, response.data.user);
+        setUpChatKeys();
         navigate(landingPathFor(response.data.user.role), { replace: true });
       }
     } catch (err) {
@@ -330,6 +343,7 @@ export default function Login() {
         return;
       }
       login(response.data.token, response.data.user);
+      setUpChatKeys();
       navigate(landingPathFor(response.data.user.role), { replace: true });
     } catch (err) {
       setError(err.response?.data?.error || 'Network error. Is the backend server running?');
@@ -345,6 +359,7 @@ export default function Login() {
     try {
       const response = await axios.post(`${API}/api/login/accept-tos`, { tosPendingToken });
       login(response.data.token, response.data.user);
+      setUpChatKeys();
       navigate(landingPathFor(response.data.user.role), { replace: true });
     } catch (err) {
       setError(err.response?.data?.error || 'Network error. Is the backend server running?');

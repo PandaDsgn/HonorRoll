@@ -19,6 +19,7 @@
 // sees the swap; `SwappableStore` just delegates each call to whichever
 // backing store is current.
 const { rateLimit, MemoryStore, ipKeyGenerator } = require('express-rate-limit');
+const { getClientIp } = require('./lib/requestIp');
 
 // The integration test suite (tests/) exercises real signup/login flows
 // dozens of times per run, all from the same loopback IP — real, correct
@@ -61,6 +62,10 @@ const globalLimiter = rateLimit({
   legacyHeaders: false,
   store: globalStore,
   skip: skipInTest,
+  // Explicit rather than express-rate-limit's own default keyGenerator —
+  // that default also just reads req.ip, which is Cloudflare's edge address
+  // here, not the visitor's (see getClientIp's own comment).
+  keyGenerator: (req) => ipKeyGenerator(getClientIp(req)),
   message: { error: 'Too many requests — please slow down and try again shortly.' },
 });
 
@@ -78,6 +83,10 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
   store: authStore,
   skip: skipInTest,
+  // See globalLimiter's own comment — without this, this brute-force
+  // ceiling is really keyed on which Cloudflare edge node handled the
+  // request, not the actual attacker/visitor.
+  keyGenerator: (req) => ipKeyGenerator(getClientIp(req)),
   message: { error: 'Too many attempts — please wait 15 minutes and try again.' },
 });
 
@@ -103,7 +112,7 @@ const assistantLimiter = rateLimit({
   // through ipKeyGenerator (rather than the raw string) so it doesn't
   // let a whole IPv6 /64 share one bucket, per express-rate-limit's own
   // validation.
-  keyGenerator: (req) => (req.user?.userId ? String(req.user.userId) : ipKeyGenerator(req.ip)),
+  keyGenerator: (req) => (req.user?.userId ? String(req.user.userId) : ipKeyGenerator(getClientIp(req))),
   message: { error: 'You\'ve sent a lot of messages — please wait a bit before asking the assistant something else.' },
 });
 

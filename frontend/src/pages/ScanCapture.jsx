@@ -557,7 +557,6 @@ export default function ScanCapture() {
                       <div className="exam-coding-item">
                         <select
                           aria-label="Language"
-                          className="language-select"
                           value={ans.language || ''}
                           onChange={(e) => updateAnswer(q.id, { language: e.target.value, code: q.starterCode?.[e.target.value] || '' })}
                         >

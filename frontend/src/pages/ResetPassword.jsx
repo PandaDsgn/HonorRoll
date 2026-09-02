@@ -66,6 +66,17 @@ export default function ResetPassword() {
         <h2 className="auth-title">Set a new password</h2>
         <p className="auth-sub">Choose a new password for your account.</p>
 
+        {!done && (
+          <div className="alert" role="alert">
+            <span className="alert-icon">!</span>
+            <span>
+              If you've used encrypted chat, resetting your password makes your old messages permanently unreadable —
+              they're encrypted with a key tied to your current password, and there's no way to recover it after a
+              reset. New messages after this will work fine.
+            </span>
+          </div>
+        )}
+
         {!token && (
           <div className="alert" role="alert">
             <span className="alert-icon">!</span>

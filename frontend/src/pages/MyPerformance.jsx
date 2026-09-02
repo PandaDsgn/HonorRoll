@@ -9,6 +9,7 @@ import SpaceSwitcher, { SpaceNotifications } from '../components/SpaceSwitcher';
 import LogoutFab from '../components/LogoutFab';
 import PercentBar from '../components/PercentBar';
 import IdCard from '../components/IdCard';
+import PhotoPicker from '../components/PhotoPicker';
 import { PERF_STATUS_LABELS, PERF_STATUS_CLASS } from '../lib/performanceStatus';
 import { API } from '../config';
 import '../admin.css';
@@ -199,7 +200,7 @@ function ItemGraph({ kind, items }) {
 
   return (
     <div>
-      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 12 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 12 }}>
         <select value={itemId} onChange={(e) => { setItemId(Number(e.target.value) || e.target.value); setResult(null); }} style={{ maxWidth: 260 }}>
           {eligible.map((it) => <option key={it[cfg.idKey]} value={it[cfg.idKey]}>{it.title}</option>)}
         </select>
@@ -522,6 +523,11 @@ function MyInfoPanel() {
       <div className="panel" style={{ padding: 20, marginBottom: 16 }}>
         <h3 style={{ margin: '0 0 4px' }}>Your details</h3>
         <p className="auth-sub" style={{ margin: '0 0 16px' }}>{user?.name || user?.email}{user?.name && ` — ${user.email}`}</p>
+
+        <h4 style={{ margin: '0 0 8px', fontSize: 13, color: 'var(--text-dim)' }}>My photos</h4>
+        <PhotoPicker />
+
+        <h4 style={{ margin: '20px 0 8px', fontSize: 13, color: 'var(--text-dim)' }}>Your institutions</h4>
         <div className="admin-table-wrap">
           <table className="admin-table">
             <thead><tr><th>Institution</th><th>Role</th><th>Unit</th><th>Roll number</th><th /></tr></thead>

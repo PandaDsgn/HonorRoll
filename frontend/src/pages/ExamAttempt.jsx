@@ -460,7 +460,6 @@ export default function ExamAttempt() {
                 <div className="exam-coding-item">
                   <select
                     aria-label="Language"
-                    className="language-select"
                     value={ans.language || ''}
                     onChange={(e) => updateAnswer(item.id, { language: e.target.value, code: item.starterCode?.[e.target.value] || '' })}
                   >

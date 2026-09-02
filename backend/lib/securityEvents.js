@@ -13,6 +13,7 @@
 // action, and a caller that forgets to `await` this must not produce an
 // unhandled promise rejection either.
 const { pool } = require('./db');
+const { getClientIp } = require('./requestIp');
 const { ensureSecurityEventsSchema, ensureLoginLocationsSchema } = require('../schema');
 
 // req is optional (a couple of call sites — e.g. a scheduled sweep — have
@@ -28,9 +29,10 @@ function logSecurityEvent(req, eventType, opts = {}) {
   const organizationId = opts.organizationId !== undefined ? opts.organizationId : (req?.user?.organizationId ?? null);
   const actorEmail = opts.actorEmail ?? null;
   const detail = opts.detail ?? null;
-  // req.ip resolves through Express's own `trust proxy` setting (see
-  // index.js) — the real client IP behind nginx, not nginx's own address.
-  const ipAddress = req?.ip || req?.socket?.remoteAddress || null;
+  // getClientIp prefers Cloudflare's CF-Connecting-IP over req.ip — see its
+  // own comment for why req.ip alone resolves to Cloudflare's edge address
+  // on this deployment, not the real visitor's.
+  const ipAddress = getClientIp(req) || req?.socket?.remoteAddress || null;
   const userAgent = req?.headers?.['user-agent'] || null;
 
   return pool.query(

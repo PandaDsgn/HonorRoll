@@ -23,15 +23,22 @@ function isAssistantConfigured() {
 // hallucinating a settings page that doesn't exist. Kept role-agnostic
 // (all roles' capabilities, not just the caller's) since a teacher might
 // reasonably ask "can students see X" and it should know the answer.
-const APP_OVERVIEW = `HonorRoll is a school/institution management platform: assignments (typed or scanned-handwritten), timed proctored exams, a code IDE with a line-by-line "Visualize" debugger, digital ID cards, notes/notices, and per-institution admin tools, all under one login. A user's role — student, teacher, admin, or superadmin — decides what they see; institutions are called "organizations," and one person can belong to more than one.
+//
+// THIS IS HAND-MAINTAINED, NOT LIVE — there's no introspection into the
+// actual nav/route config here, so every time a nav item moves, gets
+// renamed, or a feature ships, this paragraph has to be edited by hand or
+// the assistant starts confidently describing a UI that no longer exists
+// (this exact thing happened: it kept telling people IDE was a top-level
+// nav button well after Doubts pushed the student nav row to a "More"
+// dropdown). Whoever changes SpaceSwitcher.jsx's `spaces`/`moreSpaces` or
+// AdminDashboard.jsx's `adminTabs` should update this in the same change.
+const APP_OVERVIEW = `HonorRoll is a school/institution management platform: assignments (typed or scanned-handwritten), timed proctored exams, a code IDE with a line-by-line "Visualize" debugger, subject doubts, digital ID cards, notes/notices, and per-institution admin tools, all under one login. A user's role — student, teacher, admin, or superadmin — decides what they see; institutions are called "organizations," and one person can belong to more than one.
 
 What each role can do, and roughly where:
-- STUDENT: "Assignments" (attempt typed-code or scanned-handwritten problems, view results), "Exams" (take timed/proctored exams, view results after), "IDE" (a free-form coding scratchpad with the Visualize feature — step through code line by line and watch variables/objects change), "Notes" (browse/search notes teachers have posted for their subjects), "Notices" (org-wide announcements), "Performance" (percentile standing and per-question score graphs), "Profile" (their digital ID card — upload/crop a photo, download the card as a PNG, switch between institutions if they belong to more than one).
-- TEACHER: everything a student's IDE/Notices/Profile pages offer, PLUS an "Admin" dashboard (shared with admins) for grading scanned/typed submissions, reviewing AI-assisted correctness assessments and plagiarism/handwriting-similarity flags, and an "Uploads" tab to post notes (PDFs, photos, videos, audio, text, or links) for their subjects.
-- ADMIN: the same "Admin" dashboard, organized into Structure (classes/units, students, teachers), Grading (problems, exams, assignments), and Billing tabs; can post org-wide notices, upload/crop the institution's logo (shown on every ID card issued there), manage the institution's billing plan, and request another admin be added.
-- SUPERADMIN: a platform-wide "Superadmin" dashboard listing every institution — can open any one of them to directly manage its admins/teachers/students, edit its structure, or override its billing plan without "entering" it as an admin; can terminate a single person's access or delete an entire institution (which always emails a full data export to that institution's admins first); teachers can also start their own new institution (e.g. private coaching) from their own Profile page, gated behind the same access code used at signup.
-
-Everyone reaches their own role's pages from the main navigation ("Dashboard"/"IDE"/"Assignments"/"Exams"/"Profile"/etc, varies by role) at the top of the app.`;
+- STUDENT: top nav is Dashboard, Notices, Assignments, Exams, then a "More" dropdown holding Notes, Doubts, and IDE (nothing here is missing from the app — those three just live one click deeper since the row got crowded). "Dashboard" opens on "My Info" (name/email, every institution they're in with a "View ID Card" button, a photo library, and a "request a correction" flow to their admin) with a "Performance" tab alongside it (percentile standing and per-question score graphs, per institution). "Assignments"/"Exams" are the actual attempt flows and results. "Notes" is browse/search notes a teacher posted for their subjects. "Doubts" is where a student asks a question about a subject — by default it's open to EVERY teacher of that subject to see and answer (a "Board" tab shows every doubt already asked in a subject, asker identity hidden from other students, so they can check for a duplicate first), or they can optionally narrow it to one specific teacher instead; a "My Doubts" tab tracks their own. "IDE" is a free-form coding scratchpad with the Visualize feature — step through code line by line and watch variables/objects change. There is no separate "Profile" page for a student — it's the Dashboard's My Info tab.
+- TEACHER: top nav is Dashboard, Notices, Profile ("Profile" here is the digital ID card / photo library / "start your own institution" page — teacher-only now, not something a student has). "Dashboard" opens the shared Admin dashboard, with teacher-visible tabs for My Students, Assignments/Exams (create and grade), Gradebook, Uploads (post notes for their subjects — PDFs, photos, videos, audio, text, or links), and Doubts (their own queue: doubts addressed specifically to them, plus any unaddressed doubt in a subject they teach — never one a student narrowed to a co-teacher instead). A teacher does not get their own IDE/Assignments-attempt/Exams-attempt/Notes-browsing pages — those are the student-side view of the same features.
+- ADMIN: the same Admin dashboard as a teacher, PLUS Students, Notices, Grading (grade-band cutoffs, plagiarism thresholds, tag visibility), Structure (classes/units, subjects, teacher assignments, student promotion), Institution (logo upload), Billing, and Contact Superadmin tabs; "Profile" same as a teacher's.
+- SUPERADMIN: a platform-wide "Superadmin" dashboard (Overview / Security Events tabs) listing every institution — can open any one to directly manage its admins/teachers/students, edit its structure, or override its billing plan without "entering" it as an admin; can terminate a single person's access or delete an entire institution (which always emails a full data export to that institution's admins first); a login-location globe shows where people are logging in from. Teachers start their own new institution (e.g. private coaching) from their own Profile page, gated behind the same access code used at signup — that's not a superadmin-only action.`;
 
 function buildSystemPrompt({ name, role, organizationName }) {
   const who = organizationName
@@ -70,7 +77,15 @@ async function chatWithAssistant(userContext, history) {
       model: process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
       messages: [{ role: 'system', content: buildSystemPrompt(userContext) }, ...history],
       temperature: 0.4,
-      max_tokens: 400,
+      max_completion_tokens: 400,
+      // gpt-oss-120b is a reasoning model — without this it's free to spend
+      // an unbounded chunk of its output budget on hidden reasoning tokens
+      // before ever writing the actual reply, which shows up as this
+      // small chat widget taking noticeably longer than a short "where do
+      // I..." answer should. 'medium' keeps it fast for this use case
+      // without dropping to 'low' (which starts missing the multi-step
+      // refusal rules above on trickier rephrased jailbreak attempts).
+      reasoning_effort: 'medium',
     }),
   });
   if (!res.ok) {

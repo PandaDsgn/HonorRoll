@@ -1,6 +1,7 @@
 import { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
 import { API } from '../config';
+import { connectRealtime, disconnectRealtime } from '../lib/realtime';
 
 const AuthContext = createContext(null);
 
@@ -44,6 +45,7 @@ export function AuthProvider({ children }) {
     const token = localStorage.getItem(TOKEN_KEY);
     if (!token) {
       setUser(null);
+      disconnectRealtime();
       setLoading(false);
       return;
     }
@@ -51,12 +53,14 @@ export function AuthProvider({ children }) {
     try {
       const res = await axios.get(`${API}/api/me`);
       setUser(res.data.user);
+      connectRealtime(token);
     } catch {
       // Token missing, expired, or the account behind it is gone â€” either
       // way, stop sending a dead token on every future request.
       localStorage.removeItem(TOKEN_KEY);
       setAuthHeader(null);
       setUser(null);
+      disconnectRealtime();
     } finally {
       setLoading(false);
     }
@@ -72,6 +76,7 @@ export function AuthProvider({ children }) {
     localStorage.setItem(TOKEN_KEY, token);
     setAuthHeader(token);
     setUser(userData);
+    connectRealtime(token);
   }, []);
 
   const logout = useCallback(async () => {
@@ -84,6 +89,7 @@ export function AuthProvider({ children }) {
     localStorage.removeItem(TOKEN_KEY);
     setAuthHeader(null);
     setUser(null);
+    disconnectRealtime();
   }, []);
 
   const value = {

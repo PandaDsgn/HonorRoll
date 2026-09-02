@@ -4,8 +4,41 @@ import LegalShell from '../components/LegalShell';
 // history, not a promise of exact release timestamps.
 const ENTRIES = [
   {
-    date: '28 August 2026',
+    date: '02 September 2026',
     tag: 'Latest',
+    items: [
+      'Added an encrypted chat between a student and each teacher of a subject they\'re enrolled in — messages are end-to-end encrypted in your browser, so not even HonorRoll\'s own servers can read them.',
+      'Notifications and chat messages now arrive instantly instead of waiting for the app to next check in.',
+      'Added Doubts — ask a question about a subject and, by default, every teacher of that subject can see and answer it (or narrow it to one specific teacher instead). A public board lets you check whether your question has already been asked and answered before you post it, and a "My Doubts" tab tracks your own.',
+      'Teachers now get a notification whenever a doubt is posted in a subject they teach, even if it wasn\'t addressed to them specifically.',
+      'A student\'s Profile — photos, institutions, ID cards — now lives on their Dashboard\'s "My Info" tab instead of a separate page, and the student navigation bar now tucks Notes, Doubts, and the IDE behind a "More" menu so the top bar stays uncluttered.',
+      'The in-app assistant\'s knowledge of the app\'s own navigation was out of date and has been corrected; it now runs on an upgraded model.',
+      'Fixed dropdowns and file-upload buttons across the site to match the rest of the app\'s look instead of the browser\'s own default styling.',
+      'Security Events now has its own tab on the superadmin dashboard instead of being buried in the middle of the page.',
+      'Fixed a bug where some logins were geolocated to the wrong country on the superadmin login map — a proxy\'s own address was being recorded instead of the actual visitor\'s.',
+    ],
+  },
+  {
+    date: '01 September 2026',
+    tag: 'Improved',
+    items: [
+      'Redesigned the digital ID card with a real QR code — linking straight to your dashboard — in place of the old barcode, plus an overall more professional layout.',
+      'Standardized the whole site on Apple\'s system font, removing a couple of leftover web-font references.',
+    ],
+  },
+  {
+    date: '30 August 2026',
+    tag: 'Added',
+    items: [
+      'Added an in-app security audit log for admins and superadmins, tracking logins, access denials, and account/role/grade changes across the institution.',
+      'Accounts now temporarily lock after 5 failed login attempts within 15 minutes, with an email alert — entering the correct password during a lockout sends a one-time code to your email that lifts it immediately instead of waiting out the timer.',
+      'Signing in from a browser or device we haven\'t seen before now asks for an emailed verification code before letting you in, with an option to trust that device going forward.',
+      'Superadmins can now see a live globe showing where each institution\'s students, teachers, and admins log in from, with a login from an unusual location flagged automatically.',
+    ],
+  },
+  {
+    date: '28 August 2026',
+    tag: 'Added',
     items: [
       'Added a step-by-step code visualizer to the IDE — watch your code run line by line alongside a live diagram of its variables, objects, and how they reference each other, with playback controls, a PNG export, and shareable links to a specific step.',
       'The code visualizer now works for every language the IDE supports, not just Python — C, C++, Java, JavaScript, TypeScript, Go, Rust, Ruby, and PHP can all be stepped through line by line too.',
@@ -88,7 +121,7 @@ export default function Changelog() {
         <div key={entry.date} style={{ marginBottom: 32 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
             <h2 style={{ margin: 0 }}>{entry.date}</h2>
-            <span className="chip chip-neutral"><span className="dot" />{entry.tag}</span>
+            <span className={`chip ${entry.tag === 'Latest' ? 'chip-amber' : 'chip-neutral'}`}><span className="dot" />{entry.tag}</span>
           </div>
           <ul>
             {entry.items.map((item) => <li key={item}>{item}</li>)}

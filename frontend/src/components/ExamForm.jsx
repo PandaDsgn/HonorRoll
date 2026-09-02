@@ -375,7 +375,6 @@ export default function ExamForm({ initialData, onSubmit, onCancel }) {
               <div className="field">
                 <label>Type</label>
                 <select
-                  className="assignment-select"
                   value={it.type}
                   onChange={(e) => changeItemType(it.key, e.target.value)}
                 >
@@ -486,7 +485,6 @@ export default function ExamForm({ initialData, onSubmit, onCancel }) {
               <div className="field">
                 <label>Coding assignment</label>
                 <select
-                  className="assignment-select"
                   value={it.problemId}
                   onChange={(e) => updateItem(it.key, { problemId: e.target.value })}
                 >

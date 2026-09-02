@@ -73,6 +73,13 @@ function noticesObjectKey(organizationId, fileId, extension = '.pdf') {
   return `notices/${organizationId}/${fileId}${extension}`;
 }
 
+// Same shape as notesObjectKey — a doubt's attachment is scoped to a
+// subject the same way a note is. Default extension is .jpg (a photo,
+// the common case) rather than .pdf, unlike every helper above.
+function doubtsObjectKey(organizationId, subjectId, fileId, extension = '.jpg') {
+  return `doubts/${organizationId}/${subjectId}/${fileId}${extension}`;
+}
+
 // Profile photos belong to the global user identity (see memberships'
 // "users is pure identity" comment in index.js), not any one organization
 // — a student who uploads a headshot can reuse it as the photo on every
@@ -143,6 +150,6 @@ async function deleteScanPdf(objectKey) {
 
 module.exports = {
   isB2Configured, scanObjectKey, examScanObjectKey, notesObjectKey, noticesObjectKey,
-  avatarObjectKey, orgLogoObjectKey,
+  avatarObjectKey, orgLogoObjectKey, doubtsObjectKey,
   uploadScanPdf, getScanPdfUrl, downloadScanPdf, deleteScanPdf,
 };

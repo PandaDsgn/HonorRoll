@@ -49,6 +49,7 @@ export default function SuperadminDashboard() {
   const [deleteConfirmText, setDeleteConfirmText] = useState('');
   const [deleting, setDeleting] = useState(false);
   const [deleteResult, setDeleteResult] = useState('');
+  const [tab, setTab] = useState('overview');
 
   const fetchOrgs = useCallback(() => {
     axios.get(`${API}/api/superadmin/organizations`, { withCredentials: true })
@@ -177,8 +178,21 @@ export default function SuperadminDashboard() {
               </div>
             )}
           </div>
+
+          <div className="segmented" role="tablist" aria-label="Superadmin section">
+            <button type="button" role="tab" aria-pressed={tab === 'overview'} className={tab === 'overview' ? 'active' : ''} onClick={() => setTab('overview')}>
+              Overview
+            </button>
+            <button type="button" role="tab" aria-pressed={tab === 'security-events'} className={tab === 'security-events' ? 'active' : ''} onClick={() => setTab('security-events')}>
+              Security Events
+            </button>
+          </div>
         </div>
 
+        {tab === 'security-events' ? (
+          <SecurityEventsPanel orgs={orgs} />
+        ) : (
+        <>
         {error && <div className="alert" style={{ marginBottom: 16 }}><span className="alert-icon">!</span><span>{error}</span></div>}
         {deleteResult && <div className="alert alert-success" style={{ marginBottom: 16 }}><span className="alert-icon">✓</span><span>{deleteResult}</span></div>}
 
@@ -229,8 +243,6 @@ export default function SuperadminDashboard() {
         <AddAdminRequestsPanel />
 
         <UserSearchPanel onEnterOrg={enterOrg} />
-
-        <SecurityEventsPanel orgs={orgs} />
 
         <div className="panel" style={{ padding: 20, marginBottom: 16 }}>
           <h3 style={{ margin: '0 0 12px' }}>Organizations</h3>
@@ -318,6 +330,8 @@ export default function SuperadminDashboard() {
               </tbody>
             </table>
           </div>
+        )}
+        </>
         )}
       </section>
     </div>
@@ -990,7 +1004,7 @@ function SecurityEventsPanel({ orgs }) {
         organization — most recent {events?.length ?? '…'} shown.
       </p>
 
-      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 16 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 16 }}>
         <select value={eventTypeFilter} onChange={(e) => setEventTypeFilter(e.target.value)} style={{ minWidth: 160 }}>
           <option value="">All event types</option>
           {eventTypes.map((t) => <option key={t} value={t}>{t}</option>)}

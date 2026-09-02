@@ -25,21 +25,22 @@ export default function SpaceSwitcher({ activeTab }) {
   const navigate = useNavigate();
   const { role } = useAuth();
   // Narrow viewports get a hamburger + dropdown instead of the full button
-  // row (up to 6 buttons for a student) — same items, same navigate() call,
-  // just collapsed. Both the row and the toggle/dropdown are always in the
-  // DOM; a media query picks which one is visible, so there's no layout
-  // flash from a JS-computed width check on mount.
+  // row (up to 5 buttons for a student now, plus the More dropdown below) —
+  // same items, same navigate() call, just collapsed. Both the row and the
+  // toggle/dropdown are always in the DOM; a media query picks which one is
+  // visible, so there's no layout flash from a JS-computed width check on
+  // mount.
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
   const containerRef = useRef(null);
+  const moreRef = useRef(null);
 
   // One single priority order, filtered per role rather than reordered per
   // role — every role sees a subsequence of this exact same list, so the
   // relative hierarchy (whatever a role does see, it sees in this order)
   // never drifts between roles: Dashboard (home base) > Notices
   // (time-sensitive announcements) > Assignments/Exams (actionable, has a
-  // deadline) > Notes (reference material, no deadline) > IDE (a free
-  // scratch space, the least "important" item here since nothing about it
-  // is graded or due).
+  // deadline).
   const spaces = [
     ...(role === 'student' ? [{ id: 'performance', label: 'Dashboard', path: '/performance' }] : []),
     ...(role === 'admin' || role === 'teacher' ? [{ id: 'admin', label: 'Dashboard', path: '/admin' }] : []),
@@ -47,18 +48,30 @@ export default function SpaceSwitcher({ activeTab }) {
     // A teacher/admin creates/grades assignments and exams from their own
     // admin dashboard tabs (see AssignmentsPanel/ExamsPanel there) — they
     // never attempt one themselves the way a student does, so these
-    // student-facing attempt-flow links (and the free-form IDE) are
-    // student-only, same as Notes below.
+    // student-facing attempt-flow links are student-only, same as
+    // moreSpaces below.
     ...(role === 'student' ? [{ id: 'assignments', label: 'Assignments', path: '/assignments' }] : []),
     ...(role === 'student' ? [{ id: 'exams', label: 'Exams', path: '/exams' }] : []),
-    ...(role === 'student' ? [{ id: 'notes', label: 'Notes', path: '/notes' }] : []),
-    ...(role === 'student' ? [{ id: 'ide', label: 'IDE', path: '/ide' }] : []),
-    // Unconditional — every role gets an ID card/photo page, so unlike
-    // everything above it this isn't filtered by role at all. Placed last:
-    // same reasoning as IDE being last for a student, nothing about it is
-    // time-sensitive or actionable the way the entries above it are.
-    { id: 'profile', label: 'Profile', path: '/profile' },
+    // Admin/teacher only now — a student's own photo library, institutions,
+    // and ID cards live under their Dashboard's My Info tab instead (see
+    // MyPerformance.jsx's MyInfoPanel).
+    ...(role === 'admin' || role === 'teacher' ? [{ id: 'profile', label: 'Profile', path: '/profile' }] : []),
   ];
+
+  // Reference material and scratch tools — nothing here has a deadline the
+  // way Assignments/Exams do, so it's the lowest-priority tier and gets
+  // folded behind one "More" button instead of each taking its own slot in
+  // the row: Notes (reference material) > Doubts (ask, not time-sensitive
+  // once posted) > Chat (a private line to a teacher, same non-urgency) >
+  // IDE (a free scratch space). Student-only today since that's the only
+  // role with enough items to need folding at all.
+  const moreSpaces = role === 'student' ? [
+    { id: 'notes', label: 'Notes', path: '/notes' },
+    { id: 'doubts', label: 'Doubts', path: '/doubts' },
+    { id: 'chat', label: 'Chat', path: '/chat' },
+    { id: 'ide', label: 'IDE', path: '/ide' },
+  ] : [];
+  const moreActive = moreSpaces.some((s) => s.id === activeTab);
 
   useEffect(() => {
     if (!mobileOpen) return undefined;
@@ -69,8 +82,18 @@ export default function SpaceSwitcher({ activeTab }) {
     return () => document.removeEventListener('mousedown', onClickOutside);
   }, [mobileOpen]);
 
+  useEffect(() => {
+    if (!moreOpen) return undefined;
+    const onClickOutside = (e) => {
+      if (moreRef.current && !moreRef.current.contains(e.target)) setMoreOpen(false);
+    };
+    document.addEventListener('mousedown', onClickOutside);
+    return () => document.removeEventListener('mousedown', onClickOutside);
+  }, [moreOpen]);
+
   const go = (path) => {
     setMobileOpen(false);
+    setMoreOpen(false);
     navigate(path);
   };
 
@@ -89,6 +112,37 @@ export default function SpaceSwitcher({ activeTab }) {
             {s.label}
           </button>
         ))}
+        {moreSpaces.length > 0 && (
+          <div style={{ position: 'relative' }} ref={moreRef}>
+            <button
+              type="button"
+              role="tab"
+              aria-haspopup="true"
+              aria-expanded={moreOpen}
+              aria-pressed={moreActive}
+              className={moreActive ? 'active' : ''}
+              onClick={() => setMoreOpen((v) => !v)}
+            >
+              More
+            </button>
+            {moreOpen && (
+              <div className="panel segmented space-nav-drawer" role="tablist" aria-label="More">
+                {moreSpaces.map((s) => (
+                  <button
+                    key={s.id}
+                    type="button"
+                    role="tab"
+                    aria-pressed={activeTab === s.id}
+                    className={activeTab === s.id ? 'active' : ''}
+                    onClick={() => go(s.path)}
+                  >
+                    {s.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="space-nav-mobile" ref={containerRef}>
@@ -103,7 +157,7 @@ export default function SpaceSwitcher({ activeTab }) {
         </button>
         {mobileOpen && (
           <div className="panel segmented space-nav-drawer space-nav-drawer-center" role="tablist" aria-label="Space">
-            {spaces.map((s) => (
+            {[...spaces, ...moreSpaces].map((s) => (
               <button
                 key={s.id}
                 type="button"

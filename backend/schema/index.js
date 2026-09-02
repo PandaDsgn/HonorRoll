@@ -1401,6 +1401,150 @@ function ensureNoticesSchema() {
 bootSchemaStep(ensureNoticesSchema);
 
 // ============================================================================
+// DOUBTS — a student's question to one specific subject teacher (teacher_id,
+// chosen at ask-time from that subject's own subject_teachers), with a
+// lightweight reply thread (doubt_replies). Routed narrowly on the answering
+// side — a doubt sent to one teacher never appears in a co-teacher's own
+// queue (see GET /api/teacher/doubts) — but visible broadly on the asking
+// side: any student who can see the subject at all can browse every doubt
+// ever asked in it, regardless of which teacher it went to (see GET
+// /api/doubts), so a student can check "has this already been answered"
+// before posting a near-duplicate. The asker's identity is redacted from
+// that broader view (see serializeDoubtRow in routes/doubts.js) — visible
+// to the assigned teacher and to the asker themselves, nobody else.
+// attachment_type mirrors notes' file/text split, just narrower ('none' —
+// the common case, a plain typed question — 'photo', or 'video'); unlike
+// notes there's no separate text/link type since question_text is always
+// required regardless of whether a file rides along with it.
+// ============================================================================
+let doubtsSchemaPromise = null;
+function ensureDoubtsSchema() {
+  if (!doubtsSchemaPromise) {
+    doubtsSchemaPromise = Promise.all([ensureSubjectsSchema(), ensureUsersSchema()]).then(async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS doubts (
+          id SERIAL PRIMARY KEY,
+          organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          subject_id INTEGER NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
+          student_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          teacher_id UUID REFERENCES users(id) ON DELETE CASCADE,
+          question_text TEXT NOT NULL,
+          attachment_type TEXT NOT NULL DEFAULT 'none',
+          original_filename TEXT,
+          storage_key TEXT,
+          status TEXT NOT NULL DEFAULT 'open',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `);
+      // teacher_id is nullable by design, not by omission: a doubt is
+      // fundamentally addressed to a SUBJECT, not a teacher — every teacher
+      // of that subject can see and answer it (GET /api/teacher/doubts,
+      // GET /api/doubts/:id, POST /api/doubts/:id/replies all treat a NULL
+      // teacher_id as "any of this subject's teachers"). A student can
+      // still narrow it to one specific teacher at ask-time, which is the
+      // only case teacher_id is ever actually set. DROP NOT NULL brings an
+      // already-created table (from before this became optional) in line —
+      // safe to re-run on every boot, same as every other ALTER here.
+      await pool.query('ALTER TABLE doubts ALTER COLUMN teacher_id DROP NOT NULL');
+      await pool.query('CREATE INDEX IF NOT EXISTS doubts_subject_id_idx ON doubts(subject_id)');
+      await pool.query('CREATE INDEX IF NOT EXISTS doubts_teacher_id_idx ON doubts(teacher_id)');
+      await pool.query('CREATE INDEX IF NOT EXISTS doubts_student_id_idx ON doubts(student_id)');
+
+      // Both a teacher's answer and a student's own follow-up land here —
+      // author_role disambiguates which, since author_id alone can't (a
+      // student could in principle also be a teacher elsewhere, and the
+      // role a person acted in matters more here than who they are
+      // globally). A teacher reply flips the parent doubt to 'answered'; a
+      // student follow-up flips it back to 'open' — see POST
+      // /api/doubts/:id/replies in routes/doubts.js.
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS doubt_replies (
+          id SERIAL PRIMARY KEY,
+          doubt_id INTEGER NOT NULL REFERENCES doubts(id) ON DELETE CASCADE,
+          author_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          author_role TEXT NOT NULL,
+          body_text TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `);
+      await pool.query('CREATE INDEX IF NOT EXISTS doubt_replies_doubt_id_idx ON doubt_replies(doubt_id)');
+    }).catch((err) => console.error('Failed to ensure doubts schema:', err));
+  }
+  return doubtsSchemaPromise;
+}
+bootSchemaStep(ensureDoubtsSchema);
+
+// ============================================================================
+// E2EE CHAT — a private 1:1 channel between a student and a teacher of a
+// subject they're enrolled in (see routes/chat.js's own canChat() for the
+// exact "who can message whom" rule, mirroring doubts' subject_teachers-
+// based authorization). TRUE end-to-end encryption, not just encryption at
+// rest: this server never holds a private key or plaintext message, only
+// ciphertext it cannot itself decrypt.
+//
+// user_e2ee_keys holds each user's ECDH public key (shared openly — it's
+// not secret) and their PRIVATE key, but only ever in a form encrypted
+// client-side with a key derived from that user's own account password
+// (PBKDF2, never sent to the server) — the server stores an opaque blob
+// it has no way to open. This is what lets the same private key (and so
+// the same ability to decrypt old messages) follow a user across devices
+// without the server ever holding key material in the clear: log in
+// anywhere with the same password, unwrap the same blob, get the same key.
+// A password RESET (as opposed to a normal login) can't re-wrap this blob
+// — the old wrapping key is gone the moment the old password is — so a
+// reset genuinely and unavoidably forfeits access to prior chat history;
+// see ResetPassword.jsx's own notice for that tradeoff spelled out to the
+// user at the moment it happens.
+let e2eeKeysSchemaPromise = null;
+function ensureE2eeKeysSchema() {
+  if (!e2eeKeysSchemaPromise) {
+    e2eeKeysSchemaPromise = ensureUsersSchema().then(async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS user_e2ee_keys (
+          user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+          public_key_jwk TEXT NOT NULL,
+          wrapped_private_key TEXT NOT NULL,
+          wrap_salt TEXT NOT NULL,
+          wrap_iv TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `);
+    }).catch((err) => console.error('Failed to ensure E2EE keys schema:', err));
+  }
+  return e2eeKeysSchemaPromise;
+}
+bootSchemaStep(ensureE2eeKeysSchema);
+
+// chat_messages stores only what the server is ALLOWED to see: who sent
+// what to whom and when — never the content. ciphertext/iv are opaque
+// base64 blobs produced by the sender's browser (AES-GCM, keyed by an
+// ECDH-derived shared secret between sender and recipient — see
+// frontend/src/lib/e2ee.js); this server just stores and relays them.
+let chatMessagesSchemaPromise = null;
+function ensureChatMessagesSchema() {
+  if (!chatMessagesSchemaPromise) {
+    chatMessagesSchemaPromise = Promise.all([ensureOrganizationsSchema(), ensureUsersSchema()]).then(async () => {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS chat_messages (
+          id SERIAL PRIMARY KEY,
+          organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          sender_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          recipient_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          ciphertext TEXT NOT NULL,
+          iv TEXT NOT NULL,
+          read_at TIMESTAMPTZ,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `);
+      await pool.query('CREATE INDEX IF NOT EXISTS chat_messages_sender_id_idx ON chat_messages(sender_id)');
+      await pool.query('CREATE INDEX IF NOT EXISTS chat_messages_recipient_id_idx ON chat_messages(recipient_id)');
+    }).catch((err) => console.error('Failed to ensure chat messages schema:', err));
+  }
+  return chatMessagesSchemaPromise;
+}
+bootSchemaStep(ensureChatMessagesSchema);
+
+// ============================================================================
 // NOTIFICATIONS — generic per-user feed, one row per event. Two producers
 // today: a teacher posting a note (POST /api/teacher/notes, unit-scoped to
 // students under that subject) and an admin posting a notice (POST
@@ -1414,7 +1558,7 @@ bootSchemaStep(ensureNoticesSchema);
 let notificationsSchemaPromise = null;
 function ensureNotificationsSchema() {
   if (!notificationsSchemaPromise) {
-    notificationsSchemaPromise = Promise.all([ensureNotesSchema(), ensureNoticesSchema(), ensureUsersSchema(), ensureProblemsSchema(), ensureExamSchema()]).then(async () => {
+    notificationsSchemaPromise = Promise.all([ensureNotesSchema(), ensureNoticesSchema(), ensureUsersSchema(), ensureProblemsSchema(), ensureExamSchema(), ensureDoubtsSchema()]).then(async () => {
       await pool.query(`
         CREATE TABLE IF NOT EXISTS notifications (
           id SERIAL PRIMARY KEY,
@@ -1442,6 +1586,9 @@ function ensureNotificationsSchema() {
       // pattern as note_id/notice_id above.
       await pool.query('ALTER TABLE notifications ADD COLUMN IF NOT EXISTS problem_id INTEGER REFERENCES problems(id) ON DELETE CASCADE');
       await pool.query('ALTER TABLE notifications ADD COLUMN IF NOT EXISTS exam_id INTEGER REFERENCES exams(id) ON DELETE CASCADE');
+      // "New doubt for you to answer" (teacher) / "Your doubt got a reply"
+      // (student) — see POST /api/doubts and POST /api/doubts/:id/replies.
+      await pool.query('ALTER TABLE notifications ADD COLUMN IF NOT EXISTS doubt_id INTEGER REFERENCES doubts(id) ON DELETE CASCADE');
     }).catch((err) => console.error('Failed to ensure notifications schema:', err));
   }
   return notificationsSchemaPromise;

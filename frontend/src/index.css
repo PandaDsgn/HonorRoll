@@ -43,6 +43,17 @@
   --blue: #3b82f6;
   --blue-dim: rgba(59, 130, 246, 0.15);
 
+  /* Second accent — a warm complement to --accent's cool sapphire, for
+     anything that needs to stand out as its own distinct signal alongside
+     (not instead of) the primary accent: a featured/highlighted state, a
+     "new" indicator, a second brand moment. Deliberately not derived from
+     --gold (that one's scoped to .btn-secondary-choice specifically, see
+     its own comment) or --warn (a real warning state, not a decorative
+     accent) — this is its own thing, free to use anywhere a second accent
+     earns its place. */
+  --amber: #e0954a;
+  --amber-dim: rgba(224, 149, 74, 0.16);
+
   /* Apple font stacks, exclusively — -apple-system/BlinkMacSystemFont
      resolve to San Francisco on macOS/iOS/iPadOS; "SF Pro Text"/"SF Pro
      Display" are named explicitly for the rare case a browser doesn't
@@ -464,6 +475,9 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity:
 .chip-easy { color: var(--teal); }
 .chip-medium { color: var(--warn); }
 .chip-hard { color: var(--danger); }
+/* Not a status like the three above (pass/pending/fail) — flags something
+   as new or worth a second look, e.g. the Changelog's "Latest" tag. */
+.chip-amber { color: var(--amber); }
 
 /* ---------- segmented control ---------- */
 /* Each tab is its own standalone button (not a joined pill). Genuinely
@@ -494,12 +508,16 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity:
   color: var(--accent);
 }
 
-/* ---------- language picker ---------- */
-/* A dropdown rather than a .segmented button row — with 10 languages now
-   supported (see codeLanguages.js), a button per language stopped fitting
-   any screen size, not just mobile. Used by IDE.jsx, Sandbox.jsx,
-   ExamAttempt.jsx, and ScanCapture.jsx's coding-item editor. */
-.language-select {
+/* ---------- select (every dropdown in the app) ---------- */
+/* Originally scoped to .language-select alone (IDE.jsx, Sandbox.jsx,
+   ExamAttempt.jsx, ScanCapture.jsx's coding-item editor), but a bare
+   <select> anywhere else in the app got none of this — just the OS's own
+   native chrome (a thick blue focus ring on macOS/Safari in particular),
+   which reads as a jarring inconsistency next to every other styled
+   control. Promoted to the bare element so every select in the app —
+   subject/status filter dropdowns included — gets the same treatment with
+   no per-callsite className needed. */
+select {
   /* appearance: none strips the native select chrome (including its own
      arrow, which looks inconsistent across browsers/OSes) so the SVG
      chevron below is the only one that ever shows. */
@@ -520,12 +538,41 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity:
   cursor: pointer;
   transition: background-color 0.15s ease, border-color 0.15s ease;
 }
-.language-select:hover { border-color: var(--text-dim); background-color: var(--surface-3); }
-.language-select:focus {
+select:hover { border-color: var(--text-dim); background-color: var(--surface-3); }
+select:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-dim);
 }
+
+/* ---------- file input ---------- */
+/* Native file inputs render as an OS-chrome button + "No file chosen" text
+   with almost nothing else in CSS able to touch the button itself —
+   ::file-selector-button is the one part every modern browser (Chromium,
+   Firefox, Safari 15.4+) actually lets CSS restyle, so that's targeted
+   directly rather than hiding the input and drawing a fake button (which
+   would break native keyboard/screen-reader behavior for free). Matches
+   .btn-ghost's own look (transparent at rest, a plain border, no solid
+   fill even on hover) rather than introducing a third button language. */
+input[type='file'] {
+  color: var(--text-dim);
+  font-family: var(--font-sans);
+  font-size: 13px;
+}
+input[type='file']::file-selector-button {
+  margin-right: 12px;
+  padding: 6px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+input[type='file']::file-selector-button:hover { color: var(--text); border-color: var(--border-strong); background: var(--surface-2); }
 
 /* ---------- mobile hamburger nav (SpaceSwitcher, AdminDashboard tabs) ---------- */
 /* Below this width, a full row of segmented buttons (up to 8 for an admin)
