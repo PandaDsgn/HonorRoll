@@ -5,4 +5,11 @@ dist/
 .env.*.local
 *.log
 .DS_Store
-.env.production
+# .env.production is deliberately NOT ignored — VITE_API_URL is the only
+# thing in it, and it's not a secret: Vite bakes it directly into the
+# public JS bundle at build time regardless, visible to anyone via
+# view-source. Excluding this file meant GitHub Actions' build step (see
+# ../.github/workflows/deploy-frontend.yml) never had it, so every deploy
+# silently fell back to the http://localhost:3000 dev default — working
+# only on a machine that happened to have a local backend running on that
+# port, breaking for literally everyone else.
