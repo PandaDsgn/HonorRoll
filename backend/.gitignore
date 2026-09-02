@@ -1,8 +1,0 @@
-node_modules/
-.env
-.env.local
-temp/
-admin_passwords.csv
-*.log
-*.csv
-.DS_Store
