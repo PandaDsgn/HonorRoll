@@ -105,7 +105,13 @@ export default function AdminDashboard() {
               { id: 'gradebook', label: 'Gradebook', onClick: () => setTab('gradebook') },
               user?.role === 'teacher' && { id: 'uploads', label: 'Uploads', onClick: () => setTab('uploads') },
               user?.role === 'teacher' && { id: 'doubts', label: 'Doubts', onClick: () => setTab('doubts') },
-              user?.role === 'teacher' && { id: 'chat', label: 'Chat', onClick: () => setTab('chat') },
+              // Chat itself dropped from this row — it's now the standing
+              // icon beside the notification bell (SpaceSwitcher.jsx's
+              // ChatShortcut), same as it was pulled out of the student
+              // nav's "More" dropdown for the same reason. The `tab ===
+              // 'chat'` render branch further down stays, though — that's
+              // still how ChatShortcut's own navigate(..., {state:{tab:
+              // 'chat'}}) actually lands on it.
               user?.role === 'admin' && { id: 'notices', label: 'Notices', onClick: () => setTab('notices') },
               user?.role === 'admin' && { id: 'grade-scale', label: 'Grading', onClick: () => setTab('grade-scale') },
               user?.role === 'admin' && { id: 'structure', label: 'Structure', onClick: () => setTab('structure') },
