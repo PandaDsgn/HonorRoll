@@ -104,7 +104,13 @@ async function sweepOldLoginLocations() {
   }
 }
 
-Promise.all([ensureSecurityEventsSchema(), ensureLoginLocationsSchema()]).then(() => {
+// Sequential, not Promise.all — two schema-ensure calls that can each
+// still be triggering their own first-ever CREATE TABLE/ALTER TABLE
+// against a genuinely cold database (this module can load before
+// schema/index.js's own bootSchemaStep queue reaches either one) would
+// race for real; see schema/index.js's ensureOrgUnitsSchema for the same
+// gap and its fix.
+ensureSecurityEventsSchema().then(() => ensureLoginLocationsSchema()).then(() => {
   setInterval(sweepOldSecurityEvents, RETENTION_SWEEP_INTERVAL_MS);
   setInterval(sweepOldLoginLocations, RETENTION_SWEEP_INTERVAL_MS);
   sweepOldSecurityEvents();

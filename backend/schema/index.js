@@ -189,7 +189,11 @@ bootSchemaStep(ensureProblemsSchema);
 let judgeDataSchemaPromise = null;
 function ensureJudgeDataSchema() {
   if (!judgeDataSchemaPromise) {
-    judgeDataSchemaPromise = Promise.all([ensureProblemsSchema(), ensureUsersSchema()]).then(() => Promise.all([
+    // Sequential, not Promise.all — see ensureOrgUnitsSchema's own comment
+    // on why concurrent dependency DDL can deadlock a cold DB. The inner
+    // Promise.all below is a different, lower-risk pattern (three brand
+    // new, mutually-independent sibling tables, not a shared dependency).
+    judgeDataSchemaPromise = ensureProblemsSchema().then(() => ensureUsersSchema()).then(() => Promise.all([
       pool.query(`
         CREATE TABLE IF NOT EXISTS submissions (
           id SERIAL PRIMARY KEY,
@@ -922,7 +926,14 @@ bootSchemaStep(ensureOrgLevelDefsSchema);
 let orgUnitsSchemaPromise = null;
 function ensureOrgUnitsSchema() {
   if (!orgUnitsSchemaPromise) {
-    orgUnitsSchemaPromise = Promise.all([ensureOrganizationsSchema(), ensureOrgLevelDefsSchema()]).then(async () => {
+    orgUnitsSchemaPromise = (async () => {
+      // Sequential, not Promise.all — two real concurrent DDL statements
+      // against a genuinely cold database (as opposed to an already-
+      // migrated one, where every IF-NOT-EXISTS check is a no-op) can
+      // deadlock each other even though neither depends on the other's
+      // table directly. See lib/db.js's own comment on this exact gap.
+      await ensureOrganizationsSchema();
+      await ensureOrgLevelDefsSchema();
       await pool.query(`
         CREATE TABLE IF NOT EXISTS org_units (
           id SERIAL PRIMARY KEY,
@@ -936,7 +947,7 @@ function ensureOrgUnitsSchema() {
       await pool.query('CREATE INDEX IF NOT EXISTS org_units_parent_idx ON org_units(parent_unit_id)');
       await pool.query('ALTER TABLE memberships ADD COLUMN IF NOT EXISTS org_unit_id INTEGER REFERENCES org_units(id) ON DELETE SET NULL');
       await pool.query('ALTER TABLE organizations ADD COLUMN IF NOT EXISTS default_org_unit_id INTEGER REFERENCES org_units(id) ON DELETE SET NULL');
-    }).catch((err) => console.error('Failed to ensure org units schema:', err));
+    })().catch((err) => console.error('Failed to ensure org units schema:', err));
   }
   return orgUnitsSchemaPromise;
 }
@@ -1010,7 +1021,11 @@ bootSchemaStep(ensureOrganizationLogoSchema);
 // never take out the membership row it happened to be attached to — the
 // card just falls back to "no photo" until a new one's picked.
 async function ensureMembershipActivePhotoColumn() {
-  await Promise.all([ensureMembershipsSchema(), ensureUserPhotosSchema()]);
+  // Sequential, not Promise.all — see ensureOrgUnitsSchema's own comment on
+  // why two concurrent DDL-bearing dependency awaits can deadlock a
+  // genuinely cold database even when they touch different tables.
+  await ensureMembershipsSchema();
+  await ensureUserPhotosSchema();
   try {
     await pool.query('ALTER TABLE memberships ADD COLUMN IF NOT EXISTS active_photo_id INTEGER REFERENCES user_photos(id) ON DELETE SET NULL');
   } catch (err) {
@@ -1030,7 +1045,12 @@ bootSchemaStep(ensureMembershipActivePhotoColumn);
 let subjectsSchemaPromise = null;
 function ensureSubjectsSchema() {
   if (!subjectsSchemaPromise) {
-    subjectsSchemaPromise = Promise.all([ensureOrganizationsSchema(), ensureOrgUnitsSchema(), ensureUsersSchema()]).then(async () => {
+    subjectsSchemaPromise = (async () => {
+      // Sequential, not Promise.all — see ensureOrgUnitsSchema's own
+      // comment on why concurrent dependency DDL can deadlock a cold DB.
+      await ensureOrganizationsSchema();
+      await ensureOrgUnitsSchema();
+      await ensureUsersSchema();
       await pool.query(`
         CREATE TABLE IF NOT EXISTS subjects (
           id SERIAL PRIMARY KEY,
@@ -1047,7 +1067,7 @@ function ensureSubjectsSchema() {
           PRIMARY KEY (subject_id, user_id)
         )
       `);
-    }).catch((err) => console.error('Failed to ensure subjects schema:', err));
+    })().catch((err) => console.error('Failed to ensure subjects schema:', err));
   }
   return subjectsSchemaPromise;
 }
@@ -1066,7 +1086,12 @@ bootSchemaStep(ensureSubjectsSchema);
 let scanSubmissionsSchemaPromise = null;
 function ensureScanSubmissionsSchema() {
   if (!scanSubmissionsSchemaPromise) {
-    scanSubmissionsSchemaPromise = Promise.all([ensureProblemsSchema(), ensureUsersSchema()]).then(() => pool.query(`
+    scanSubmissionsSchemaPromise = (async () => {
+      // Sequential, not Promise.all — see ensureOrgUnitsSchema's own
+      // comment on why concurrent dependency DDL can deadlock a cold DB.
+      await ensureProblemsSchema();
+      await ensureUsersSchema();
+      return pool.query(`
       CREATE TABLE IF NOT EXISTS scan_submissions (
         id SERIAL PRIMARY KEY,
         problem_id INTEGER NOT NULL REFERENCES problems(id) ON DELETE CASCADE,
@@ -1097,7 +1122,8 @@ function ensureScanSubmissionsSchema() {
       // remarks) — set alongside marks in PUT /api/admin/scan-submissions/
       // :id/grade.
       await pool.query('ALTER TABLE scan_submissions ADD COLUMN IF NOT EXISTS overall_remarks TEXT');
-    })).catch((err) => console.error('Failed to ensure scan_submissions schema:', err));
+      });
+    })().catch((err) => console.error('Failed to ensure scan_submissions schema:', err));
   }
   return scanSubmissionsSchemaPromise;
 }
@@ -1110,7 +1136,11 @@ bootSchemaStep(ensureScanSubmissionsSchema);
 let scanPlagiarismFlagsSchemaPromise = null;
 function ensureScanPlagiarismFlagsSchema() {
   if (!scanPlagiarismFlagsSchemaPromise) {
-    scanPlagiarismFlagsSchemaPromise = Promise.all([ensureScanSubmissionsSchema(), ensureScanAssignmentQuestionsSchema()]).then(async () => {
+    scanPlagiarismFlagsSchemaPromise = (async () => {
+      // Sequential, not Promise.all — see ensureOrgUnitsSchema's own
+      // comment on why concurrent dependency DDL can deadlock a cold DB.
+      await ensureScanSubmissionsSchema();
+      await ensureScanAssignmentQuestionsSchema();
       await pool.query(`
         CREATE TABLE IF NOT EXISTS scan_plagiarism_flags (
           id SERIAL PRIMARY KEY,
@@ -1138,7 +1168,7 @@ function ensureScanPlagiarismFlagsSchema() {
       // inserted (every NULL would look distinct to it).
       await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS scan_plagiarism_flags_pair_submission_idx ON scan_plagiarism_flags(problem_id, submission_a_id, submission_b_id, flag_type) WHERE question_id IS NULL');
       await pool.query('CREATE UNIQUE INDEX IF NOT EXISTS scan_plagiarism_flags_pair_question_idx ON scan_plagiarism_flags(problem_id, submission_a_id, submission_b_id, flag_type, question_id) WHERE question_id IS NOT NULL');
-    }).catch((err) => console.error('Failed to ensure scan_plagiarism_flags schema:', err));
+    })().catch((err) => console.error('Failed to ensure scan_plagiarism_flags schema:', err));
   }
   return scanPlagiarismFlagsSchemaPromise;
 }
@@ -1227,7 +1257,11 @@ bootSchemaStep(ensureScanAssignmentQuestionsSchema);
 let scanSubmissionAnswersSchemaPromise = null;
 function ensureScanSubmissionAnswersSchema() {
   if (!scanSubmissionAnswersSchemaPromise) {
-    scanSubmissionAnswersSchemaPromise = Promise.all([ensureScanSubmissionsSchema(), ensureScanAssignmentQuestionsSchema()]).then(async () => {
+    scanSubmissionAnswersSchemaPromise = (async () => {
+      // Sequential, not Promise.all — see ensureOrgUnitsSchema's own
+      // comment on why concurrent dependency DDL can deadlock a cold DB.
+      await ensureScanSubmissionsSchema();
+      await ensureScanAssignmentQuestionsSchema();
       await pool.query(`
         CREATE TABLE IF NOT EXISTS scan_submission_answers (
           id SERIAL PRIMARY KEY,
@@ -1249,7 +1283,7 @@ function ensureScanSubmissionAnswersSchema() {
       // marks_awarded and of ai_assessment (the AI's own aid-only note),
       // and addable to any question type, not just the manually-graded ones.
       await pool.query('ALTER TABLE scan_submission_answers ADD COLUMN IF NOT EXISTS remarks TEXT');
-    }).catch((err) => console.error('Failed to ensure scan_submission_answers schema:', err));
+    })().catch((err) => console.error('Failed to ensure scan_submission_answers schema:', err));
   }
   return scanSubmissionAnswersSchemaPromise;
 }
@@ -1315,7 +1349,11 @@ bootSchemaStep(ensureScanSubmissionProcessingStartedColumn);
 let notesSchemaPromise = null;
 function ensureNotesSchema() {
   if (!notesSchemaPromise) {
-    notesSchemaPromise = Promise.all([ensureSubjectsSchema(), ensureUsersSchema()]).then(async () => {
+    notesSchemaPromise = (async () => {
+      // Sequential, not Promise.all — see ensureOrgUnitsSchema's own
+      // comment on why concurrent dependency DDL can deadlock a cold DB.
+      await ensureSubjectsSchema();
+      await ensureUsersSchema();
       await pool.query(`
         CREATE TABLE IF NOT EXISTS notes (
           id SERIAL PRIMARY KEY,
@@ -1353,7 +1391,7 @@ function ensureNotesSchema() {
           OR (type = 'link' AND external_url IS NOT NULL)
         )
       `);
-    }).catch((err) => console.error('Failed to ensure notes schema:', err));
+    })().catch((err) => console.error('Failed to ensure notes schema:', err));
   }
   return notesSchemaPromise;
 }
@@ -1370,7 +1408,11 @@ bootSchemaStep(ensureNotesSchema);
 let noticesSchemaPromise = null;
 function ensureNoticesSchema() {
   if (!noticesSchemaPromise) {
-    noticesSchemaPromise = Promise.all([ensureOrganizationsSchema(), ensureUsersSchema()]).then(async () => {
+    noticesSchemaPromise = (async () => {
+      // Sequential, not Promise.all — see ensureOrgUnitsSchema's own
+      // comment on why concurrent dependency DDL can deadlock a cold DB.
+      await ensureOrganizationsSchema();
+      await ensureUsersSchema();
       await pool.query(`
         CREATE TABLE IF NOT EXISTS notices (
           id SERIAL PRIMARY KEY,
@@ -1394,7 +1436,7 @@ function ensureNoticesSchema() {
           OR (type = 'link' AND external_url IS NOT NULL)
         )
       `);
-    }).catch((err) => console.error('Failed to ensure notices schema:', err));
+    })().catch((err) => console.error('Failed to ensure notices schema:', err));
   }
   return noticesSchemaPromise;
 }
@@ -1420,7 +1462,11 @@ bootSchemaStep(ensureNoticesSchema);
 let doubtsSchemaPromise = null;
 function ensureDoubtsSchema() {
   if (!doubtsSchemaPromise) {
-    doubtsSchemaPromise = Promise.all([ensureSubjectsSchema(), ensureUsersSchema()]).then(async () => {
+    doubtsSchemaPromise = (async () => {
+      // Sequential, not Promise.all — see ensureOrgUnitsSchema's own
+      // comment on why concurrent dependency DDL can deadlock a cold DB.
+      await ensureSubjectsSchema();
+      await ensureUsersSchema();
       await pool.query(`
         CREATE TABLE IF NOT EXISTS doubts (
           id SERIAL PRIMARY KEY,
@@ -1468,7 +1514,7 @@ function ensureDoubtsSchema() {
         )
       `);
       await pool.query('CREATE INDEX IF NOT EXISTS doubt_replies_doubt_id_idx ON doubt_replies(doubt_id)');
-    }).catch((err) => console.error('Failed to ensure doubts schema:', err));
+    })().catch((err) => console.error('Failed to ensure doubts schema:', err));
   }
   return doubtsSchemaPromise;
 }
@@ -1523,7 +1569,11 @@ bootSchemaStep(ensureE2eeKeysSchema);
 let chatMessagesSchemaPromise = null;
 function ensureChatMessagesSchema() {
   if (!chatMessagesSchemaPromise) {
-    chatMessagesSchemaPromise = Promise.all([ensureOrganizationsSchema(), ensureUsersSchema()]).then(async () => {
+    chatMessagesSchemaPromise = (async () => {
+      // Sequential, not Promise.all — see ensureOrgUnitsSchema's own
+      // comment on why concurrent dependency DDL can deadlock a cold DB.
+      await ensureOrganizationsSchema();
+      await ensureUsersSchema();
       await pool.query(`
         CREATE TABLE IF NOT EXISTS chat_messages (
           id SERIAL PRIMARY KEY,
@@ -1551,7 +1601,7 @@ function ensureChatMessagesSchema() {
       await pool.query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS message_type TEXT NOT NULL DEFAULT 'text'`);
       await pool.query('ALTER TABLE chat_messages ALTER COLUMN ciphertext DROP NOT NULL');
       await pool.query('ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS storage_key TEXT');
-    }).catch((err) => console.error('Failed to ensure chat messages schema:', err));
+    })().catch((err) => console.error('Failed to ensure chat messages schema:', err));
   }
   return chatMessagesSchemaPromise;
 }
@@ -1571,7 +1621,15 @@ bootSchemaStep(ensureChatMessagesSchema);
 let notificationsSchemaPromise = null;
 function ensureNotificationsSchema() {
   if (!notificationsSchemaPromise) {
-    notificationsSchemaPromise = Promise.all([ensureNotesSchema(), ensureNoticesSchema(), ensureUsersSchema(), ensureProblemsSchema(), ensureExamSchema(), ensureDoubtsSchema()]).then(async () => {
+    notificationsSchemaPromise = (async () => {
+      // Sequential, not Promise.all — see ensureOrgUnitsSchema's own
+      // comment on why concurrent dependency DDL can deadlock a cold DB.
+      await ensureNotesSchema();
+      await ensureNoticesSchema();
+      await ensureUsersSchema();
+      await ensureProblemsSchema();
+      await ensureExamSchema();
+      await ensureDoubtsSchema();
       await pool.query(`
         CREATE TABLE IF NOT EXISTS notifications (
           id SERIAL PRIMARY KEY,
@@ -1602,7 +1660,7 @@ function ensureNotificationsSchema() {
       // "New doubt for you to answer" (teacher) / "Your doubt got a reply"
       // (student) — see POST /api/doubts and POST /api/doubts/:id/replies.
       await pool.query('ALTER TABLE notifications ADD COLUMN IF NOT EXISTS doubt_id INTEGER REFERENCES doubts(id) ON DELETE CASCADE');
-    }).catch((err) => console.error('Failed to ensure notifications schema:', err));
+    })().catch((err) => console.error('Failed to ensure notifications schema:', err));
   }
   return notificationsSchemaPromise;
 }
@@ -1672,15 +1730,18 @@ function ensureSubscriptionsSchema() {
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       )
-    `)).then(() => Promise.all([
+    `)).then(async () => {
       // Widens the two CHECKs for tables that already existed before 'scale'
       // was added as a paid tier — same DROP/re-ADD pattern as
-      // ensureExamProctoringSchema's end_reason constraint.
-      pool.query('ALTER TABLE subscriptions DROP CONSTRAINT IF EXISTS subscriptions_plan_key_check').then(() =>
-        pool.query(`ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_plan_key_check CHECK (plan_key IN ('free', 'starter', 'growth', 'institution', 'scale'))`)),
-      pool.query('ALTER TABLE subscriptions DROP CONSTRAINT IF EXISTS subscriptions_pending_plan_key_check').then(() =>
-        pool.query(`ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_pending_plan_key_check CHECK (pending_plan_key IN ('starter', 'growth', 'institution', 'scale'))`)),
-    ])).catch((err) => console.error('Failed to ensure subscriptions schema:', err));
+      // ensureExamProctoringSchema's end_reason constraint. Sequential, not
+      // Promise.all — two ALTER TABLE statements against the SAME table
+      // (even different constraint names) can deadlock each other on a
+      // cold database; see ensureOrgUnitsSchema's own comment on this gap.
+      await pool.query('ALTER TABLE subscriptions DROP CONSTRAINT IF EXISTS subscriptions_plan_key_check');
+      await pool.query(`ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_plan_key_check CHECK (plan_key IN ('free', 'starter', 'growth', 'institution', 'scale'))`);
+      await pool.query('ALTER TABLE subscriptions DROP CONSTRAINT IF EXISTS subscriptions_pending_plan_key_check');
+      await pool.query(`ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_pending_plan_key_check CHECK (pending_plan_key IN ('starter', 'growth', 'institution', 'scale'))`);
+    }).catch((err) => console.error('Failed to ensure subscriptions schema:', err));
   }
   return subscriptionsSchemaPromise;
 }
@@ -1725,7 +1786,10 @@ async function ensureScanAssignmentColumns() {
 bootSchemaStep(ensureScanAssignmentColumns);
 
 async function ensureExamsSubjectColumn() {
-  await Promise.all([ensureSubjectsSchema(), ensureExamSchema()]);
+  // Sequential, not Promise.all — see ensureOrgUnitsSchema's own comment
+  // on why concurrent dependency DDL can deadlock a cold database.
+  await ensureSubjectsSchema();
+  await ensureExamSchema();
   try {
     await pool.query('ALTER TABLE exams ADD COLUMN IF NOT EXISTS subject_id INTEGER REFERENCES subjects(id) ON DELETE SET NULL');
   } catch (err) {
