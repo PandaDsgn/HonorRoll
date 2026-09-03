@@ -155,11 +155,29 @@
   gap: 10px;
 }
 
+/* Was `display: grid; grid-template-columns: 1fr 1fr auto auto` — correct
+   ONLY for its original 4-child test-case row (input, input, hidden-
+   toggle, delete button). Every other place in the app reuses this same
+   class for a plain "field(s) + submit button" row with a different
+   child count (most commonly just input + button), and a grid assigns
+   column tracks by POSITION regardless of what's actually in them — with
+   only 2 children, the button lands in the 2nd (1fr) track meant for a
+   second input and gets stretched to match, which is exactly the
+   oversized-button bug this was rewritten to fix. Flexbox sizes each
+   child by what it actually IS (input/select flex to fill, everything
+   else — buttons, the hidden-toggle label — stays sized to its own
+   content) regardless of how many of each there are, so this now works
+   identically for 2, 3, or the original 4 children. */
 .testcase-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr auto auto;
+  display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
+}
+.testcase-row > input,
+.testcase-row > select {
+  flex: 1 1 160px;
+  min-width: 0;
 }
 
 .testcase-row input[type='text'],
@@ -190,7 +208,11 @@
 }
 
 @media (max-width: 640px) {
-  .testcase-row { grid-template-columns: 1fr; }
+  .testcase-row { flex-direction: column; align-items: stretch; }
+  .testcase-row > input,
+  .testcase-row > select {
+    flex-basis: auto;
+  }
 }
 
 /* ---------- student submission history ---------- */
