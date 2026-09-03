@@ -4,6 +4,7 @@ import axios from 'axios';
 import { useAuth } from '../context/AuthContext';
 import { API } from '../config';
 import { on } from '../lib/realtime';
+import { chatLinkFor } from '../lib/chatLink';
 
 // Where clicking a notification of a given type sends the student — the
 // list pages, deliberately, not a specific item's detail route: an exam's
@@ -20,13 +21,6 @@ const NOTIFICATION_LINK_BY_TYPE = { assignment: '/assignments', exam: '/exams' }
 // pick its initial tab instead (see its own location.state?.tab).
 function doubtLinkFor(role) {
   return role === 'teacher' ? { path: '/admin', state: { tab: 'doubts' } } : { path: '/doubts', state: undefined };
-}
-
-// Same reasoning, same shape, for the encrypted chat feature — a
-// teacher's own chat inbox is a tab inside /admin, a student's is its own
-// top-level page.
-function chatLinkFor(role) {
-  return role === 'teacher' ? { path: '/admin', state: { tab: 'chat' } } : { path: '/chat', state: undefined };
 }
 
 function BellIcon() {

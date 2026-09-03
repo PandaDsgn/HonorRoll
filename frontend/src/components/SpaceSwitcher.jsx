@@ -1,7 +1,79 @@
-import { Fragment, useState, useEffect, useRef } from 'react';
+import { Fragment, useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
+import axios from 'axios';
 import { useAuth } from '../context/AuthContext';
+import { API } from '../config';
+import { on } from '../lib/realtime';
+import { chatLinkFor } from '../lib/chatLink';
 import NotificationBell from './NotificationBell';
+
+function SendIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <line x1="22" y1="2" x2="11" y2="13" />
+      <polygon points="22 2 15 22 11 13 2 9 22 2" />
+    </svg>
+  );
+}
+
+// A standing shortcut straight to Chat, with its own unread badge — reuses
+// the exact same `type: 'chat'` notifications this app already creates on
+// every new message (see routes/chat.js's createNotification call) rather
+// than inventing a second unread-count source of truth. Its own small poll/
+// push loop, same shape as NotificationBell's, since unread COUNT (not the
+// notification list itself) is this component's only state — sharing
+// NotificationBell's internal state isn't worth the coupling for that.
+function ChatShortcut() {
+  const navigate = useNavigate();
+  const { role } = useAuth();
+  const [unreadCount, setUnreadCount] = useState(0);
+
+  const fetchUnread = useCallback(async () => {
+    try {
+      const res = await axios.get(`${API}/api/notifications`, { withCredentials: true });
+      setUnreadCount(res.data.notifications.filter((n) => n.type === 'chat' && !n.read).length);
+    } catch {
+      // Silent — same "just try again next interval" posture as NotificationBell's own poll.
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchUnread();
+    const interval = setInterval(fetchUnread, 120000);
+    const onVisibilityChange = () => { if (document.visibilityState === 'visible') fetchUnread(); };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    const offNotification = on('notification', fetchUnread);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      offNotification();
+    };
+  }, [fetchUnread]);
+
+  const link = chatLinkFor(role);
+  return (
+    <button
+      type="button"
+      className="icon-btn"
+      aria-label="Chat"
+      onClick={() => navigate(link.path, link.state ? { state: link.state } : undefined)}
+      style={{ position: 'relative' }}
+    >
+      <SendIcon />
+      {unreadCount > 0 && (
+        <span
+          style={{
+            position: 'absolute', top: 2, right: 2, minWidth: 15, height: 15, padding: '0 3px',
+            borderRadius: 999, background: 'var(--amber)', color: '#1a1006',
+            fontSize: 10, fontWeight: 700, lineHeight: '15px', textAlign: 'center',
+          }}
+        >
+          {unreadCount > 9 ? '9+' : unreadCount}
+        </span>
+      )}
+    </button>
+  );
+}
 
 function MenuIcon() {
   return (
@@ -62,13 +134,15 @@ export default function SpaceSwitcher({ activeTab }) {
   // way Assignments/Exams do, so it's the lowest-priority tier and gets
   // folded behind one "More" button instead of each taking its own slot in
   // the row: Notes (reference material) > Doubts (ask, not time-sensitive
-  // once posted) > Chat (a private line to a teacher, same non-urgency) >
-  // IDE (a free scratch space). Student-only today since that's the only
-  // role with enough items to need folding at all.
+  // once posted) > IDE (a free scratch space). Student-only today since
+  // that's the only role with enough items to need folding at all. Chat
+  // used to live here too — it's now its own standing icon beside the
+  // notification bell (see ChatShortcut below), not buried a dropdown
+  // click deep, since unlike Notes/Doubts/IDE it can have something
+  // genuinely time-sensitive waiting (a new message).
   const moreSpaces = role === 'student' ? [
     { id: 'notes', label: 'Notes', path: '/notes' },
     { id: 'doubts', label: 'Doubts', path: '/doubts' },
-    { id: 'chat', label: 'Chat', path: '/chat' },
     { id: 'ide', label: 'IDE', path: '/ide' },
   ] : [];
   const moreActive = moreSpaces.some((s) => s.id === activeTab);
@@ -185,5 +259,10 @@ export default function SpaceSwitcher({ activeTab }) {
 // reason.)
 export function SpaceNotifications() {
   const { role } = useAuth();
-  return (role === 'student' || role === 'teacher') ? <NotificationBell /> : null;
+  return (role === 'student' || role === 'teacher') ? (
+    <>
+      <ChatShortcut />
+      <NotificationBell />
+    </>
+  ) : null;
 }
