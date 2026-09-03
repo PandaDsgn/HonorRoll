@@ -80,6 +80,15 @@ function doubtsObjectKey(organizationId, subjectId, fileId, extension = '.jpg') 
   return `doubts/${organizationId}/${subjectId}/${fileId}${extension}`;
 }
 
+// A chat attachment's bytes are ciphertext (see routes/chat.js) — this
+// server never learns what type of file it actually is, so there's no
+// real extension to speak of; the default here is purely cosmetic (never
+// read back or relied on for anything, unlike every other *ObjectKey's
+// extension param).
+function chatObjectKey(organizationId, senderId, fileId, extension = '.bin') {
+  return `chat/${organizationId}/${senderId}/${fileId}${extension}`;
+}
+
 // Profile photos belong to the global user identity (see memberships'
 // "users is pure identity" comment in index.js), not any one organization
 // — a student who uploads a headshot can reuse it as the photo on every
@@ -150,6 +159,6 @@ async function deleteScanPdf(objectKey) {
 
 module.exports = {
   isB2Configured, scanObjectKey, examScanObjectKey, notesObjectKey, noticesObjectKey,
-  avatarObjectKey, orgLogoObjectKey, doubtsObjectKey,
+  avatarObjectKey, orgLogoObjectKey, doubtsObjectKey, chatObjectKey,
   uploadScanPdf, getScanPdfUrl, downloadScanPdf, deleteScanPdf,
 };

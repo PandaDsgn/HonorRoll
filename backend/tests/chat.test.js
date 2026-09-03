@@ -187,4 +187,39 @@ describe('chat routes', () => {
     const res = await request(app).get(`/api/chat/${studentId}/messages`).set('Authorization', `Bearer ${outsiderTeacherToken}`);
     expect(res.status).toBe(403);
   });
+
+  // Attachment validation — B2 isn't configured in the test env (see
+  // tests/setupEnv.js), so these can't exercise a real upload, but they do
+  // prove the request-shape validation for non-text message types works:
+  // a well-formed attachment request gets as far as "recognized, storage
+  // unavailable" (503) rather than being rejected outright, and a
+  // malformed one (bad type, or a type that requires a file with none
+  // attached) is rejected before ever reaching the storage layer at all.
+  it('POST /api/chat/:otherUserId/messages rejects an invalid messageType', async () => {
+    const res = await request(app)
+      .post(`/api/chat/${teacherId}/messages`)
+      .set('Authorization', `Bearer ${studentToken}`)
+      .field('messageType', 'bogus')
+      .field('iv', 'ZmFrZQ==');
+    expect(res.status).toBe(400);
+  });
+
+  it('POST /api/chat/:otherUserId/messages rejects a non-text type with no file attached', async () => {
+    const res = await request(app)
+      .post(`/api/chat/${teacherId}/messages`)
+      .set('Authorization', `Bearer ${studentToken}`)
+      .field('messageType', 'photo')
+      .field('iv', 'ZmFrZQ==');
+    expect(res.status).toBe(400);
+  });
+
+  it('POST /api/chat/:otherUserId/messages recognizes a well-formed attachment (503, storage not configured — not a 400)', async () => {
+    const res = await request(app)
+      .post(`/api/chat/${teacherId}/messages`)
+      .set('Authorization', `Bearer ${studentToken}`)
+      .field('messageType', 'photo')
+      .field('iv', 'ZmFrZQ==')
+      .attach('file', Buffer.from('fake pre-encrypted bytes'), { filename: 'photo.enc', contentType: 'application/octet-stream' });
+    expect(res.status).toBe(503);
+  });
 });

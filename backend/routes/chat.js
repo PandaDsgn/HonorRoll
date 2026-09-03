@@ -11,6 +11,10 @@ const { authenticateToken } = require('../lib/auth');
 const { getVisibleSubjectIds, getTeacherScope } = require('../lib/performance');
 const { sendToUser } = require('../lib/realtime');
 const { createNotification } = require('../lib/notifications');
+const { notesUpload } = require('../lib/uploads');
+const { isB2Configured, chatObjectKey, uploadScanPdf, getScanPdfUrl } = require('../storage');
+
+const MESSAGE_TYPES = new Set(['text', 'photo', 'video', 'voice', 'document']);
 
 // Mirrors routes/doubts.js's teacherCanAccessDoubt in spirit — the same
 // subject_teachers-based relationship decides who's allowed to message
@@ -147,13 +151,17 @@ router.get('/api/chat/keys/:userId', authenticateToken, async (req, res) => {
 // Full thread with one contact, oldest first. Opening it marks every
 // incoming message in it as read — same "read on open, not per-message"
 // posture GET /api/doubts/:id and the notification bell both already use.
+// A non-text row carries a presigned attachmentUrl (the encrypted bytes
+// live in B2, not this table — see POST below) instead of inline
+// ciphertext; the client fetches that URL itself and decrypts what comes
+// back the same way it would inline ciphertext, just one extra hop.
 router.get('/api/chat/:otherUserId/messages', authenticateToken, async (req, res) => {
   const otherUserId = req.params.otherUserId;
   try {
     if (!(await canChat(req.user, otherUserId))) return res.status(403).json({ error: 'Not a chat contact' });
 
     const result = await pool.query(
-      `SELECT id, sender_id, ciphertext, iv, created_at FROM chat_messages
+      `SELECT id, sender_id, message_type, ciphertext, iv, storage_key, created_at FROM chat_messages
        WHERE (sender_id = $1 AND recipient_id = $2) OR (sender_id = $2 AND recipient_id = $1)
        ORDER BY created_at ASC`,
       [req.user.userId, otherUserId]
@@ -163,39 +171,63 @@ router.get('/api/chat/:otherUserId/messages', authenticateToken, async (req, res
       [req.user.userId, otherUserId]
     );
 
-    res.status(200).json({
-      messages: result.rows.map((r) => ({
-        id: r.id,
-        fromMe: r.sender_id === req.user.userId,
-        ciphertext: r.ciphertext,
-        iv: r.iv,
-        createdAt: r.created_at,
-      })),
-    });
+    const configured = isB2Configured();
+    const messages = await Promise.all(result.rows.map(async (r) => ({
+      id: r.id,
+      fromMe: r.sender_id === req.user.userId,
+      messageType: r.message_type,
+      ciphertext: r.ciphertext,
+      iv: r.iv,
+      attachmentUrl: r.storage_key && configured ? await getScanPdfUrl(r.storage_key) : null,
+      createdAt: r.created_at,
+    })));
+    res.status(200).json({ messages });
   } catch (err) {
     console.error('Get chat thread error:', err);
     res.status(500).json({ error: 'Failed to load messages' });
   }
 });
 
-// Send a message — body is already ciphertext+iv by the time it reaches
-// here; this route never sees plaintext. The notification created below
-// deliberately never echoes any message content, generic or otherwise —
-// only who it's from, since notifications.body is stored in the clear and
-// a leaked snippet there would defeat the whole point of encrypting
-// chat_messages in the first place.
-router.post('/api/chat/:otherUserId/messages', authenticateToken, async (req, res) => {
+// Send a message — either JSON-carried ciphertext+iv (a text message) or,
+// for everything else, an ALREADY-ENCRYPTED file (the sender's browser
+// encrypted the raw file bytes client-side before this request was ever
+// made — see frontend/src/lib/e2ee.js's encryptBytes) riding along as
+// multipart form data. Either way this route never sees plaintext of any
+// kind, text or file. The notification created below deliberately never
+// echoes any message content, generic or otherwise — only who it's from,
+// since notifications.body is stored in the clear and a leaked snippet
+// there would defeat the whole point of encrypting chat_messages (and now
+// chat attachments) in the first place.
+router.post('/api/chat/:otherUserId/messages', authenticateToken, notesUpload.single('file'), async (req, res) => {
   const otherUserId = req.params.otherUserId;
-  const { ciphertext, iv } = req.body;
-  if (!ciphertext || !iv) return res.status(400).json({ error: 'ciphertext and iv are required' });
+  const messageType = String(req.body.messageType || 'text');
+  const iv = req.body.iv;
+  const ciphertext = req.body.ciphertext || null;
+
+  if (!MESSAGE_TYPES.has(messageType)) return res.status(400).json({ error: 'Invalid message type' });
+  if (!iv) return res.status(400).json({ error: 'iv is required' });
+  if (messageType === 'text' && !ciphertext) return res.status(400).json({ error: 'ciphertext is required for a text message' });
+  if (messageType !== 'text' && !req.file) return res.status(400).json({ error: 'A file is required for this message type' });
 
   try {
     if (!(await canChat(req.user, otherUserId))) return res.status(403).json({ error: 'Not a chat contact' });
 
+    let storageKey = null;
+    if (req.file) {
+      if (!isB2Configured()) return res.status(503).json({ error: 'Attachment storage is not configured yet' });
+      // req.file.buffer is already ciphertext by the time it reaches here
+      // (encrypted client-side pre-upload) — 'application/octet-stream'
+      // rather than the real mimetype since this server has no way to
+      // know (or verify) what the real file type is, only the sender's
+      // own device does.
+      storageKey = chatObjectKey(req.user.organizationId, req.user.userId, crypto.randomUUID());
+      await uploadScanPdf(storageKey, req.file.buffer, 'application/octet-stream');
+    }
+
     const insertRes = await pool.query(
-      `INSERT INTO chat_messages (organization_id, sender_id, recipient_id, ciphertext, iv)
-       VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at`,
-      [req.user.organizationId, req.user.userId, otherUserId, ciphertext, iv]
+      `INSERT INTO chat_messages (organization_id, sender_id, recipient_id, message_type, ciphertext, iv, storage_key)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, created_at`,
+      [req.user.organizationId, req.user.userId, otherUserId, messageType, ciphertext, iv, storageKey]
     );
 
     sendToUser(otherUserId, 'chat-message', { fromUserId: req.user.userId });

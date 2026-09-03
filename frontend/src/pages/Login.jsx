@@ -176,8 +176,8 @@ export default function Login() {
   // completion points below fires; see ensureE2eeKeys's own comment for
   // why the plaintext password (not persisted anywhere) is what a fresh
   // device needs to recover or set up this account's chat key.
-  const setUpChatKeys = () => {
-    ensureE2eeKeys(password).catch((err) => console.error('Failed to set up encrypted chat keys (continuing anyway):', err));
+  const setUpChatKeys = (userId) => {
+    ensureE2eeKeys(password, userId).catch((err) => console.error('Failed to set up encrypted chat keys (continuing anyway):', err));
   };
 
   // Separate from handleLogin's onSubmit wrapper below so handleVerifyOtp
@@ -215,7 +215,7 @@ export default function Login() {
 
       if (response.status === 200) {
         login(response.data.token, response.data.user);
-        setUpChatKeys();
+        setUpChatKeys(response.data.user.id);
         // replace, not push — otherwise /login stays one swipe/back-button
         // press behind the dashboard forever, and a signed-in user landing
         // back on the login form (then having to swipe forward again to
@@ -282,7 +282,7 @@ export default function Login() {
       }
       if (response.data.token) {
         login(response.data.token, response.data.user);
-        setUpChatKeys();
+        setUpChatKeys(response.data.user.id);
         navigate(landingPathFor(response.data.user.role), { replace: true });
       }
     } catch (err) {
@@ -343,7 +343,7 @@ export default function Login() {
         return;
       }
       login(response.data.token, response.data.user);
-      setUpChatKeys();
+      setUpChatKeys(response.data.user.id);
       navigate(landingPathFor(response.data.user.role), { replace: true });
     } catch (err) {
       setError(err.response?.data?.error || 'Network error. Is the backend server running?');
@@ -359,7 +359,7 @@ export default function Login() {
     try {
       const response = await axios.post(`${API}/api/login/accept-tos`, { tosPendingToken });
       login(response.data.token, response.data.user);
-      setUpChatKeys();
+      setUpChatKeys(response.data.user.id);
       navigate(landingPathFor(response.data.user.role), { replace: true });
     } catch (err) {
       setError(err.response?.data?.error || 'Network error. Is the backend server running?');

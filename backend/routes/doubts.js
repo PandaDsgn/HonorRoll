@@ -17,7 +17,7 @@ const { notesUpload } = require('../lib/uploads');
 const { isB2Configured, doubtsObjectKey, uploadScanPdf, getScanPdfUrl } = require('../storage');
 const { createNotification } = require('../lib/notifications');
 
-const ATTACHMENT_DEFAULT_EXT = { photo: '.jpg', video: '.mp4' };
+const ATTACHMENT_DEFAULT_EXT = { photo: '.jpg', video: '.mp4', document: '.pdf' };
 
 // Simple word-overlap ranking for the "have I seen this before" duplicate
 // check (GET /api/doubts/similar) — same shingle/set-overlap idea as
@@ -379,7 +379,8 @@ router.post('/api/doubts', authenticateToken, notesUpload.single('file'), async 
   if (req.file) {
     if (req.file.mimetype.startsWith('image/')) attachmentType = 'photo';
     else if (req.file.mimetype.startsWith('video/')) attachmentType = 'video';
-    else return res.status(400).json({ error: 'Attachments must be a photo or a video' });
+    else if (req.file.mimetype === 'application/pdf') attachmentType = 'document';
+    else return res.status(400).json({ error: 'Attachments must be a photo, a video, or a PDF' });
     if (!isB2Configured()) return res.status(503).json({ error: 'Attachment storage is not configured yet' });
   }
 

@@ -18,12 +18,23 @@ function formatDate(iso) {
 
 const STATUS_CLASS = { open: 'chip-medium', answered: 'chip-easy' };
 
+function DocumentIcon() {
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+      <path d="M14 2v6h6" />
+    </svg>
+  );
+}
+
 // A doubt's attachment, shown small next to its card in every list (board,
-// My Doubts, the teacher's queue) — same object either way (an image or a
-// short video), just cropped square rather than shown at full size the way
-// DoubtDetail renders it. Video gets no controls/poster of its own
-// (pointerEvents: 'none' so a click on it still opens the card like the
-// rest of it) — the browser's own first frame is enough of a preview here.
+// My Doubts, the teacher's queue) — same object either way (an image, a
+// short video, or a document), just cropped square rather than shown at
+// full size the way DoubtDetail renders it. Video gets no controls/poster
+// of its own (pointerEvents: 'none' so a click on it still opens the card
+// like the rest of it) — the browser's own first frame is enough of a
+// preview here. A document has no visual preview to speak of, so it's
+// just an icon in the same-sized slot for layout consistency.
 function AttachmentThumb({ attachmentType, attachmentUrl }) {
   if (!attachmentUrl) return null;
   const style = {
@@ -32,6 +43,13 @@ function AttachmentThumb({ attachmentType, attachmentUrl }) {
   };
   if (attachmentType === 'photo') return <img src={attachmentUrl} alt="" style={style} />;
   if (attachmentType === 'video') return <video src={attachmentUrl} muted playsInline preload="metadata" style={{ ...style, pointerEvents: 'none' }} />;
+  if (attachmentType === 'document') {
+    return (
+      <div style={{ ...style, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-dim)' }}>
+        <DocumentIcon />
+      </div>
+    );
+  }
   return null;
 }
 
@@ -219,11 +237,11 @@ function AskTab({ subjects, onPosted }) {
       </div>
 
       <div className="field" style={{ marginBottom: 14 }}>
-        <label htmlFor="doubt-file">Attach a photo or video (optional)</label>
+        <label htmlFor="doubt-file">Attach a photo, video, or PDF (optional)</label>
         <input
           id="doubt-file"
           type="file"
-          accept="image/*,video/*"
+          accept="image/*,video/*,application/pdf"
           onChange={(e) => setFile(e.target.files[0] || null)}
         />
       </div>
@@ -367,6 +385,11 @@ export function DoubtDetail({ doubtId, onBack, role }) {
               )}
               {doubt.attachmentUrl && doubt.attachmentType === 'video' && (
                 <video src={doubt.attachmentUrl} controls style={{ maxWidth: '100%', borderRadius: 'var(--radius-sm)', marginTop: 12 }} />
+              )}
+              {doubt.attachmentUrl && doubt.attachmentType === 'document' && (
+                <a href={doubt.attachmentUrl} target="_blank" rel="noreferrer" className="btn btn-ghost btn-sm" style={{ marginTop: 12 }}>
+                  <DocumentIcon /> View document
+                </a>
               )}
             </div>
 

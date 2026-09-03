@@ -1538,6 +1538,19 @@ function ensureChatMessagesSchema() {
       `);
       await pool.query('CREATE INDEX IF NOT EXISTS chat_messages_sender_id_idx ON chat_messages(sender_id)');
       await pool.query('CREATE INDEX IF NOT EXISTS chat_messages_recipient_id_idx ON chat_messages(recipient_id)');
+
+      // message_type/storage_key bring an already-created (text-only) table
+      // up to date, same "bring an existing table up to date" posture as
+      // every other ALTER in this file — a photo/video/voice/document
+      // message stores its encrypted bytes in B2 (storage_key), same as
+      // every other file feature in this app, rather than growing
+      // ciphertext to hold binary-as-base64 directly. ciphertext stays
+      // populated for 'text' rows only, hence DROP NOT NULL here; iv stays
+      // required either way — it's what decrypts whichever payload this
+      // message actually carries, inline text or the B2 blob.
+      await pool.query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS message_type TEXT NOT NULL DEFAULT 'text'`);
+      await pool.query('ALTER TABLE chat_messages ALTER COLUMN ciphertext DROP NOT NULL');
+      await pool.query('ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS storage_key TEXT');
     }).catch((err) => console.error('Failed to ensure chat messages schema:', err));
   }
   return chatMessagesSchemaPromise;

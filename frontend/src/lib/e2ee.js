@@ -106,3 +106,21 @@ export async function decryptMessage(sharedKey, ciphertextB64, ivB64) {
   const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64ToBuf(ivB64) }, sharedKey, base64ToBuf(ciphertextB64));
   return new TextDecoder().decode(plainBuf);
 }
+
+// Same AES-GCM call as encryptMessage/decryptMessage above, just skipping
+// the TextEncoder/TextDecoder step — for a chat attachment (photo/video/
+// voice/document), where the payload is already raw bytes (from a File's
+// own .arrayBuffer(), or a MediaRecorder Blob's) rather than a string.
+// Returns/accepts a raw ArrayBuffer, not base64 — the caller is the one
+// uploading a Blob (POST /api/chat/.../messages' multipart file field) or
+// fetching one back (the presigned attachmentUrl GET already returns), so
+// base64 round-tripping here would just be wasted work.
+export async function encryptBytes(sharedKey, arrayBuffer) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, sharedKey, arrayBuffer);
+  return { ciphertext, iv: bufToBase64(iv) };
+}
+
+export async function decryptBytes(sharedKey, ciphertextArrayBuffer, ivB64) {
+  return crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64ToBuf(ivB64) }, sharedKey, ciphertextArrayBuffer);
+}

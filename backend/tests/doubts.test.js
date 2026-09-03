@@ -99,6 +99,26 @@ describe('doubts routes', () => {
     doubtId = res.body.id;
   });
 
+  it("POST /api/doubts recognizes a PDF as 'document' (503, not the old 'photo or video' 400 — B2 isn't configured in the test env, see tests/setupEnv.js)", async () => {
+    const res = await request(app)
+      .post('/api/doubts')
+      .set('Authorization', `Bearer ${studentToken}`)
+      .field('subjectId', subjectId)
+      .field('questionText', 'Can someone check my proof? Attached as a PDF.')
+      .attach('file', Buffer.from('%PDF-1.4 fake pdf content'), { filename: 'proof.pdf', contentType: 'application/pdf' });
+    expect(res.status).toBe(503);
+  });
+
+  it('POST /api/doubts still rejects an attachment that is neither a photo, video, nor PDF', async () => {
+    const res = await request(app)
+      .post('/api/doubts')
+      .set('Authorization', `Bearer ${studentToken}`)
+      .field('subjectId', subjectId)
+      .field('questionText', 'This one has a bogus attachment type.')
+      .attach('file', Buffer.from('not a real file'), { filename: 'notes.txt', contentType: 'text/plain' });
+    expect(res.status).toBe(400);
+  });
+
   it('POST /api/doubts rejects a teacher not assigned to the subject', async () => {
     const res = await request(app)
       .post('/api/doubts')
