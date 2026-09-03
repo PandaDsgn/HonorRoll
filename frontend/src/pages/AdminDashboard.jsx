@@ -26,6 +26,7 @@ import PromoteStudentsPanel from './admin/PromoteStudentsPanel';
 import { RequestAddAdminPanel, AdminRequestsPanel } from './admin/SuperadminContactPanels';
 import DoubtsPanel from './admin/DoubtsPanel';
 import ChatPanel from './admin/ChatPanel';
+import ChatReportsPanel from './admin/ChatReportsPanel';
 import '../admin.css';
 import '../IdCard.css';
 
@@ -111,6 +112,7 @@ export default function AdminDashboard() {
               user?.role === 'admin' && { id: 'institution', label: 'Institution', onClick: () => setTab('institution') },
               user?.role === 'admin' && { id: 'billing', label: 'Billing', onClick: () => setTab('billing') },
               user?.role === 'admin' && { id: 'contact-superadmin', label: 'Contact Superadmin', onClick: () => setTab('contact-superadmin') },
+              user?.role === 'admin' && { id: 'chat-reports', label: 'Chat Reports', onClick: () => setTab('chat-reports') },
             ].filter(Boolean);
 
             return (
@@ -195,6 +197,8 @@ export default function AdminDashboard() {
               <AdminRequestsPanel />
             </>
           ) : null
+        ) : tab === 'chat-reports' ? (
+          user?.role === 'admin' ? <ChatReportsPanel /> : null
         ) : tab === 'grade-scale' ? (
           // Every panel here is an org-wide policy call (which tags students
           // see, the grade-band cutoffs, the plagiarism-similarity

@@ -1601,11 +1601,53 @@ function ensureChatMessagesSchema() {
       await pool.query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS message_type TEXT NOT NULL DEFAULT 'text'`);
       await pool.query('ALTER TABLE chat_messages ALTER COLUMN ciphertext DROP NOT NULL');
       await pool.query('ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS storage_key TEXT');
+      // Set only by PUT /api/chat/:otherUserId/messages/:messageId (a text-
+      // only edit, within 15 minutes of created_at) — null means never
+      // edited, same "nullable timestamp doubles as a flag" idiom as
+      // read_at above.
+      await pool.query('ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ');
     })().catch((err) => console.error('Failed to ensure chat messages schema:', err));
   }
   return chatMessagesSchemaPromise;
 }
 bootSchemaStep(ensureChatMessagesSchema);
+
+// A recipient flagging one specific message — the only safety mechanism
+// this feature can have given chat_messages.ciphertext is genuinely
+// opaque to the server. Reporting submits the plaintext the recipient's
+// own browser already decrypted, only for that one message, only when
+// they choose to (see POST /api/chat/:otherUserId/messages/:messageId/report).
+// UNIQUE(message_id, reporter_id) — one report per message per reporter,
+// not a way to spam-flag the same message repeatedly.
+let chatMessageReportsSchemaPromise = null;
+function ensureChatMessageReportsSchema() {
+  if (!chatMessageReportsSchemaPromise) {
+    chatMessageReportsSchemaPromise = (async () => {
+      // Sequential, not Promise.all — see ensureOrgUnitsSchema's own
+      // comment on why concurrent dependency DDL can deadlock a cold DB.
+      await ensureChatMessagesSchema();
+      await ensureOrganizationsSchema();
+      await ensureUsersSchema();
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS chat_message_reports (
+          id SERIAL PRIMARY KEY,
+          message_id INTEGER NOT NULL REFERENCES chat_messages(id) ON DELETE CASCADE,
+          organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          reporter_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          reported_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          plaintext_content TEXT NOT NULL,
+          reporter_note TEXT,
+          status TEXT NOT NULL CHECK (status IN ('open', 'reviewed')) DEFAULT 'open',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          UNIQUE (message_id, reporter_id)
+        )
+      `);
+      await pool.query('CREATE INDEX IF NOT EXISTS chat_message_reports_org_idx ON chat_message_reports(organization_id)');
+    })().catch((err) => console.error('Failed to ensure chat message reports schema:', err));
+  }
+  return chatMessageReportsSchemaPromise;
+}
+bootSchemaStep(ensureChatMessageReportsSchema);
 
 // ============================================================================
 // NOTIFICATIONS — generic per-user feed, one row per event. Two producers
@@ -1630,6 +1672,7 @@ function ensureNotificationsSchema() {
       await ensureProblemsSchema();
       await ensureExamSchema();
       await ensureDoubtsSchema();
+      await ensureChatMessageReportsSchema();
       await pool.query(`
         CREATE TABLE IF NOT EXISTS notifications (
           id SERIAL PRIMARY KEY,
@@ -1660,6 +1703,9 @@ function ensureNotificationsSchema() {
       // "New doubt for you to answer" (teacher) / "Your doubt got a reply"
       // (student) — see POST /api/doubts and POST /api/doubts/:id/replies.
       await pool.query('ALTER TABLE notifications ADD COLUMN IF NOT EXISTS doubt_id INTEGER REFERENCES doubts(id) ON DELETE CASCADE');
+      // "A message you sent got reported" — admin-facing only, see POST
+      // /api/chat/:otherUserId/messages/:messageId/report.
+      await pool.query('ALTER TABLE notifications ADD COLUMN IF NOT EXISTS chat_report_id INTEGER REFERENCES chat_message_reports(id) ON DELETE SET NULL');
     })().catch((err) => console.error('Failed to ensure notifications schema:', err));
   }
   return notificationsSchemaPromise;

@@ -158,7 +158,14 @@ export default function NotificationBell() {
             <p className="sb-loading" style={{ margin: '12px 8px' }}>No notifications yet.</p>
           ) : (
             notifications.map((n) => {
-              const roleAwareLink = n.type === 'doubt' ? doubtLinkFor(role) : n.type === 'chat' ? chatLinkFor(role) : null;
+              const roleAwareLink = n.type === 'doubt' ? doubtLinkFor(role)
+                : n.type === 'chat' ? chatLinkFor(role)
+                // Always admin-facing — only an admin's own account ever
+                // receives this notification type (see the fan-out in
+                // POST /api/chat/:otherUserId/messages/:messageId/report),
+                // so unlike doubt/chat above there's no role branch needed.
+                : n.type === 'chat_report' ? { path: '/admin', state: { tab: 'chat-reports' } }
+                : null;
               const linkTo = roleAwareLink ? roleAwareLink.path : NOTIFICATION_LINK_BY_TYPE[n.type];
               return (
                 <div
