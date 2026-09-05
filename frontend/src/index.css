@@ -80,6 +80,14 @@
   --console-out: #4fd1c5;
   --console-err: #ff6b6b;
   --console-pending: #7d8a8f;
+
+  /* Without this, Chrome/Safari assume the page is light-themed for
+     anything they paint natively (autofill's own default colors, form
+     control chrome) regardless of what this file's own dark palette
+     says — declaring the theme explicitly is what makes the
+     -webkit-autofill override below actually stick instead of getting
+     fought by the browser's own light-mode assumption. */
+  color-scheme: dark;
 }
 
 /* ---------- light theme ---------- */
@@ -117,6 +125,8 @@
 
   --grid-dot: rgba(0, 0, 0, 0.035);
   --shadow-lg: 0 20px 45px -20px rgba(20, 20, 18, 0.18), 0 4px 16px rgba(20, 20, 18, 0.08);
+
+  color-scheme: light;
 }
 
 /* ---------- reset ---------- */
@@ -576,6 +586,26 @@ input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
+/* Chrome/Safari force their own background+text color the instant a
+   field is autofilled — a saved password, or a suggested SMS one-time
+   code for a run of single-digit boxes right next to a password field
+   (both login inputs on this page trigger exactly this) — completely
+   ignoring the theme above. `color` is not the property that wins here;
+   -webkit-text-fill-color is what actually paints autofilled glyphs, and
+   the only way to swap out the forced background without Chrome
+   stomping it back on every keystroke is the inset box-shadow trick
+   (an actual `background` override gets silently reverted). */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+input:-webkit-autofill:active {
+  -webkit-text-fill-color: var(--text-h) !important;
+  -webkit-box-shadow: 0 0 0 1000px var(--surface-2) inset !important;
+  box-shadow: 0 0 0 1000px var(--surface-2) inset !important;
+  caret-color: var(--text-h);
+  transition: background-color 9999s ease-in-out 0s;
 }
 
 /* ---------- checkbox ---------- */

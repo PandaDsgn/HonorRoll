@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import Globe from 'react-globe.gl';
+import * as THREE from 'three';
 import axios from 'axios';
 import { API } from '../config';
 
@@ -143,12 +144,16 @@ export default function LoginMapGlobe() {
           backgroundColor="rgba(0,0,0,0)"
           globeImageUrl="//unpkg.com/three-globe/example/img/earth-blue-marble.jpg"
           bumpImageUrl="//unpkg.com/three-globe/example/img/earth-topology.png"
-          pointsData={points}
-          pointColor="color"
-          pointAltitude={0.012}
-          pointRadius={0.35}
-          pointLabel="label"
-          onPointClick={handlePointClick}
+          objectsData={points}
+          objectLat="lat"
+          objectLng="lng"
+          objectAltitude={0}
+          objectLabel="label"
+          objectThreeObject={(d) => new THREE.Mesh(
+            new THREE.SphereGeometry(0.35, 16, 16),
+            new THREE.MeshLambertMaterial({ color: d.color })
+          )}
+          onObjectClick={handlePointClick}
           ringsData={anomalyRings}
           ringColor={() => (t) => `rgba(255, 90, 90, ${1 - t})`}
           ringMaxRadius={2.2}
