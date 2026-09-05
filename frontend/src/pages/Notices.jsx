@@ -7,14 +7,8 @@ import BrandMark from '../components/BrandMark';
 import SpaceSwitcher, { SpaceNotifications } from '../components/SpaceSwitcher';
 import { NoteTypeIcon } from '../components/NoteTypeIcons';
 import { API } from '../config';
+import { formatDate } from '../lib/formatDate';
 import '../admin.css';
-
-function formatDate(iso) {
-  if (!iso) return '—';
-  return new Date(iso).toLocaleString(undefined, {
-    year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
-  });
-}
 
 // Read-only org-wide notice feed — students and teachers alike (see GET
 // /api/notices, which has no subject/unit visibility rule at all, unlike

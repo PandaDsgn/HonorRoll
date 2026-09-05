@@ -5,3 +5,5 @@ cookies.txt
 .env
 samples/
 .claude/
+mobile/
+__pycache__/

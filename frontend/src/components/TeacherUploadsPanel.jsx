@@ -2,13 +2,7 @@ import { useState, useEffect, useCallback, Fragment } from 'react';
 import axios from 'axios';
 import { API } from '../config';
 import { NOTE_TYPES, NoteTypeIcon } from './NoteTypeIcons';
-
-function formatDate(iso) {
-  if (!iso) return '—';
-  return new Date(iso).toLocaleString(undefined, {
-    year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
-  });
-}
+import { formatDate } from '../lib/formatDate';
 
 // A teacher's own PDF/photo/video/audio/text/link library, one row per
 // upload — always scoped to what THEY posted (see GET/DELETE

@@ -7,14 +7,8 @@ import BrandMark from '../components/BrandMark';
 import SpaceSwitcher, { SpaceNotifications } from '../components/SpaceSwitcher';
 import { NoteTypeIcon } from '../components/NoteTypeIcons';
 import { API } from '../config';
+import { formatDate } from '../lib/formatDate';
 import '../admin.css';
-
-function formatDate(iso) {
-  if (!iso) return '—';
-  return new Date(iso).toLocaleString(undefined, {
-    year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
-  });
-}
 
 // A student's Notes tab — pick a subject (only ones their own org_unit can
 // see, same ancestor-reaches-descendants rule the rest of the app already

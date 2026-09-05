@@ -2,13 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
 import { API } from '../../config';
 import { DoubtDetail, DoubtCard } from '../Doubts';
-
-function formatDate(iso) {
-  if (!iso) return '—';
-  return new Date(iso).toLocaleString(undefined, {
-    year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
-  });
-}
+import { formatDate } from '../../lib/formatDate';
 
 // ============================================================================
 // DOUBTS — a teacher's own queue: every doubt addressed specifically to

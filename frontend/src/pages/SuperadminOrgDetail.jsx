@@ -6,12 +6,8 @@ import { setOrgOverrideHeader } from '../context/AuthContext';
 import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
 import { API } from '../config';
+import { formatDateTime as formatDate } from '../lib/formatDate';
 import '../admin.css';
-
-function formatDate(iso) {
-  if (!iso) return '—';
-  return new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
-}
 
 // A page built for the superadmin, not a trip through the institution's own
 // AdminDashboard — see SuperadminDashboard's own comment on why. Every

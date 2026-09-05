@@ -8,12 +8,8 @@ import BrandMark from '../components/BrandMark';
 import LogoutFab from '../components/LogoutFab';
 import { API } from '../config';
 import LoginMapGlobe from '../components/LoginMapGlobe';
+import { formatDateTime as formatDate } from '../lib/formatDate';
 import '../admin.css';
-
-function formatDate(iso) {
-  if (!iso) return '—';
-  return new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
-}
 
 const STATUS_CLASS = { approved: 'chip-easy', pending: 'chip-medium', rejected: 'chip-hard', terminated: 'chip-hard' };
 const ROLE_CLASS = { admin: 'chip-hard', teacher: 'chip-medium', student: 'chip-easy' };

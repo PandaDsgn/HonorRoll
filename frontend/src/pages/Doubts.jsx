@@ -3,18 +3,12 @@ import { useNavigate } from 'react-router-dom';
 import axios from 'axios';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../hooks/useTheme';
+import { formatDate } from '../lib/formatDate';
 import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
 import SpaceSwitcher, { SpaceNotifications } from '../components/SpaceSwitcher';
 import { API } from '../config';
 import '../admin.css';
-
-function formatDate(iso) {
-  if (!iso) return '—';
-  return new Date(iso).toLocaleString(undefined, {
-    year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
-  });
-}
 
 const STATUS_CLASS = { open: 'chip-medium', answered: 'chip-easy' };
 

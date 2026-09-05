@@ -2,13 +2,7 @@ import { useState, useEffect, useCallback, Fragment } from 'react';
 import axios from 'axios';
 import { API } from '../config';
 import { NOTICE_TYPES, NoteTypeIcon } from './NoteTypeIcons';
-
-function formatDate(iso) {
-  if (!iso) return '—';
-  return new Date(iso).toLocaleString(undefined, {
-    year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
-  });
-}
+import { formatDate } from '../lib/formatDate';
 
 // The org's one shared notices list — unlike TeacherUploadsPanel (each
 // teacher's own personal library), every admin here manages the SAME list
