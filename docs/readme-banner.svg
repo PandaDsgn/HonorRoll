@@ -1,0 +1,26 @@
+<svg width="1200" height="260" viewBox="0 0 1200 260" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .bg { fill: #0b0d0e; }
+    .honor { fill: #f2f4f5; }
+    .roll { fill: #4a92c2; }
+    .tagline { fill: #c7cdd1; }
+    @media (prefers-color-scheme: light) {
+      .bg { fill: #f7f7f5; }
+      .honor { fill: #16181a; }
+      .roll { fill: #1c3b73; }
+      .tagline { fill: #4a4f54; }
+    }
+    text {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, sans-serif;
+    }
+    .brand { font-size: 72px; font-weight: 800; letter-spacing: -0.03em; }
+    .sub { font-size: 28px; font-weight: 600; letter-spacing: -0.02em; }
+  </style>
+
+  <rect class="bg" width="1200" height="260" />
+
+  <text x="600" y="120" text-anchor="middle" class="brand">
+    <tspan class="honor">Honor</tspan><tspan class="roll">Roll</tspan>
+  </text>
+  <text x="600" y="175" text-anchor="middle" class="sub tagline">Where assignments earn their grade.</text>
+</svg>

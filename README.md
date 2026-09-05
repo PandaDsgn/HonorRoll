@@ -1,4 +1,4 @@
-# HonorRoll
+<img src="docs/readme-banner.svg" alt="HonorRoll — Where assignments earn their grade." width="100%" />
 
 A multi-tenant school platform combining an LMS, a coding-assessment judge, and proctored online exams — for four roles (student, teacher, admin, superadmin), with both a React web app and a React Native/Expo mobile app.
 
