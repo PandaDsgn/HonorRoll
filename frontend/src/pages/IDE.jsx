@@ -255,7 +255,7 @@ export default function IDE() {
             <h1 className="sb-problem-title">IDE</h1>
           </div>
           <p className="sb-problem-desc">
-            A free space to write and run code, no problem, no grading, no test cases.
+            A free space to write and run code no problem, no grading, no test cases.
             Pick a language, write anything, and hit Run. If your program reads input,
             add it below and it'll be piped in as stdin.
           </p>

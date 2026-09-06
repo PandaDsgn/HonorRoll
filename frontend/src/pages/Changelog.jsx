@@ -4,8 +4,21 @@ import LegalShell from '../components/LegalShell';
 // history, not a promise of exact release timestamps.
 const ENTRIES = [
   {
-    date: '02 September 2026',
+    date: '06 September 2026',
     tag: 'Latest',
+    items: [
+      'Added a live demo — try HonorRoll as a student, teacher, or admin without creating an account. You can switch roles mid-session without losing your place, and all demo data resets automatically once the session expires.',
+      'Added proper pages for "page not found," "access denied," and unexpected errors, instead of a blank screen or a silent redirect.',
+      'The browser tab title now reflects whichever page you\'re actually on.',
+      'Added breadcrumb navigation to results, scan review, and other pages that sit a few levels deep.',
+      'Added a "skip to content" link for keyboard and screen-reader users.',
+      'Added Cookie Policy and Refund Policy pages, linked from the footer alongside Terms of Service and Privacy Policy.',
+      'The sign-in and sign-up screens\' side panel now follows your light/dark theme instead of always staying dark, and shows the same live product preview as the homepage.',
+    ],
+  },
+  {
+    date: '02 September 2026',
+    tag: 'Improved',
     items: [
       'Added an encrypted chat between a student and each teacher of a subject they\'re enrolled in — messages are end-to-end encrypted in your browser, so not even HonorRoll\'s own servers can read them.',
       'Notifications and chat messages now arrive instantly instead of waiting for the app to next check in.',
