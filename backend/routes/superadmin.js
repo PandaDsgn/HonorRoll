@@ -1012,4 +1012,12 @@ router.get('/api/superadmin/login-map', authenticateToken, requireSuperadmin, as
   }
 });
 
+// deleteOrganizationData is attached to the router function itself (safe —
+// routers are plain functions, extra properties don't affect Express)
+// rather than switching this file to a named-export object, so every
+// existing `app.use(require('./routes/superadmin'))` keeps working
+// unchanged. lib/demo.js's cleanup sweep is the second real caller — the
+// original "not genuinely shared, stays here" call on this function no
+// longer holds now that it is.
 module.exports = router;
+module.exports.deleteOrganizationData = deleteOrganizationData;

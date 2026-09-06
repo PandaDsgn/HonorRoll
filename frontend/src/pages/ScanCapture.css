@@ -6,7 +6,7 @@
 
 .scan-capture-video-wrap {
   position: relative;
-  border-radius: 12px;
+  border-radius: 0;
   overflow: hidden;
   background: #000;
   border: 1px solid var(--border);
@@ -51,7 +51,7 @@
 /* Corner editor — draggable-quad crop confirmation for one captured page */
 .scan-corner-editor-frame {
   position: relative;
-  border-radius: 12px;
+  border-radius: 0;
   overflow: hidden;
   background: #000;
   border: 1px solid var(--border);
@@ -110,7 +110,7 @@
   display: block;
   width: 100%;
   height: auto;
-  border-radius: 8px;
+  border-radius: 0;
   border: 1px solid var(--border);
   background: var(--surface-2);
 }

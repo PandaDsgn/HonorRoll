@@ -372,11 +372,12 @@ export default function Login() {
   if (orgChoice) {
     return (
       <div className="auth-shell">
-        <div className="auth-card bracket-frame">
-          <span className="corner tl" aria-hidden="true" />
-          <span className="corner tr" aria-hidden="true" />
-          <span className="corner bl" aria-hidden="true" />
-          <span className="corner br" aria-hidden="true" />
+        <div className="auth-panel" aria-hidden="true">
+          <span className="auth-panel-eyebrow">HonorRoll</span>
+          <p className="auth-panel-quote">“Where assignments earn their grade.”</p>
+        </div>
+
+        <div className="auth-card">
 
           <div className="auth-card-head">
             <button type="button" className="brand" onClick={() => navigate('/', { replace: true })}><BrandMark /></button>
@@ -424,11 +425,12 @@ export default function Login() {
   if (lockoutOtpToken) {
     return (
       <div className="auth-shell">
-        <div className="auth-card bracket-frame">
-          <span className="corner tl" aria-hidden="true" />
-          <span className="corner tr" aria-hidden="true" />
-          <span className="corner bl" aria-hidden="true" />
-          <span className="corner br" aria-hidden="true" />
+        <div className="auth-panel" aria-hidden="true">
+          <span className="auth-panel-eyebrow">HonorRoll</span>
+          <p className="auth-panel-quote">“Where assignments earn their grade.”</p>
+        </div>
+
+        <div className="auth-card">
 
           <div className="auth-card-head">
             <button type="button" className="brand" onClick={() => navigate('/', { replace: true })}><BrandMark /></button>
@@ -487,11 +489,12 @@ export default function Login() {
   if (deviceOtpToken) {
     return (
       <div className="auth-shell">
-        <div className="auth-card bracket-frame">
-          <span className="corner tl" aria-hidden="true" />
-          <span className="corner tr" aria-hidden="true" />
-          <span className="corner bl" aria-hidden="true" />
-          <span className="corner br" aria-hidden="true" />
+        <div className="auth-panel" aria-hidden="true">
+          <span className="auth-panel-eyebrow">HonorRoll</span>
+          <p className="auth-panel-quote">“Where assignments earn their grade.”</p>
+        </div>
+
+        <div className="auth-card">
 
           <div className="auth-card-head">
             <button type="button" className="brand" onClick={() => navigate('/', { replace: true })}><BrandMark /></button>
@@ -554,11 +557,12 @@ export default function Login() {
   if (tosPendingToken) {
     return (
       <div className="auth-shell">
-        <div className="auth-card bracket-frame">
-          <span className="corner tl" aria-hidden="true" />
-          <span className="corner tr" aria-hidden="true" />
-          <span className="corner bl" aria-hidden="true" />
-          <span className="corner br" aria-hidden="true" />
+        <div className="auth-panel" aria-hidden="true">
+          <span className="auth-panel-eyebrow">HonorRoll</span>
+          <p className="auth-panel-quote">“Where assignments earn their grade.”</p>
+        </div>
+
+        <div className="auth-card">
 
           <div className="auth-card-head">
             <button type="button" className="brand" onClick={() => navigate('/', { replace: true })}><BrandMark /></button>
@@ -601,11 +605,12 @@ export default function Login() {
 
   return (
     <div className="auth-shell">
-      <div className="auth-card bracket-frame">
-        <span className="corner tl" aria-hidden="true" />
-        <span className="corner tr" aria-hidden="true" />
-        <span className="corner bl" aria-hidden="true" />
-        <span className="corner br" aria-hidden="true" />
+      <div className="auth-panel" aria-hidden="true">
+        <span className="auth-panel-eyebrow">HonorRoll</span>
+        <p className="auth-panel-quote">“Where assignments earn their grade.”</p>
+      </div>
+
+      <div className="auth-card">
 
         <div className="auth-card-head">
           <button type="button" className="brand" onClick={() => navigate('/', { replace: true })}><BrandMark /></button>

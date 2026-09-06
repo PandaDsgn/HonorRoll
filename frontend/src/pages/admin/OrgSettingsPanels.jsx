@@ -156,7 +156,8 @@ export function TagVisibilityPanel() {
     try {
       const res = await axios.get(`${API}/api/admin/tag-visibility`, { withCredentials: true });
       setSettings(res.data);
-    } catch {
+    } catch (err) {
+      console.error('Tag visibility fetch failed:', err);
       setError('Failed to load tag visibility settings.');
     }
   }, []);

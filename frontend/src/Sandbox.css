@@ -236,8 +236,8 @@
   word-break: break-word;
 }
 
-.tc-block.error { color: var(--danger); background: var(--danger-dim); border-color: rgba(255, 92, 92, 0.2); }
-.tc-block.error-soft { color: #ff8a8a; }
+.tc-block.error { color: var(--danger); background: var(--danger-dim); border-color: rgba(226, 96, 63, 0.2); }
+.tc-block.error-soft { color: #ec8a68; }
 
 .tc-empty, .tc-hidden-msg {
   color: var(--text-dim);

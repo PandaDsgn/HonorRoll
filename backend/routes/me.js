@@ -37,7 +37,8 @@ router.get('/api/me', authenticateToken, async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT u.id, u.email, u.name, m.role, m.org_unit_id, o.name AS organization_name
+      `SELECT u.id, u.email, u.name, m.role, m.org_unit_id, o.name AS organization_name,
+              o.is_demo, o.demo_expires_at
        FROM users u
        JOIN memberships m ON m.user_id = u.id AND m.organization_id = $2
        JOIN organizations o ON o.id = m.organization_id

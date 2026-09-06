@@ -33,6 +33,7 @@ import About from './pages/About';
 import Contact from './pages/Contact';
 import Changelog from './pages/Changelog';
 import AssistantWidget from './components/AssistantWidget';
+import DemoBanner from './components/DemoBanner';
 
 function App() {
   return (
@@ -112,6 +113,7 @@ function App() {
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
         <AssistantWidget />
+        <DemoBanner />
       </HashRouter>
     </AuthProvider>
   );

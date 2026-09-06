@@ -43,6 +43,24 @@ function ensureOrganizationsSchema() {
 }
 bootSchemaStep(ensureOrganizationsSchema);
 
+// Backs the self-serve "Try the demo" flow (POST /api/demo/start, lib/
+// demo.js) — a demo org looks and behaves exactly like a real one, just
+// tagged so the cleanup sweep in lib/demo.js knows which rows are safe to
+// delete once their timer runs out. demo_expires_at is null for every
+// real organization, so `is_demo AND demo_expires_at < now()` never
+// matches one by accident.
+async function ensureOrganizationsDemoColumns() {
+  await ensureOrganizationsSchema();
+  try {
+    await pool.query('ALTER TABLE organizations ADD COLUMN IF NOT EXISTS is_demo BOOLEAN NOT NULL DEFAULT false');
+    await pool.query('ALTER TABLE organizations ADD COLUMN IF NOT EXISTS demo_expires_at TIMESTAMPTZ');
+  } catch (err) {
+    console.error('Failed to ensure organizations demo columns:', err);
+  }
+}
+bootSchemaStep(ensureOrganizationsDemoColumns);
+
+
 // The global identity table — every other ensureXSchema function in this
 // file assumes `users` already exists (memberships.user_id REFERENCES
 // users(id), problems.created_by, etc.), but until now nothing actually
@@ -2023,6 +2041,7 @@ module.exports = {
   ensureOrgUnitsSchema,
   ensureOrganizationLogoSchema,
   ensureOrganizationVerificationSchema,
+  ensureOrganizationsDemoColumns,
   ensureOrganizationsPlagiarismThresholdColumn,
   ensureOrganizationsSchema,
   ensureProblemsOrgColumn,

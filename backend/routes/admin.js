@@ -16,7 +16,7 @@ const {
 const {
   getOrgUnitLookup, resolveOrgUnitPath, getTeacherScope, getTeacherScopedStudents,
   getAssignmentPerformance, getExamPerformance, averagePercent, getSubjectScopedAssignmentsAndExams,
-  getStudentsForSubject, getTotalScores, getVisibleSubjectIds, computePercentileTiers,
+  getStudentsForSubject, getTotalScores, getVisibleSubjectIds, computePercentileTiers, getTagVisibility,
 } = require('../lib/performance');
 const { checkStudentCap } = require('../lib/billing');
 const { findOrCreateGlobalUser, sendStudentWelcomeEmail } = require('../lib/misc');

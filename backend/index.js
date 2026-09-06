@@ -133,6 +133,10 @@ app.use('/api/organizations/signup', authLimiter);
 app.use('/api/forgot-password', authLimiter);
 app.use('/api/reset-password', authLimiter);
 app.use('/api/contact', authLimiter);
+// Same ceiling as signup — both mint a brand-new organization + user per
+// request, the same DB-write cost an attacker could otherwise hammer for
+// free since this route needs no credentials at all.
+app.use('/api/demo/start', authLimiter);
 app.use(globalLimiter);
 connectRedisAndUpgradeStores();
 
@@ -155,6 +159,7 @@ app.use(require('./routes/problems'));
 app.use(require('./routes/exams'));
 app.use(require('./routes/scans'));
 app.use(require('./routes/admin'));
+app.use(require('./routes/demo'));
 
 // Backstop, not the primary error-handling path — every route above already
 // wraps its own body in try/catch and answers its own res.status(500), so
@@ -246,6 +251,13 @@ async function ensurePerformanceIndexes() {
   }
 }
 bootSchemaStep(ensurePerformanceIndexes);
+
+// Queued onto the same serial schema-boot chain as every ensureXSchema
+// step above, so the first sweep never runs before organizations.is_demo/
+// demo_expires_at (and the cascade fix both depend on) actually exist.
+bootSchemaStep(() => {
+  require('./lib/demo').startDemoCleanupSweep();
+});
 
 const PORT = process.env.PORT || 3000;
 // require.main === module is only true when this file is run directly
