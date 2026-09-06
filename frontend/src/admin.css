@@ -85,8 +85,18 @@
 .admin-table td {
   padding: 12px 16px;
   text-align: left;
-  white-space: nowrap;
   border-bottom: 1px solid var(--border);
+}
+
+/* Regular data cells stay single-line so the table reads as a grid — but a
+   colSpan cell is always an expanded detail panel (grading forms, scan
+   review, ...), full of genuine prose that needs to wrap normally. Nowrap
+   on those forced every long question/answer onto one line, blowing the
+   table out to several thousand pixels wide and leaving the panel scrolled
+   into unreadable, clipped territory the moment you expanded it. */
+.admin-table th,
+.admin-table td:not([colspan]) {
+  white-space: nowrap;
 }
 
 .admin-table th {
