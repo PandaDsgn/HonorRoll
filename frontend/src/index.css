@@ -29,27 +29,20 @@
   --accent-dim: rgba(47, 111, 228, 0.18);
   --on-accent: #ffffff;
 
-  /* No reserved green readout — console/status text stays plain white
-     (var(--text-h)), same treatment as every other collapsed semantic slot
-     below. */
-  --teal: var(--text-h);
-  --teal-dim: rgba(234, 234, 234, 0.08);
+  --teal: #4fd1c5;
+  --teal-dim: rgba(79, 209, 197, 0.12);
 
   --danger: #e2603f;
   --danger-dim: rgba(226, 96, 63, 0.16);
 
-  /* Secondary semantic slots (warn/gold/amber/blue) collapse to plain ink —
-     a monochrome+red palette differentiates state through text/brackets,
-     not through a rainbow of competing hues (also more colorblind-safe than
-     the tri-color chips this replaces). */
-  --warn: var(--text-h);
-  --warn-dim: rgba(234, 234, 234, 0.08);
-  --gold: var(--text-h);
-  --gold-dim: rgba(234, 234, 234, 0.08);
-  --blue: var(--text-h);
-  --blue-dim: rgba(234, 234, 234, 0.08);
-  --amber: var(--text-h);
-  --amber-dim: rgba(234, 234, 234, 0.08);
+  --warn: #ffd166;
+  --warn-dim: rgba(255, 209, 102, 0.14);
+  --gold: #cfa748;
+  --gold-dim: rgba(207, 167, 72, 0.14);
+  --blue: #3b82f6;
+  --blue-dim: rgba(59, 130, 246, 0.15);
+  --amber: #e0954a;
+  --amber-dim: rgba(224, 149, 74, 0.16);
 
   /* Archivo Black for bleeding macro headers, the native Apple system font
      for UI body (San Francisco on macOS/iOS, no webfont needed for it),
@@ -101,20 +94,18 @@
   --accent-strong: #1d4fb3;
   --accent-dim: rgba(47, 111, 228, 0.12);
 
-  --teal: var(--text-h);
-  --teal-dim: rgba(5, 5, 5, 0.06);
+  --teal: #0e8f83;
+  --teal-dim: rgba(14, 143, 131, 0.12);
 
   --danger: #c8492c;
   --danger-dim: rgba(200, 73, 44, 0.1);
 
-  --warn: var(--text-h);
-  --warn-dim: rgba(5, 5, 5, 0.06);
-  --gold: var(--text-h);
-  --gold-dim: rgba(5, 5, 5, 0.06);
-  --blue: var(--text-h);
-  --blue-dim: rgba(5, 5, 5, 0.06);
-  --amber: var(--text-h);
-  --amber-dim: rgba(5, 5, 5, 0.06);
+  --warn: #b3690a;
+  --warn-dim: rgba(179, 105, 10, 0.12);
+  --gold: #cfa748;
+  --gold-dim: rgba(207, 167, 72, 0.16);
+  --blue: #2563eb;
+  --blue-dim: rgba(37, 99, 235, 0.12);
 
   --grid-dot: rgba(5, 5, 5, 0.06);
   --shadow-lg: 4px 4px 0 var(--text-h);
@@ -380,8 +371,11 @@ button.brand:hover .brand-honor { color: var(--accent); }
    deadline editor in AdminDashboard's assignments table. Dark theme is the
    default (:root), so this is opt-out for light theme rather than opt-in
    for dark. */
+input[type='date']::-webkit-calendar-picker-indicator,
 input[type='datetime-local']::-webkit-calendar-picker-indicator { filter: invert(1); opacity: 0.7; cursor: pointer; }
+input[type='date']::-webkit-calendar-picker-indicator:hover,
 input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity: 1; }
+[data-theme='light'] input[type='date']::-webkit-calendar-picker-indicator,
 [data-theme='light'] input[type='datetime-local']::-webkit-calendar-picker-indicator { filter: none; }
 
 .field textarea {
@@ -517,9 +511,9 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity:
 
 /* ASCII-bracket framed telemetry tag, per skill section 6 ("[ DELIVERY
    SYSTEMS ]") — ink-colored text with brackets, not a filled pill. Status
-   reads through the ONE reserved accent (red, for "hard"/urgent) rather
-   than a rainbow of hues; --teal itself stays reserved for the console's
-   single readout, so chips never borrow it. */
+   still reads through real color (teal/warn/danger) rather than the
+   monochrome-only treatment, since a status pointer needs to be scannable
+   at a glance across a table, not just by reading the word. */
 .chip {
   display: inline-flex;
   align-items: center;
@@ -535,12 +529,12 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity:
   text-transform: uppercase;
 }
 .chip .dot { display: none; }
-.chip-easy { color: var(--text-dim); }
-.chip-medium { color: var(--text-h); }
-.chip-hard { color: var(--accent); }
+.chip-easy { color: var(--teal); }
+.chip-medium { color: var(--warn); }
+.chip-hard { color: var(--danger); }
 /* Not a status like the three above (pass/pending/fail) — flags something
    as new or worth a second look, e.g. the Changelog's "Latest" tag. */
-.chip-amber { color: var(--text-h); }
+.chip-amber { color: var(--amber); }
 
 /* ---------- segmented control ---------- */
 /* Genuinely monochrome at rest so the inverse-video active state reads as a
