@@ -317,7 +317,7 @@ export function StudentsPanel({ onSelectStudent }) {
     try {
       await axios.delete(`${API}/api/admin/students/${id}`, { withCredentials: true });
       setStudents((prev) => prev.filter((s) => s.id !== id));
-    } catch (err) {
+    } catch {
       setError('Failed to remove student.');
     } finally {
       setBusyId(null);

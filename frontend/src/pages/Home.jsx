@@ -6,6 +6,7 @@ import { useTheme } from '../hooks/useTheme';
 import { useAuth } from '../context/AuthContext';
 import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
+import ShowcaseCard from '../components/ShowcaseCard';
 
 const FEATURES = [
   {
@@ -127,69 +128,7 @@ export default function Home() {
           )}
         </div>
 
-        {/* Auto-cycling, no interaction — three frames take turns via a
-            pure-CSS opacity loop (see .showcase-frame-1/2/3 keyframes),
-            each one a real (fake) snapshot of the product rather than an
-            illustration of it. */}
-        <div className="showcase code-window-card" aria-hidden="true">
-          <div className="showcase-frame showcase-frame-1">
-            <div className="showcase-label">Assignments</div>
-            <div className="showcase-scan">
-              <div className="showcase-scan-doc">
-                <span className="showcase-scan-corner tl" />
-                <span className="showcase-scan-corner tr" />
-                <span className="showcase-scan-corner bl" />
-                <span className="showcase-scan-corner br" />
-                <div className="showcase-scan-lines">
-                  <span style={{ width: '78%' }} />
-                  <span style={{ width: '92%' }} />
-                  <span style={{ width: '65%' }} />
-                  <span style={{ width: '85%' }} />
-                  <span style={{ width: '40%' }} />
-                </div>
-              </div>
-              <div className="hero-mock-console">
-                <span className="console-out">Scan captured, ready to submit</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="showcase-frame showcase-frame-2">
-            <div className="showcase-label">Timed exams</div>
-            <div className="showcase-exam">
-              <div className="showcase-exam-row">
-                <span>Question 4 of 12</span>
-                <span className="showcase-timer">18:42</span>
-              </div>
-              <div className="showcase-exam-q">A binary search tree has 31 nodes. What is the maximum possible height?</div>
-              <div className="showcase-exam-options">
-                <div className="showcase-exam-opt">30</div>
-                <div className="showcase-exam-opt showcase-exam-opt-selected">5</div>
-                <div className="showcase-exam-opt">15</div>
-              </div>
-            </div>
-          </div>
-
-          <div className="showcase-frame showcase-frame-3">
-            <div className="showcase-label">Code sandbox</div>
-            <div className="hero-mock-tab">binary_search.go</div>
-            <pre className="hero-mock-code">{`func binarySearch(nums []int, target int) int {
-    lo, hi := 0, len(nums)-1
-    for lo <= hi {
-        mid := (lo + hi) / 2
-        if nums[mid] == target {
-            return mid
-        } else if nums[mid] < target {
-            lo = mid + 1
-        } else {
-            hi = mid - 1
-        }
-    }
-    return -1
-}
-`}</pre>
-          </div>
-        </div>
+        <ShowcaseCard />
       </main>
 
       <section className="feature-row">
@@ -217,6 +156,10 @@ export default function Home() {
           <button type="button" className="landing-footer-link" onClick={() => navigate('/terms')}>Terms of Service</button>
           <span className="landing-footer-dot" aria-hidden="true">·</span>
           <button type="button" className="landing-footer-link" onClick={() => navigate('/privacy')}>Privacy Policy</button>
+          <span className="landing-footer-dot" aria-hidden="true">·</span>
+          <button type="button" className="landing-footer-link" onClick={() => navigate('/cookies')}>Cookie Policy</button>
+          <span className="landing-footer-dot" aria-hidden="true">·</span>
+          <button type="button" className="landing-footer-link" onClick={() => navigate('/refunds')}>Refund Policy</button>
         </div>
         <span className="landing-footer-version">© HonorRoll</span>
       </footer>

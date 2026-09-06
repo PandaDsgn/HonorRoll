@@ -1,0 +1,23 @@
+# HonorRoll
+
+> HonorRoll is a single platform for a school, college, or coaching institution to run code assignments, timed exams, and academic performance tracking — replacing a separate code judge, a separate exam tool, a separate plagiarism checker, and a spreadsheet for tracking who's actually doing well.
+
+Every institution that signs up gets its own fully isolated workspace: own roster, own org structure, own grading rules, never mixed with any other institution's data. Admins manage structure and billing; teachers grade only what's assigned to them, with AI-assisted OCR and plagiarism checks doing the first pass (a human always makes the final call); students write and run code against real test cases, sit proctored exams, and see clear, percentile/grade-band feedback on their own standing.
+
+## Product
+
+- [Home](https://pandadsgn.github.io/HonorRoll/): overview and sign-in
+- [About](https://pandadsgn.github.io/HonorRoll/#/about): full feature list — code judging, OCR-scanned handwritten answers, proctored exams, plagiarism signals, performance analytics, custom org structure, bulk roster import, multi-institution accounts
+- [Set up an institution](https://pandadsgn.github.io/HonorRoll/#/signup): self-serve signup for a new school/college workspace
+- [Changelog](https://pandadsgn.github.io/HonorRoll/#/changelog): recent product updates
+
+## Policies
+
+- [Terms of Service](https://pandadsgn.github.io/HonorRoll/#/terms)
+- [Privacy Policy](https://pandadsgn.github.io/HonorRoll/#/privacy)
+- [Cookie Policy](https://pandadsgn.github.io/HonorRoll/#/cookies)
+- [Refund Policy](https://pandadsgn.github.io/HonorRoll/#/refunds)
+
+## Contact
+
+- [Contact form](https://pandadsgn.github.io/HonorRoll/#/contact)

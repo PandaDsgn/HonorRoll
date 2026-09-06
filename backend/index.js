@@ -81,6 +81,20 @@ app.use(cors({
   credentials: true
 }));
 
+// Baseline hardening headers. This backend is a pure JSON API — the actual
+// HTML page is static-hosted separately on GitHub Pages, whose headers this
+// process has no control over (a CSP/X-Frame-Options aimed at protecting
+// THAT page would need to be set at the static host or a CDN in front of
+// it, not here) — so this only covers what an API response itself can
+// still usefully assert.
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('X-Frame-Options', 'DENY');
+  res.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
+
 // Health check for the load balancer (nginx) and Docker's own healthcheck
 // directive — see docker-compose.yml. Deliberately registered before the
 // rate limiter and load guard below: an infrastructure check hitting this

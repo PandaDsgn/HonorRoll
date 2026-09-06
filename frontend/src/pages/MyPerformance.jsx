@@ -244,7 +244,7 @@ function ItemGraph({ kind, items }) {
 // percentile or raw score. Reuses the percent/percentile already loaded
 // with the assignments/exams list (see GET /api/me/performance/
 // :organizationId) rather than fetching anything extra.
-function OverallGraph({ kind, items }) {
+function OverallGraph({ items }) {
   const [factor, setFactor] = useState('percentile');
   const key = factor === 'percentile' ? 'percentile' : 'percent';
   const bars = items.filter((it) => it[key] != null).map((it) => ({ label: it.title, value: it[key] }));

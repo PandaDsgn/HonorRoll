@@ -426,7 +426,7 @@ export default function ExamsPanel() {
     try {
       const res = await axios.get(`${API}/api/admin/exams`, { withCredentials: true });
       setExams(res.data.exams);
-    } catch (err) {
+    } catch {
       setError('Failed to load exams.');
     }
   }, []);
@@ -449,7 +449,7 @@ export default function ExamsPanel() {
     try {
       const res = await axios.get(`${API}/api/admin/exams/${ex.id}`, { withCredentials: true });
       setFormMode({ ...res.data, id: ex.id });
-    } catch (err) {
+    } catch {
       setError('Failed to fetch full exam details for editing.');
       setFormMode(null);
     }
@@ -460,7 +460,7 @@ export default function ExamsPanel() {
     try {
       await axios.delete(`${API}/api/admin/exams/${id}`, { withCredentials: true });
       setExams((prev) => prev.filter((e) => e.id !== id));
-    } catch (err) {
+    } catch {
       setError('Failed to delete exam.');
     } finally {
       setBusyId(null);

@@ -60,7 +60,6 @@ export default function IdCard({ organizations, initialOrganizationId, onClose }
       .catch((err) => { if (!cancelled) setError(err.response?.data?.error || 'Could not load this ID card.'); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeOrg]);
 
   const cycle = (delta) => {
@@ -206,7 +205,7 @@ export default function IdCard({ organizations, initialOrganizationId, onClose }
                     aria-label={data.photoUrl ? 'Change photo' : 'Add a photo'}
                   >
                     {data.photoUrl
-                      ? <img ref={photoImgRef} src={data.photoUrl} alt="" className="idcard-photo" />
+                      ? <img ref={photoImgRef} src={data.photoUrl} alt={data.name ? `${data.name}'s photo` : 'ID photo'} className="idcard-photo" />
                       : (
                         <div className="idcard-photo idcard-photo-empty">
                           <span className="idcard-photo-plus">+</span>
@@ -258,7 +257,7 @@ export default function IdCard({ organizations, initialOrganizationId, onClose }
                   <div className="idcard-qr-caption">Scan to open<br />dashboard</div>
                   {data.logoUrl && (
                     <div className="idcard-logo-wrap">
-                      <img ref={logoImgRef} src={data.logoUrl} alt="" className="idcard-org-logo" />
+                      <img ref={logoImgRef} src={data.logoUrl} alt="Institution logo" className="idcard-org-logo" />
                     </div>
                   )}
                 </div>

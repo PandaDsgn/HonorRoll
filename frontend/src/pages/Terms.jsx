@@ -108,7 +108,8 @@ export default function Terms() {
         Organizations may subscribe to a paid plan for additional capacity. Payments are processed by
         a third-party payment processor (Razorpay); HonorRoll does not store your full card or bank
         details. Plan terms, pricing, and cancellation are as described at checkout and in the billing
-        section of the admin dashboard at the time of subscribing.
+        section of the admin dashboard at the time of subscribing. See the{' '}
+        <a href="#/refunds">Refund Policy</a> for cancellation and refund terms.
       </p>
 
       <h2>9. Platform administration</h2>

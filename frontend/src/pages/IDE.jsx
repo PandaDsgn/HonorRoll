@@ -197,7 +197,6 @@ export default function IDE() {
     if (!visualizerActive) {
       cmViewRef.current?.dispatch({ effects: setExecLine.of(null) });
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visualizerActive]);
 
   // Loads a shared step link (see lib/shareStep.js) on first mount, if the
@@ -217,7 +216,6 @@ export default function IDE() {
     setInitialStep(payload.step);
     setPendingShareRun(true);
     clearSharePayload();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -257,7 +255,7 @@ export default function IDE() {
             <h1 className="sb-problem-title">IDE</h1>
           </div>
           <p className="sb-problem-desc">
-            A free space to write and run code — no problem, no grading, no test cases.
+            A free space to write and run code, no problem, no grading, no test cases.
             Pick a language, write anything, and hit Run. If your program reads input,
             add it below and it'll be piped in as stdin.
           </p>

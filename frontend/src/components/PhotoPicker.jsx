@@ -84,7 +84,7 @@ export default function PhotoPicker({ selectedPhotoId, onSelect }) {
             >
               <img
                 src={photo.url}
-                alt=""
+                alt="Saved photo"
                 className="photo-picker-thumb"
                 onClick={() => onSelect?.(photo.id)}
                 role={onSelect ? 'button' : undefined}

@@ -5,6 +5,7 @@ import { useTheme } from '../hooks/useTheme';
 import { setOrgOverrideHeader } from '../context/AuthContext';
 import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
+import Breadcrumbs from '../components/Breadcrumbs';
 import { API } from '../config';
 import { formatDateTime as formatDate } from '../lib/formatDate';
 import '../admin.css';
@@ -77,6 +78,10 @@ export default function SuperadminOrgDetail() {
       </header>
 
       <section className="admin-shell">
+        <Breadcrumbs items={[
+          { label: 'Superadmin', to: '/superadmin' },
+          { label: orgName || 'Loading…' },
+        ]} />
         <div className="admin-head">
           <h1 className="problems-title">
             <button type="button" className="btn btn-ghost btn-sm" style={{ marginRight: 10 }} onClick={() => navigate('/superadmin')}>&larr; All organizations</button>
@@ -182,7 +187,7 @@ function TerminateButton({ orgId, userId, label, onDone }) {
 // directly (no request/approve queue needed since the superadmin is already
 // here) and to terminate any of them.
 // ============================================================================
-function AdminsSection({ orgId, orgName }) {
+function AdminsSection({ orgId }) {
   const [admins, setAdmins] = useState(null);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');

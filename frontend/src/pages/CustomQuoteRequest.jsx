@@ -5,6 +5,7 @@ import { useTheme } from '../hooks/useTheme';
 import { useAuth } from '../context/AuthContext';
 import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
+import Breadcrumbs from '../components/Breadcrumbs';
 import { API } from '../config';
 
 // Reached from the "Custom" plan card in BillingPanel — anything past the
@@ -49,6 +50,10 @@ export default function CustomQuoteRequest() {
       </header>
 
       <section className="admin-shell">
+        <Breadcrumbs items={[
+          { label: 'Admin', to: '/admin' },
+          { label: 'Custom quote' },
+        ]} />
         <div className="admin-toolbar" style={{ justifyContent: 'flex-start' }}>
           <button type="button" className="btn btn-ghost" onClick={() => navigate('/admin')}>&larr; Back to admin dashboard</button>
         </div>

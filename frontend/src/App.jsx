@@ -29,17 +29,27 @@ import SuperadminDashboard from './pages/SuperadminDashboard';
 import SuperadminOrgDetail from './pages/SuperadminOrgDetail';
 import Terms from './pages/Terms';
 import Privacy from './pages/Privacy';
+import CookiePolicy from './pages/CookiePolicy';
+import RefundPolicy from './pages/RefundPolicy';
 import About from './pages/About';
 import Contact from './pages/Contact';
 import Changelog from './pages/Changelog';
 import AssistantWidget from './components/AssistantWidget';
 import DemoBanner from './components/DemoBanner';
+import ErrorBoundary from './components/ErrorBoundary';
+import PageMeta from './components/PageMeta';
+import NotFound from './pages/NotFound';
 
 function App() {
   return (
     <AuthProvider>
       {/* Wrap your app in HashRouter instead of BrowserRouter */}
       <HashRouter>
+        <a href="#main-content" className="skip-link">Skip to content</a>
+        <PageMeta />
+        <DemoBanner />
+        <ErrorBoundary>
+        <main id="main-content">
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/login" element={<Login />} />
@@ -49,6 +59,8 @@ function App() {
           <Route path="/reset-password" element={<ResetPassword />} />
           <Route path="/terms" element={<Terms />} />
           <Route path="/privacy" element={<Privacy />} />
+          <Route path="/cookies" element={<CookiePolicy />} />
+          <Route path="/refunds" element={<RefundPolicy />} />
           <Route path="/about" element={<About />} />
           <Route path="/contact" element={<Contact />} />
           <Route path="/changelog" element={<Changelog />} />
@@ -110,10 +122,11 @@ function App() {
 
           <Route path="/sandbox" element={<Navigate to="/assignments/1" replace />} />
           <Route path="/playground" element={<Navigate to="/ide" replace />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
+          <Route path="*" element={<NotFound />} />
         </Routes>
+        </main>
+        </ErrorBoundary>
         <AssistantWidget />
-        <DemoBanner />
       </HashRouter>
     </AuthProvider>
   );

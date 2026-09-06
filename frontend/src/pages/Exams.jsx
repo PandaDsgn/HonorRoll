@@ -52,7 +52,7 @@ export default function Exams() {
 
   const [exams, setExams] = useState(null);
   const [loadError, setLoadError] = useState('');
-  const [now, setNow] = useState(Date.now());
+  const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
     const fetchExams = async () => {

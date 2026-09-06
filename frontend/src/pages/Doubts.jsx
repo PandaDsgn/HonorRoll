@@ -35,7 +35,7 @@ function AttachmentThumb({ attachmentType, attachmentUrl }) {
     width: 56, height: 56, borderRadius: 'var(--radius-sm)', objectFit: 'cover',
     flexShrink: 0, border: '1px solid var(--border)', background: 'var(--surface-2)',
   };
-  if (attachmentType === 'photo') return <img src={attachmentUrl} alt="" style={style} />;
+  if (attachmentType === 'photo') return <img src={attachmentUrl} alt="Attachment preview" style={style} />;
   if (attachmentType === 'video') return <video src={attachmentUrl} muted playsInline preload="metadata" style={{ ...style, pointerEvents: 'none' }} />;
   if (attachmentType === 'document') {
     return (

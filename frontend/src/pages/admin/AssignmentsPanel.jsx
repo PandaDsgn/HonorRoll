@@ -23,7 +23,7 @@ export default function AssignmentsPanel() {
     try {
       const res = await axios.get(`${API}/api/problems`, { withCredentials: true });
       setProblems(res.data.problems);
-    } catch (err) {
+    } catch {
       setError('Failed to load assignments.');
     }
   }, []);
@@ -46,7 +46,7 @@ export default function AssignmentsPanel() {
     try {
       const res = await axios.get(`${API}/api/admin/problems/${p.id}`, { withCredentials: true });
       setFormMode({ ...res.data, id: p.id });
-    } catch (err) {
+    } catch {
       setError('Failed to fetch full assignment details for editing.');
       setFormMode(null);
     }
@@ -57,7 +57,7 @@ export default function AssignmentsPanel() {
     try {
       await axios.delete(`${API}/api/admin/problems/${id}`, { withCredentials: true });
       setProblems((prev) => prev.filter((p) => p.id !== id));
-    } catch (err) {
+    } catch {
       setError('Failed to delete assignment.');
     } finally {
       setBusyId(null);
@@ -77,7 +77,7 @@ export default function AssignmentsPanel() {
       const res = await axios.patch(`${API}/api/admin/problems/${id}/window`, { opensAt: toIso(windowDraft.opensAt), closesAt: toIso(windowDraft.closesAt) }, { withCredentials: true });
       setProblems((prev) => prev.map((p) => (p.id === id ? { ...p, ...res.data.problem } : p)));
       setEditingWindowId(null);
-    } catch (err) {
+    } catch {
       setError('Failed to update deadline.');
     } finally {
       setBusyId(null);

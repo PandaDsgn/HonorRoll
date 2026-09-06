@@ -177,7 +177,7 @@ function VoiceMessagePlayer({ src }) {
 // proxy route hands back (still opaque until decrypted).
 function MessageBubbleContent({ message: m }) {
   if (m.messageType === 'photo' && m.mediaUrl) {
-    return <img src={m.mediaUrl} alt="" style={{ maxWidth: 220, maxHeight: 220, borderRadius: 'var(--radius-sm)', display: 'block' }} />;
+    return <img src={m.mediaUrl} alt="Image message" style={{ maxWidth: 220, maxHeight: 220, borderRadius: 'var(--radius-sm)', display: 'block' }} />;
   }
   if (m.messageType === 'video' && m.mediaUrl) {
     return <video src={m.mediaUrl} controls style={{ maxWidth: 260, borderRadius: 'var(--radius-sm)', display: 'block' }} />;

@@ -66,10 +66,47 @@ async function provisionDemoOrg() {
     }
     const adminId = users.admin.userId;
 
+    // The minimum real org-structure/subject setup, not skippable: a
+    // teacher's authority over anything (viewing exam attempts, grading,
+    // "My Students") is enforced via subject_teachers (see
+    // enforceSubjectAuthority, lib/auth.js) — a subject-less exam/problem
+    // is admin-only in practice. One tier, one root unit, one subject is
+    // enough; org_units.parent_unit_id is nullable, so a root-level unit
+    // needs no parent chain above it.
+    const levelDefRes = await client.query(
+      `INSERT INTO org_level_defs (organization_id, tier_index, label) VALUES ($1, 0, 'Class') RETURNING id`,
+      [org.id]
+    );
+    const unitRes = await client.query(
+      `INSERT INTO org_units (organization_id, level_def_id, name) VALUES ($1, $2, 'Demo Class') RETURNING id`,
+      [org.id, levelDefRes.rows[0].id]
+    );
+    const unitId = unitRes.rows[0].id;
+    await client.query(
+      'UPDATE memberships SET org_unit_id = $1 WHERE organization_id = $2 AND user_id = ANY($3::uuid[])',
+      [unitId, org.id, [users.teacher.userId, users.student.userId]]
+    );
+    // Membership authority checks (enforceSubjectAuthority, GET /api/exams
+    // /api/problems' getVisibleSubjectIds) read org_unit_id off the JWT
+    // claim, not a fresh DB lookup — the token minted in routes/demo.js
+    // needs this to actually scope a teacher/student into the subject
+    // above instead of seeing nothing.
+    users.teacher.orgUnitId = unitId;
+    users.student.orgUnitId = unitId;
+    const subjectRes = await client.query(
+      `INSERT INTO subjects (organization_id, org_unit_id, name) VALUES ($1, $2, 'Computer Science') RETURNING id`,
+      [org.id, unitId]
+    );
+    const subjectId = subjectRes.rows[0].id;
+    await client.query(
+      'INSERT INTO subject_teachers (subject_id, user_id) VALUES ($1, $2)',
+      [subjectId, users.teacher.userId]
+    );
+
     const problemRes = await client.query(
-      `INSERT INTO problems (title, description, difficulty, organization_id, created_by, submission_mode)
-       VALUES ($1, $2, 'medium', $3, $4, 'code') RETURNING id`,
-      ['Longest Common Prefix', 'Write a function that returns the longest common prefix string amongst an array of strings. Return an empty string if there is none.', org.id, adminId]
+      `INSERT INTO problems (title, description, difficulty, organization_id, subject_id, created_by, submission_mode)
+       VALUES ($1, $2, 'medium', $3, $4, $5, 'code') RETURNING id`,
+      ['Longest Common Prefix', 'Write a function that returns the longest common prefix string amongst an array of strings. Return an empty string if there is none.', org.id, subjectId, adminId]
     );
     const problemId = problemRes.rows[0].id;
     await client.query(
@@ -83,15 +120,15 @@ async function provisionDemoOrg() {
     );
 
     await client.query(
-      `INSERT INTO problems (title, description, difficulty, organization_id, created_by, submission_mode)
-       VALUES ($1, $2, 'easy', $3, $4, 'code')`,
-      ['Two Sum', 'Given an array of integers and a target, return the indices of the two numbers that add up to the target.', org.id, adminId]
+      `INSERT INTO problems (title, description, difficulty, organization_id, subject_id, created_by, submission_mode)
+       VALUES ($1, $2, 'easy', $3, $4, $5, 'code')`,
+      ['Two Sum', 'Given an array of integers and a target, return the indices of the two numbers that add up to the target.', org.id, subjectId, adminId]
     );
 
     const examRes = await client.query(
-      `INSERT INTO exams (title, description, total_marks, total_time_seconds, organization_id, created_by)
-       VALUES ($1, $2, 10, 900, $3, $4) RETURNING id`,
-      ['Data Structures Quiz', 'A short timed quiz covering arrays, trees, and time complexity.', org.id, adminId]
+      `INSERT INTO exams (title, description, total_marks, total_time_seconds, organization_id, subject_id, created_by)
+       VALUES ($1, $2, 10, 900, $3, $4, $5) RETURNING id`,
+      ['Data Structures Quiz', 'A short timed quiz covering arrays, trees, and time complexity.', org.id, subjectId, adminId]
     );
     await client.query(
       `INSERT INTO exam_items (exam_id, type, position, marks, prompt, options, correct_option_id) VALUES
@@ -160,10 +197,34 @@ function startDemoCleanupSweep() {
   }, 5 * 60 * 1000);
 }
 
+// A middleware factory, not a fixed middleware — different write actions
+// want different wording (billing today; nothing else asked for yet, but
+// the message is the only thing that would ever need to vary). Placed
+// AFTER requireAdmin/requireAdminOrTeacher in a route's middleware chain,
+// same as any other authorization gate. Fails open (calls next()) on a DB
+// error rather than blocking a real org's real billing action over a
+// transient hiccup — the worse failure mode here is "briefly can't
+// distinguish demo from real," not "a real admin's checkout 500s."
+function blockInDemo(message) {
+  return async (req, res, next) => {
+    if (!req.user?.organizationId) return next();
+    try {
+      const { rows } = await pool.query('SELECT is_demo FROM organizations WHERE id = $1', [req.user.organizationId]);
+      if (rows[0]?.is_demo) {
+        return res.status(403).json({ error: message });
+      }
+    } catch (err) {
+      console.error('blockInDemo check failed:', err);
+    }
+    next();
+  };
+}
+
 module.exports = {
   DEMO_DURATION_MS,
   DEMO_ROLES: DEMO_ROLES.map((r) => r.role),
   provisionDemoOrg,
   sweepExpiredDemoOrgs,
   startDemoCleanupSweep,
+  blockInDemo,
 };

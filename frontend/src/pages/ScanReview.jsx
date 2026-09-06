@@ -4,6 +4,7 @@ import axios from 'axios';
 import { useTheme } from '../hooks/useTheme';
 import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
+import Breadcrumbs from '../components/Breadcrumbs';
 import { API } from '../config';
 
 function formatScanDate(iso) {
@@ -149,6 +150,10 @@ export default function ScanReview() {
       </header>
 
       <section className="admin-shell">
+        <Breadcrumbs items={[
+          { label: 'Admin', to: '/admin' },
+          { label: submission?.name || submission?.email || 'Submission' },
+        ]} />
         <div className="admin-toolbar" style={{ justifyContent: 'flex-start' }}>
           <button type="button" className="btn btn-ghost" onClick={() => navigate(-1)}>&larr; Back</button>
         </div>

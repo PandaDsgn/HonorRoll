@@ -185,6 +185,25 @@ button, a { touch-action: manipulation; }
 
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 1000;
+  background: var(--accent);
+  color: var(--on-accent);
+  padding: 10px 16px;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  font-size: 0.8rem;
+  letter-spacing: 0.05em;
+}
+
+.skip-link:focus {
+  left: 8px;
+  top: 8px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.001ms !important;
@@ -816,14 +835,15 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
 .icon-btn svg { width: 16px; height: 16px; }
 
 /* ---------- demo session banner ---------- */
-/* Fixed to the top of every page for as long as a demo session is active
-   (see DemoBanner.jsx) — pushes nothing else on the page, just overlays,
-   so it needs no layout changes anywhere it might appear over. */
+/* Rendered as a normal-flow sibling before <Routes> (see App.jsx), NOT
+   position:fixed — a fixed banner overlays instead of pushing content
+   down, which covered every page's own header. As a normal-flow element,
+   whatever page is routed simply renders below it, guaranteed, with no
+   need to reserve matching space anywhere else. position:sticky keeps it
+   pinned to the top through scroll without leaving the document flow. */
 .demo-banner {
-  position: fixed;
+  position: sticky;
   top: 0;
-  left: 0;
-  right: 0;
   z-index: 150;
   display: flex;
   align-items: center;
@@ -840,6 +860,20 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
 /* The countdown digits are genuine numeric telemetry (mono earns its
    place), matching the exam-timer precedent elsewhere in this file. */
 .demo-banner span { font-variant-numeric: tabular-nums; }
+.demo-banner-role {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+.demo-banner-role select {
+  background-color: var(--bg);
+  color: var(--accent);
+  border: 2px solid var(--bg);
+  border-radius: 0;
+  padding: 3px 24px 3px 10px;
+  font-size: 12px;
+}
 .demo-banner-exit {
   background: var(--bg);
   color: var(--accent);
@@ -991,10 +1025,9 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   grid-template-columns: minmax(0, 1fr) minmax(0, 460px);
 }
 
-/* A dark panel pairing every auth screen with the form. Stays pure
-   near-black (the global body::before grain overlay already covers this
-   panel too, so no local texture is needed here) — always this same dark
-   look regardless of app theme, like .console/.idcard. */
+/* Editorial panel pairing every auth screen with the form — follows the
+   site theme like everything else (the global body::before grain overlay
+   already covers this panel too, so no local texture is needed here). */
 .auth-panel {
   position: relative;
   display: flex;
@@ -1003,7 +1036,7 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   gap: 24px;
   padding: 64px;
   overflow: hidden;
-  background: #050505;
+  background: var(--bg);
   border-right: 2px solid var(--border-strong);
 }
 .auth-panel-eyebrow {
@@ -1014,7 +1047,7 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: #6b6b6b;
+  color: var(--text-dim);
 }
 .auth-panel-quote {
   position: relative;
@@ -1027,7 +1060,11 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   font-size: clamp(26px, 2.6vw, 40px);
   line-height: 0.98;
   letter-spacing: -0.02em;
-  color: #eaeaea;
+  color: var(--text-h);
+}
+
+.auth-panel .code-window-card {
+  margin-top: 8px;
 }
 
 .auth-card {
@@ -1313,6 +1350,31 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   color: var(--text-dim);
   white-space: nowrap;
 }
+
+/* ---------- full-page error states (404/403/500) ---------- */
+/* Shared by ErrorPage.jsx — same "own header, bleeding number, one CTA"
+   shape as the landing hero, reused rather than a fourth layout. */
+.error-page {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 16px;
+  padding: 64px 24px;
+}
+.error-page-code {
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: clamp(72px, 14vw, 180px);
+  line-height: 0.9;
+  letter-spacing: -0.03em;
+  color: var(--border-strong);
+}
+.error-page h1 { font-size: clamp(28px, 4vw, 40px); }
+.error-page p { max-width: 440px; color: var(--text-dim); font-size: 15px; line-height: 1.6; }
+.error-page-actions { margin-top: 8px; }
 
 /* ---------- landing / home page ---------- */
 /* Blueprint layout: bleeding macro headline, hard rules spanning full

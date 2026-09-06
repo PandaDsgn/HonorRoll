@@ -18,7 +18,7 @@ import { API } from '../../config';
 // words on every render.
 const OCR_EXPECTED_MS = 60_000;
 function ScanProgressRing({ processingStartedAt }) {
-  const [now, setNow] = useState(Date.now());
+  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);

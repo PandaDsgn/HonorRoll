@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import axios from 'axios';
+import Breadcrumbs from '../components/Breadcrumbs';
 import { API } from '../config';
 import '../Exam.css';
 
@@ -52,6 +53,10 @@ export default function ExamResult() {
   return (
     <div className="sb-shell exam-message-shell">
       <div className="panel exam-message-panel">
+        <Breadcrumbs items={[
+          { label: 'Exams', to: '/exams' },
+          { label: 'Result' },
+        ]} />
         <h1 className="problems-title">Your result</h1>
 
         {phase === 'loading' && <p className="sb-loading">Loading…</p>}

@@ -143,7 +143,7 @@ export default function ImageCropper({
           <img
             ref={imgRef}
             src={imgUrl}
-            alt=""
+            alt="Image being cropped"
             onLoad={handleImgLoad}
             draggable={false}
             className="cropper-img"

@@ -11,6 +11,41 @@
   padding: 40px 32px 64px;
 }
 
+.breadcrumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-bottom: 16px;
+}
+
+.breadcrumb-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.breadcrumb-item a {
+  color: var(--text-dim);
+  text-decoration: none;
+}
+
+.breadcrumb-item a:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.breadcrumb-item [aria-current='page'] {
+  color: var(--text);
+}
+
+.breadcrumb-sep {
+  color: var(--text-dim);
+}
+
 .admin-head {
   display: flex;
   align-items: center;

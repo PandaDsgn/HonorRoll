@@ -4,6 +4,7 @@ import axios from 'axios';
 import { useTheme } from '../hooks/useTheme';
 import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
+import AuthVisualPanel from '../components/AuthVisualPanel';
 import { API } from '../config';
 
 // Landing target for the confirmation link sent by POST /api/organizations/signup.
@@ -39,10 +40,7 @@ export default function VerifyOrganization() {
 
   return (
     <div className="auth-shell">
-      <div className="auth-panel" aria-hidden="true">
-        <span className="auth-panel-eyebrow">HonorRoll</span>
-        <p className="auth-panel-quote">“Where assignments earn their grade.”</p>
-      </div>
+      <AuthVisualPanel />
 
       <div className="auth-card">
 

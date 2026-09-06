@@ -51,7 +51,7 @@ export default function Problems() {
 
   const [problems, setProblems] = useState(null);
   const [loadError, setLoadError] = useState('');
-  const [now, setNow] = useState(Date.now());
+  const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
     const fetchProblems = async () => {

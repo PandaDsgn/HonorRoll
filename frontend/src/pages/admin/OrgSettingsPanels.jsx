@@ -125,7 +125,7 @@ export function OrgLogoPanel() {
           }}
         >
           {org.logoUrl ? (
-            <img src={org.logoUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+            <img src={org.logoUrl} alt="Organization logo" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
           ) : (
             <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>No logo</span>
           )}

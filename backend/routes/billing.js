@@ -9,9 +9,11 @@ const router = express.Router();
 const crypto = require('crypto');
 const { pool } = require('../lib/db');
 const { authenticateToken, requireAdmin } = require('../lib/auth');
+const { blockInDemo } = require('../lib/demo');
 const {
   PLAN_CATALOG, PAID_PLAN_KEYS, BILLING_CYCLES, getRazorpayClient, ensureRazorpayPlan,
 } = require('../lib/billing');
+const blockBillingInDemo = blockInDemo('Billing is not available in demo mode');
 const { ensureSubscriptionsSchema } = require('../schema');
 const { sendEmail } = require('../mailer');
 
@@ -80,7 +82,7 @@ router.get('/api/admin/billing/status', authenticateToken, requireAdmin, async (
   }
 });
 
-router.post('/api/admin/billing/checkout', authenticateToken, requireAdmin, async (req, res) => {
+router.post('/api/admin/billing/checkout', authenticateToken, requireAdmin, blockBillingInDemo, async (req, res) => {
   const { planKey, billingCycle } = req.body;
   if (!PAID_PLAN_KEYS.includes(planKey) || !BILLING_CYCLES.includes(billingCycle)) {
     return res.status(400).json({ error: 'Invalid plan or billing cycle' });
@@ -135,7 +137,7 @@ router.post('/api/admin/billing/checkout', authenticateToken, requireAdmin, asyn
 // Immediate post-checkout verification endpoint. Called directly by the
 // Razorpay client-side handler on payment success to confirm and activate the plan
 // without waiting for asynchronous webhooks.
-router.post('/api/admin/billing/verify', authenticateToken, requireAdmin, async (req, res) => {
+router.post('/api/admin/billing/verify', authenticateToken, requireAdmin, blockBillingInDemo, async (req, res) => {
   const { razorpayPaymentId, razorpaySubscriptionId, razorpaySignature } = req.body;
 
   try {
@@ -234,7 +236,7 @@ router.post('/api/admin/billing/verify', authenticateToken, requireAdmin, async 
 // already paid for (cancel_at_cycle_end) — the fallback to Free happens
 // automatically via the subscription.cancelled webhook once that period
 // ends, same mechanism as any other status change (see getEffectivePlanKey).
-router.post('/api/admin/billing/cancel', authenticateToken, requireAdmin, async (req, res) => {
+router.post('/api/admin/billing/cancel', authenticateToken, requireAdmin, blockBillingInDemo, async (req, res) => {
   const rzp = getRazorpayClient();
   if (!rzp) return res.status(503).json({ error: 'Billing is not yet configured' });
 
@@ -260,7 +262,7 @@ router.post('/api/admin/billing/cancel', authenticateToken, requireAdmin, async 
 // follows up and issues a real invoice out-of-band. No Razorpay involved,
 // no DB row created — same "best-effort email, nothing else depends on it"
 // posture as sendBillingEmail below.
-router.post('/api/admin/billing/custom-quote', authenticateToken, requireAdmin, async (req, res) => {
+router.post('/api/admin/billing/custom-quote', authenticateToken, requireAdmin, blockBillingInDemo, async (req, res) => {
   const studentCount = String(req.body.studentCount || '').trim();
   const contactPhone = String(req.body.contactPhone || '').trim();
   const notes = String(req.body.notes || '').trim();

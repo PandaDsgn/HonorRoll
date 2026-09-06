@@ -5,6 +5,7 @@ import { useTheme } from '../hooks/useTheme';
 import { useAuth } from '../context/AuthContext';
 import ThemeToggle from '../components/ThemeToggle';
 import BrandMark from '../components/BrandMark';
+import AuthVisualPanel from '../components/AuthVisualPanel';
 import { EyeIcon, EyeOffIcon } from '../components/EyeIcons';
 import { API } from '../config';
 
@@ -50,10 +51,7 @@ export default function Signup() {
 
   return (
     <div className="auth-shell">
-      <div className="auth-panel" aria-hidden="true">
-        <span className="auth-panel-eyebrow">HonorRoll</span>
-        <p className="auth-panel-quote">“Where assignments earn their grade.”</p>
-      </div>
+      <AuthVisualPanel />
 
       <div className="auth-card">
 

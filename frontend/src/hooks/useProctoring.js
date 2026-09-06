@@ -53,11 +53,6 @@ const MULTIPLE_FACES_SUSTAIN_MS = 1500;
 const PHONE_SCORE_THRESHOLD = 0.5;
 const MINOR_FLAG_COOLDOWN_MS = 10000;
 const OBJECT_DETECT_INTERVAL_MS = 1000;
-// Throttled console output of the live scores this hook is actually
-// computing — the fastest way to tell whether a flag isn't firing because
-// the behavior genuinely didn't cross the threshold, vs. something being
-// broken. Look for "[proctoring]" in devtools while testing.
-const DEBUG_LOG_INTERVAL_MS = 1000;
 
 // A "jerky/sudden movement" spike is a large angular jump in a short window
 // — distinct from head_turned, which fires on a slow sustained turn. Both
@@ -241,8 +236,6 @@ export function useProctoring({ enabled, onMinorFlag, onMajorFlag }) {
     let audioCtx = null;
     let micSource = null;
     let audioProcessor = null;
-    let lastVisualDebugLogAt = 0;
-    let lastAudioDebugLogAt = 0;
     sustainRef.current = {};
     cooldownRef.current = {};
 
@@ -301,10 +294,6 @@ export function useProctoring({ enabled, onMinorFlag, onMajorFlag }) {
             if (checkSustained('speech_detected', speechScore > SPEECH_SCORE_THRESHOLD, SPEECH_SUSTAIN_MS, MINOR_FLAG_COOLDOWN_MS, now)) {
               onMinorFlagRef.current?.('speech_detected', `Speech/vocalization detected (score ${speechScore.toFixed(2)}).`);
             }
-            if (now - lastAudioDebugLogAt > DEBUG_LOG_INTERVAL_MS) {
-              lastAudioDebugLogAt = now;
-              console.log(`[proctoring] speech score=${speechScore.toFixed(2)} (threshold ${SPEECH_SCORE_THRESHOLD})`, categories);
-            }
           };
           // ScriptProcessorNode only fires onaudioprocess once connected all
           // the way to a destination — route through a muted gain node so
@@ -340,9 +329,9 @@ export function useProctoring({ enabled, onMinorFlag, onMajorFlag }) {
           }
 
           if (hasFace) {
-            let yaw = null;
-            let pitch = null;
-            let gazeAway = null;
+            let yaw;
+            let pitch;
+            let gazeAway;
 
             const matrix = faceResult.facialTransformationMatrixes?.[0]?.data;
             if (matrix) {
@@ -383,10 +372,6 @@ export function useProctoring({ enabled, onMinorFlag, onMajorFlag }) {
               }
             }
 
-            if (now - lastVisualDebugLogAt > DEBUG_LOG_INTERVAL_MS) {
-              lastVisualDebugLogAt = now;
-              console.log(`[proctoring] yaw=${yaw?.toFixed(1)}° (th ${HEAD_YAW_DEG_THRESHOLD}) pitch=${pitch?.toFixed(1)}° (th ${HEAD_PITCH_DEG_THRESHOLD}) gazeAway=${gazeAway?.toFixed(2)} (th ${GAZE_AWAY_SCORE_THRESHOLD})`);
-            }
           } else {
             lastPose = null; // face reappearing shouldn't compute velocity across the gap
             rapidStreak = 0;
