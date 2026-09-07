@@ -176,6 +176,22 @@ button, a { touch-action: manipulation; }
 
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
+/* Visually hidden but still reachable by screen readers — for a <label>
+   whose text would be redundant on screen (the surrounding UI already
+   makes a field's purpose visually obvious) but that a field still needs
+   for a real programmatic name, not just a placeholder. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .skip-link {
   position: absolute;
   left: -9999px;

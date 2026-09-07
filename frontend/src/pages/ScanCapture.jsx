@@ -457,7 +457,7 @@ export default function ScanCapture() {
               all (scanQuestions is [] both before scanContext loads and for
               a genuinely scan-less assignment, so this reads correctly in
               every phase, not just 'questions'). */}
-          <h2 style={{ margin: '0 0 8px' }}>{scanQuestions.length > 0 ? 'Scan & submit' : 'Submit assignment'}</h2>
+          <h2 style={{ margin: '0 0 8px' }}>{scanQuestions.length > 0 ? 'Scan and submit' : 'Submit assignment'}</h2>
 
           {phase === 'loading' && <p className="sb-loading">Starting the scanner…</p>}
 
@@ -541,7 +541,9 @@ export default function ScanCapture() {
 
                     {(q.type === 'short' || q.type === 'long') && (
                       <div className="field">
+                        <label htmlFor={`scan-q-${q.id}-answer`} className="sr-only">Your answer</label>
                         <textarea
+                          id={`scan-q-${q.id}-answer`}
                           rows={q.type === 'long' ? 6 : 3}
                           value={ans.textAnswer || ''}
                           onChange={(e) => updateAnswer(q.id, { textAnswer: e.target.value })}
@@ -628,6 +630,8 @@ export default function ScanCapture() {
           <input
             ref={fileInputRef}
             type="file"
+            name="scan-upload"
+            aria-label="Upload a scanned PDF"
             accept="application/pdf,.pdf"
             style={{ display: 'none' }}
             onChange={handleFileSelected}

@@ -440,7 +440,9 @@ export default function ExamAttempt() {
 
               {(item.type === 'short' || item.type === 'long') && (
                 <div className="field">
+                  <label htmlFor={`exam-item-${item.id}-answer`} className="sr-only">Your answer</label>
                   <textarea
+                    id={`exam-item-${item.id}-answer`}
                     rows={item.type === 'long' ? 6 : 3}
                     value={ans.textAnswer || ''}
                     onChange={(e) => updateAnswer(item.id, { textAnswer: e.target.value })}
