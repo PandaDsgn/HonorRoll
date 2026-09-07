@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
 import { CODE_LANGUAGES } from '../lib/codeLanguages';
+import QuestionImageField from './QuestionImageField';
 import { API } from '../config';
 
 const ITEM_TYPES = [
@@ -54,6 +55,8 @@ function emptyItem(type = 'mcq') {
     marks: '1',
     timeLimitMinutes: '',
     prompt: '',
+    imageKey: null,
+    imageUrl: '',
     options: [{ id: 'a', text: '' }, { id: 'b', text: '' }],
     correctOptionId: '',
     wordLimit: '',
@@ -75,6 +78,8 @@ function itemFromServer(it) {
     marks: String(it.marks ?? 1),
     timeLimitMinutes: secondsToMinutesInput(it.time_limit_seconds),
     prompt: it.prompt || '',
+    imageKey: it.image_key || null,
+    imageUrl: it.image_url || '',
     options: Array.isArray(it.options) && it.options.length
       ? it.options.map((o) => ({ id: o.id, text: o.text }))
       : [{ id: 'a', text: '' }, { id: 'b', text: '' }],
@@ -195,6 +200,7 @@ export default function ExamForm({ initialData, onSubmit, onCancel }) {
     marks: Number(it.marks),
     timeLimitSeconds: minutesInputToSeconds(it.timeLimitMinutes),
     prompt: it.prompt.trim(),
+    imageKey: it.imageKey || null,
     options: it.type === 'mcq' ? it.options.filter((o) => o.text.trim()) : undefined,
     correctOptionId: it.type === 'mcq' ? it.correctOptionId : undefined,
     wordLimit: (it.type === 'short' || it.type === 'long') && it.wordLimit ? Number(it.wordLimit) : undefined,
@@ -250,7 +256,7 @@ export default function ExamForm({ initialData, onSubmit, onCancel }) {
       if (!it.marks || Number(it.marks) <= 0) { setError(`${label}: marks must be a positive number.`); return; }
 
       if (it.type === 'mcq') {
-        if (!it.prompt.trim()) { setError(`${label}: question text is required.`); return; }
+        if (!it.prompt.trim() && !it.imageKey) { setError(`${label}: question text or an image is required.`); return; }
         const filled = it.options.filter((o) => o.text.trim());
         if (filled.length < 2) { setError(`${label}: add at least 2 options.`); return; }
         if (!it.correctOptionId || !filled.some((o) => o.id === it.correctOptionId)) {
@@ -258,12 +264,12 @@ export default function ExamForm({ initialData, onSubmit, onCancel }) {
           return;
         }
       } else if (it.type === 'short' || it.type === 'long' || it.type === 'scan') {
-        if (!it.prompt.trim()) { setError(`${label}: question text is required.`); return; }
+        if (!it.prompt.trim() && !it.imageKey) { setError(`${label}: question text or an image is required.`); return; }
       } else if (it.type === 'coding') {
         if (it.codingMode === 'reuse') {
           if (!it.problemId) { setError(`${label}: pick a coding assignment.`); return; }
         } else {
-          if (!it.prompt.trim()) { setError(`${label}: question text is required.`); return; }
+          if (!it.prompt.trim() && !it.imageKey) { setError(`${label}: question text or an image is required.`); return; }
           const filledCases = it.testCases.filter((tc) => tc.expectedOutput.trim());
           if (filledCases.length === 0) { setError(`${label}: add at least one test case with an expected output.`); return; }
         }
@@ -413,14 +419,17 @@ export default function ExamForm({ initialData, onSubmit, onCancel }) {
             </div>
 
             {(it.type === 'mcq' || it.type === 'short' || it.type === 'long' || it.type === 'scan' || (it.type === 'coding' && it.codingMode === 'custom')) && (
-              <div className="field">
-                <label>Question text</label>
-                <textarea
-                  rows={it.type === 'long' ? 4 : 2}
-                  value={it.prompt}
-                  onChange={(e) => updateItem(it.key, { prompt: e.target.value })}
-                />
-              </div>
+              <>
+                <div className="field">
+                  <label>Question text (optional if an image is attached)</label>
+                  <textarea
+                    rows={it.type === 'long' ? 4 : 2}
+                    value={it.prompt}
+                    onChange={(e) => updateItem(it.key, { prompt: e.target.value })}
+                  />
+                </div>
+                <QuestionImageField imageUrl={it.imageUrl} onChange={(imageKey) => updateItem(it.key, { imageKey })} />
+              </>
             )}
 
             {it.type === 'scan' && (

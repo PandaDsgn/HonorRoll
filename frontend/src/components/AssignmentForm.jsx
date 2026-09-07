@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
 import { CODE_LANGUAGES } from '../lib/codeLanguages';
+import QuestionImageField from './QuestionImageField';
 import { API } from '../config';
 
 const LANGS = CODE_LANGUAGES.map((l) => l.id);
@@ -22,6 +23,8 @@ function emptyQuestion(type = 'scan') {
   return {
     type,
     prompt: '',
+    imageKey: null,
+    imageUrl: '',
     marks: 1,
     options: [{ id: 'a', text: '' }, { id: 'b', text: '' }],
     correctOptionId: '',
@@ -38,6 +41,8 @@ function questionFromServer(q) {
   return {
     type: q.type || 'scan',
     prompt: q.prompt || '',
+    imageKey: q.imageKey || null,
+    imageUrl: q.imageUrl || '',
     marks: q.marks ?? 1,
     options: Array.isArray(q.options) && q.options.length ? q.options : [{ id: 'a', text: '' }, { id: 'b', text: '' }],
     correctOptionId: q.correctOptionId || '',
@@ -203,7 +208,7 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
         const label = `Question ${i + 1}`;
         if (!q.marks || Number(q.marks) <= 0) { setError(`${label}: marks must be a positive number.`); return; }
         if (q.type === 'mcq') {
-          if (!q.prompt.trim()) { setError(`${label}: question text is required.`); return; }
+          if (!q.prompt.trim() && !q.imageKey) { setError(`${label}: question text or an image is required.`); return; }
           const filled = q.options.filter((o) => o.text.trim());
           if (filled.length < 2) { setError(`${label}: add at least 2 options.`); return; }
           if (!q.correctOptionId || !filled.some((o) => o.id === q.correctOptionId)) {
@@ -211,9 +216,9 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
             return;
           }
         } else if (q.type === 'short' || q.type === 'long' || q.type === 'scan') {
-          if (!q.prompt.trim()) { setError(`${label}: question text is required.`); return; }
+          if (!q.prompt.trim() && !q.imageKey) { setError(`${label}: question text or an image is required.`); return; }
         } else if (q.type === 'coding') {
-          if (!q.prompt.trim()) { setError(`${label}: question text is required.`); return; }
+          if (!q.prompt.trim() && !q.imageKey) { setError(`${label}: question text or an image is required.`); return; }
           const filledCases = q.testCases.filter((tc) => tc.expectedOutput.trim());
           if (filledCases.length === 0) { setError(`${label}: add at least one test case with an expected output.`); return; }
         }
@@ -222,6 +227,7 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
         type: q.type,
         marks: Number(q.marks),
         prompt: q.prompt.trim(),
+        imageKey: q.imageKey || null,
         options: q.type === 'mcq' ? q.options.filter((o) => o.text.trim()) : undefined,
         correctOptionId: q.type === 'mcq' ? q.correctOptionId : undefined,
         wordLimit: (q.type === 'short' || q.type === 'long') && q.wordLimit ? Number(q.wordLimit) : undefined,
@@ -400,10 +406,13 @@ export default function AssignmentForm({ initialData, onSubmit, onCancel }) {
                 </div>
 
                 {(q.type === 'mcq' || q.type === 'short' || q.type === 'long' || q.type === 'scan' || q.type === 'coding') && (
-                  <div className="field">
-                    <label>Question text</label>
-                    <textarea rows={q.type === 'long' ? 4 : 2} value={q.prompt} onChange={(e) => updateQuestion(idx, { prompt: e.target.value })} />
-                  </div>
+                  <>
+                    <div className="field">
+                      <label>Question text (optional if an image is attached)</label>
+                      <textarea rows={q.type === 'long' ? 4 : 2} value={q.prompt} onChange={(e) => updateQuestion(idx, { prompt: e.target.value })} />
+                    </div>
+                    <QuestionImageField imageUrl={q.imageUrl} onChange={(imageKey) => updateQuestion(idx, { imageKey })} />
+                  </>
                 )}
 
                 {q.type === 'scan' && (

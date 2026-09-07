@@ -517,6 +517,7 @@ export default function ScanCapture() {
                     </div>
 
                     {q.prompt && <p className="exam-take-prompt">{q.prompt}</p>}
+                    {q.imageUrl && <img src={q.imageUrl} alt={`Question ${idx + 1} attachment`} className="exam-take-image" />}
 
                     {q.type === 'scan' && (
                       <p className="auth-sub">Answer this on paper — you'll scan it in below.</p>

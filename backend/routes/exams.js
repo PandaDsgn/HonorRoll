@@ -93,11 +93,11 @@ router.post('/api/admin/exams', authenticateToken, requireAdminOrTeacher, async 
     for (let i = 0; i < normalizedItems.length; i++) {
       const item = normalizedItems[i];
       await client.query(
-        `INSERT INTO exam_items (exam_id, type, position, marks, time_limit_seconds, prompt, options, correct_option_id, word_limit, problem_id, starter_code, test_cases)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        `INSERT INTO exam_items (exam_id, type, position, marks, time_limit_seconds, prompt, options, correct_option_id, word_limit, problem_id, starter_code, test_cases, image_key)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
         [examId, item.type, i, item.marks, item.timeLimitSeconds, item.prompt,
          item.options ? JSON.stringify(item.options) : null, item.correctOptionId, item.wordLimit, item.problemId,
-         item.starterCode ? JSON.stringify(item.starterCode) : null, item.testCases ? JSON.stringify(item.testCases) : null]
+         item.starterCode ? JSON.stringify(item.starterCode) : null, item.testCases ? JSON.stringify(item.testCases) : null, item.imageKey]
       );
     }
 
@@ -155,12 +155,15 @@ router.get('/api/admin/exams/:id', authenticateToken, requireAdminOrTeacher, asy
     if (await enforceSubjectAuthority(req, res, examRes.rows[0].subject_id)) return;
 
     const itemsRes = await pool.query(
-      `SELECT id, type, position, marks, time_limit_seconds, prompt, options, correct_option_id, word_limit, problem_id, starter_code, test_cases
+      `SELECT id, type, position, marks, time_limit_seconds, prompt, options, correct_option_id, word_limit, problem_id, starter_code, test_cases, image_key
        FROM exam_items WHERE exam_id = $1 ORDER BY position ASC`,
       [examId]
     );
+    const items = await Promise.all(itemsRes.rows.map(async (item) => (
+      item.image_key ? { ...item, image_url: await getScanPdfUrl(item.image_key, 900) } : item
+    )));
 
-    res.status(200).json({ ...examRes.rows[0], items: itemsRes.rows });
+    res.status(200).json({ ...examRes.rows[0], items });
   } catch (err) {
     console.error('Fetch full exam error:', err);
     res.status(500).json({ error: 'Failed to load exam details' });
@@ -231,11 +234,11 @@ router.put('/api/admin/exams/:id', authenticateToken, requireAdminOrTeacher, asy
     for (let i = 0; i < normalizedItems.length; i++) {
       const item = normalizedItems[i];
       await client.query(
-        `INSERT INTO exam_items (exam_id, type, position, marks, time_limit_seconds, prompt, options, correct_option_id, word_limit, problem_id, starter_code, test_cases)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        `INSERT INTO exam_items (exam_id, type, position, marks, time_limit_seconds, prompt, options, correct_option_id, word_limit, problem_id, starter_code, test_cases, image_key)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
         [examId, item.type, i, item.marks, item.timeLimitSeconds, item.prompt,
          item.options ? JSON.stringify(item.options) : null, item.correctOptionId, item.wordLimit, item.problemId,
-         item.starterCode ? JSON.stringify(item.starterCode) : null, item.testCases ? JSON.stringify(item.testCases) : null]
+         item.starterCode ? JSON.stringify(item.starterCode) : null, item.testCases ? JSON.stringify(item.testCases) : null, item.imageKey]
       );
     }
 
@@ -313,11 +316,11 @@ router.post('/api/admin/exams/:id/clone', authenticateToken, requireAdminOrTeach
         for (let i = 0; i < items.length; i++) {
           const it = items[i];
           await client.query(
-            `INSERT INTO exam_items (exam_id, type, position, marks, time_limit_seconds, prompt, options, correct_option_id, word_limit, problem_id, starter_code, test_cases)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+            `INSERT INTO exam_items (exam_id, type, position, marks, time_limit_seconds, prompt, options, correct_option_id, word_limit, problem_id, starter_code, test_cases, image_key)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
             [newExamId, it.type, i, it.marks, it.time_limit_seconds, it.prompt,
              it.options ? JSON.stringify(it.options) : null, it.correct_option_id, it.word_limit, it.problem_id,
-             it.starter_code ? JSON.stringify(it.starter_code) : null, it.test_cases ? JSON.stringify(it.test_cases) : null]
+             it.starter_code ? JSON.stringify(it.starter_code) : null, it.test_cases ? JSON.stringify(it.test_cases) : null, it.image_key]
           );
         }
       }
@@ -574,8 +577,15 @@ router.post('/api/exams/:id/start', authenticateToken, async (req, res) => {
       descRes.rows.forEach((row) => { descriptionByProblem[row.id] = row.description; });
     }
 
+    // Resolved up front (one pass, not inside the map below) since signing
+    // a URL is async and Array.prototype.map can't await per-item.
+    const imageUrlByItemId = {};
+    await Promise.all(items.filter((it) => it.image_key).map(async (it) => {
+      imageUrlByItemId[it.id] = await getScanPdfUrl(it.image_key, 900);
+    }));
+
     const sanitizedItems = items.map((it) => {
-      const base = { id: it.id, type: it.type, marks: it.marks, prompt: it.prompt };
+      const base = { id: it.id, type: it.type, marks: it.marks, prompt: it.prompt, imageUrl: imageUrlByItemId[it.id] || null };
       if (it.type === 'mcq') return { ...base, options: it.options };
       if (it.type === 'short' || it.type === 'long') return { ...base, wordLimit: it.word_limit };
       if (it.type === 'coding') {
@@ -1027,7 +1037,7 @@ router.get('/api/admin/exam-attempts/:attemptId/answers', authenticateToken, req
     if (await enforceSubjectAuthority(req, res, examRes.rows[0].subject_id)) return;
 
     const result = await pool.query(
-      `SELECT ea.id AS answer_id, ei.id AS item_id, ei.type, ei.prompt, ei.marks, ei.options,
+      `SELECT ea.id AS answer_id, ei.id AS item_id, ei.type, ei.prompt, ei.marks, ei.options, ei.image_key,
               ea.marks_awarded, ea.selected_option_id, ea.text_answer, ea.is_correct,
               ea.passed_count, ea.total_count, ea.code, ea.language, ea.remarks, ea.ai_assessment
        FROM exam_answers ea
@@ -1038,13 +1048,16 @@ router.get('/api/admin/exam-attempts/:attemptId/answers', authenticateToken, req
        ORDER BY ei.position ASC`,
       [req.params.attemptId, req.user.organizationId]
     );
+    const answers = await Promise.all(result.rows.map(async (a) => (
+      a.image_key ? { ...a, image_url: await getScanPdfUrl(a.image_key, 900) } : a
+    )));
 
     // scan items live in a separate table (see exam_scan_answers' own
     // comment) — folded into the same response so the grading UI doesn't
     // need a second round trip. attemptScan is null for an attempt with no
     // scan-type items at all (the common case — most exams have none).
     const scanAnswersRes = await pool.query(
-      `SELECT esa.id AS answer_id, ei.id AS item_id, ei.type, ei.prompt, ei.marks,
+      `SELECT esa.id AS answer_id, ei.id AS item_id, ei.type, ei.prompt, ei.marks, ei.image_key,
               esa.marks_awarded, esa.ai_assessment, esa.remarks
        FROM exam_scan_answers esa
        JOIN exam_items ei ON ei.id = esa.item_id
@@ -1054,6 +1067,9 @@ router.get('/api/admin/exam-attempts/:attemptId/answers', authenticateToken, req
        ORDER BY ei.position ASC`,
       [req.params.attemptId, req.user.organizationId]
     );
+    const scanAnswers = await Promise.all(scanAnswersRes.rows.map(async (a) => (
+      a.image_key ? { ...a, image_url: await getScanPdfUrl(a.image_key, 900) } : a
+    )));
 
     let attemptScan = null;
     if (scanAnswersRes.rows.length > 0) {
@@ -1080,7 +1096,7 @@ router.get('/api/admin/exam-attempts/:attemptId/answers', authenticateToken, req
     );
     const overallRemarks = overallRemarksRes.rows[0] ? overallRemarksRes.rows[0].overall_remarks : null;
 
-    res.status(200).json({ answers: result.rows, scanAnswers: scanAnswersRes.rows, attemptScan, overallRemarks });
+    res.status(200).json({ answers, scanAnswers, attemptScan, overallRemarks });
   } catch (err) {
     console.error('List exam answers error:', err);
     res.status(500).json({ error: 'Failed to load answers' });

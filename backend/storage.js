@@ -73,6 +73,15 @@ function noticesObjectKey(organizationId, fileId, extension = '.pdf') {
   return `notices/${organizationId}/${fileId}${extension}`;
 }
 
+// An assignment/exam question's attached image — uploaded separately from
+// the question itself (POST /api/admin/question-images), before the
+// question row necessarily exists yet (a brand new question in the form
+// builder has no id to key under), so this keys on a fresh random id the
+// same way noticesObjectKey does rather than a row id.
+function questionImageObjectKey(organizationId, fileId, extension = '.jpg') {
+  return `question-images/${organizationId}/${fileId}${extension}`;
+}
+
 // Same shape as notesObjectKey — a doubt's attachment is scoped to a
 // subject the same way a note is. Default extension is .jpg (a photo,
 // the common case) rather than .pdf, unlike every helper above.
@@ -159,6 +168,6 @@ async function deleteScanPdf(objectKey) {
 
 module.exports = {
   isB2Configured, scanObjectKey, examScanObjectKey, notesObjectKey, noticesObjectKey,
-  avatarObjectKey, orgLogoObjectKey, doubtsObjectKey, chatObjectKey,
+  avatarObjectKey, orgLogoObjectKey, doubtsObjectKey, chatObjectKey, questionImageObjectKey,
   uploadScanPdf, getScanPdfUrl, downloadScanPdf, deleteScanPdf,
 };

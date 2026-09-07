@@ -422,6 +422,10 @@ async function ensureExamSchemaImpl() {
     // this — CREATE TABLE IF NOT EXISTS wouldn't retroactively add columns.
     await pool.query('ALTER TABLE exam_items ADD COLUMN IF NOT EXISTS starter_code JSONB');
     await pool.query('ALTER TABLE exam_items ADD COLUMN IF NOT EXISTS test_cases JSONB');
+    // B2 object key for an optional image attached to the question — see
+    // storage.js's questionImageObjectKey. Question text is no longer the
+    // only way to ask something; a question can lean on an image alone.
+    await pool.query('ALTER TABLE exam_items ADD COLUMN IF NOT EXISTS image_key TEXT');
     // Widens the type CHECK for exam_items tables that already existed
     // before 'scan' was added — same DROP/re-ADD pattern as
     // ensureExamProctoringSchema's end_reason constraint further down.
@@ -1254,6 +1258,11 @@ function ensureScanAssignmentQuestionsSchema() {
       await pool.query('ALTER TABLE scan_assignment_questions ADD COLUMN IF NOT EXISTS word_limit INTEGER'); // short/long only
       await pool.query('ALTER TABLE scan_assignment_questions ADD COLUMN IF NOT EXISTS starter_code JSONB'); // coding only
       await pool.query('ALTER TABLE scan_assignment_questions ADD COLUMN IF NOT EXISTS test_cases JSONB'); // coding only
+      // Same image-attachment support as exam_items — see that table's own
+      // image_key comment. prompt drops its NOT NULL since a question can
+      // now lean on an image alone instead of text.
+      await pool.query('ALTER TABLE scan_assignment_questions ADD COLUMN IF NOT EXISTS image_key TEXT');
+      await pool.query('ALTER TABLE scan_assignment_questions ALTER COLUMN prompt DROP NOT NULL');
     }).catch((err) => console.error('Failed to ensure scan_assignment_questions schema:', err));
   }
   return scanAssignmentQuestionsSchemaPromise;

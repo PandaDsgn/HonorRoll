@@ -3,6 +3,7 @@ import axios from 'axios';
 import ExamForm from '../../components/ExamForm';
 import { STATUS_CLASS, formatDate, formatDuration, formatScanStatus } from './format';
 import { API } from '../../config';
+import '../../Exam.css';
 
 // ============================================================================
 // EXAMS PANEL — same list/create/edit/delete shape as AssignmentsPanel, just
@@ -215,6 +216,7 @@ function GradingForm({ attemptId, onGraded }) {
             <span>{a.prompt}</span>
             <span className="chip chip-neutral"><span className="dot" />{a.marks_awarded ?? 0}/{a.marks} marks (auto-graded)</span>
           </div>
+          {a.image_url && <img src={a.image_url} alt="Question attachment" className="exam-take-image" />}
           {a.type === 'mcq' && (
             <p className="auth-sub" style={{ margin: '8px 0' }}>
               Selected: {a.options?.find((o) => o.id === a.selected_option_id)?.text || '(no answer given)'}
@@ -240,6 +242,7 @@ function GradingForm({ attemptId, onGraded }) {
             <span>{a.prompt}</span>
             <span className="chip chip-neutral"><span className="dot" />{a.marks} marks</span>
           </div>
+          {a.image_url && <img src={a.image_url} alt="Question attachment" className="exam-take-image" />}
           <pre className="submission-code">{a.text_answer || '(no answer given)'}</pre>
           {a.ai_assessment && <p className="auth-sub" style={{ margin: '8px 0' }}>AI assessment (aid only): {a.ai_assessment}</p>}
           {gradeInput('short-long', a)}
@@ -297,6 +300,7 @@ function GradingForm({ attemptId, onGraded }) {
             <span>{a.prompt}</span>
             <span className="chip chip-neutral"><span className="dot" />{a.marks} marks</span>
           </div>
+          {a.image_url && <img src={a.image_url} alt="Question attachment" className="exam-take-image" />}
           {a.ai_assessment && <p className="auth-sub" style={{ margin: '8px 0' }}>AI assessment (aid only): {a.ai_assessment}</p>}
           {gradeInput('scan', a)}
           {remarksField('scan', a)}

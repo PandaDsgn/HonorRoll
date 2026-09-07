@@ -364,19 +364,16 @@ button.brand:hover .brand-honor { color: var(--accent); }
 .field input::placeholder { color: var(--text-dim); }
 .field input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
 
-/* WebKit draws the datetime-local calendar-icon glyph as flat black,
-   ignoring `color` entirely — invisible against a dark surface unless
-   inverted. Global on the element type (not scoped to .field) since
-   datetime-local inputs show up outside form fields too, e.g. the inline
-   deadline editor in AdminDashboard's assignments table. Dark theme is the
-   default (:root), so this is opt-out for light theme rather than opt-in
-   for dark. */
+/* No filter needed here — :root/[data-theme='light'] both declare their own
+   color-scheme (dark/light), which is what actually tells the browser to
+   render its native controls, including this calendar-icon glyph, in the
+   right tone on its own. An invert() filter here was a workaround from
+   before color-scheme was declared at all (when the browser defaulted to
+   assuming a light page and drew the icon flat black regardless of theme);
+   now that color-scheme is set, invert() flips an already-correct icon
+   color back to the wrong one instead of fixing anything. */
 input[type='date']::-webkit-calendar-picker-indicator,
-input[type='datetime-local']::-webkit-calendar-picker-indicator { filter: invert(1); opacity: 0.7; cursor: pointer; }
-input[type='date']::-webkit-calendar-picker-indicator:hover,
-input[type='datetime-local']::-webkit-calendar-picker-indicator:hover { opacity: 1; }
-[data-theme='light'] input[type='date']::-webkit-calendar-picker-indicator,
-[data-theme='light'] input[type='datetime-local']::-webkit-calendar-picker-indicator { filter: none; }
+input[type='datetime-local']::-webkit-calendar-picker-indicator { cursor: pointer; }
 
 .field textarea {
   width: 100%;

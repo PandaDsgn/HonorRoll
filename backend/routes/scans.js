@@ -70,12 +70,15 @@ router.get('/api/me/scan-context', authenticateToken, async (req, res) => {
     // GET /api/exams/:id/start (hidden test cases and correct_option_id
     // never leave the server).
     const questionsRes = await pool.query(
-      `SELECT id, prompt, marks, type, options, word_limit, starter_code, test_cases
+      `SELECT id, prompt, marks, type, options, word_limit, starter_code, test_cases, image_key
        FROM scan_assignment_questions WHERE problem_id = $1 ORDER BY position ASC`,
       [problemId]
     );
-    const questions = questionsRes.rows.map((q) => {
-      const base = { id: q.id, type: q.type, marks: q.marks, prompt: q.prompt };
+    const questions = await Promise.all(questionsRes.rows.map(async (q) => {
+      const base = {
+        id: q.id, type: q.type, marks: q.marks, prompt: q.prompt,
+        imageUrl: q.image_key ? await getScanPdfUrl(q.image_key, 900) : null,
+      };
       if (q.type === 'mcq') return { ...base, options: q.options };
       if (q.type === 'short' || q.type === 'long') return { ...base, wordLimit: q.word_limit };
       if (q.type === 'coding') {
@@ -85,7 +88,7 @@ router.get('/api/me/scan-context', authenticateToken, async (req, res) => {
         return { ...base, starterCode: q.starter_code || {}, samples };
       }
       return base; // scan
-    });
+    }));
 
     res.status(200).json({
       studentName: name || null,

@@ -420,6 +420,7 @@ export default function ExamAttempt() {
               </div>
 
               {item.prompt && <p className="exam-take-prompt">{item.prompt}</p>}
+              {item.imageUrl && <img src={item.imageUrl} alt={`Item ${idx + 1} attachment`} className="exam-take-image" />}
 
               {item.type === 'mcq' && (
                 <div className="exam-mcq-options">

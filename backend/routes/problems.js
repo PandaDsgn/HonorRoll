@@ -17,6 +17,19 @@ const { getProblemStatus, getVisibleSubjectIds, computePercentileTiers, gradeTag
 const { LANGUAGE_CONFIG, executeInSandbox, normalizeOutput } = require('../lib/sandbox');
 const { runCodePlagiarismComparator } = require('../lib/plagiarism');
 const { normalizeTimeLimitSeconds, normalizeScanAssignmentQuestion } = require('../lib/examItems');
+const { getScanPdfUrl } = require('../storage');
+
+// Resolves every question's image_key into a fresh short-lived signed URL
+// in parallel — a stored key alone isn't fetchable by the browser, and a
+// signed URL from an earlier request may already have expired by the time
+// this page loads. Skips questions with no image_key rather than signing
+// a URL for `null`. Shared by both the student-facing and admin-editing
+// question fetches so the two can never drift on how this is done.
+async function withQuestionImageUrls(questions) {
+  return Promise.all(questions.map(async (q) => (
+    q.imageKey ? { ...q, imageUrl: await getScanPdfUrl(q.imageKey, 900) } : q
+  )));
+}
 
 // Problems-only (never used by exams, unlike normalizeTimeLimitSeconds) —
 // stays local rather than in lib/examItems.js.
@@ -438,11 +451,11 @@ router.post('/api/admin/problems', authenticateToken, requireAdminOrTeacher, asy
       for (let i = 0; i < questions.length; i++) {
         const q = questions[i];
         await client.query(
-          `INSERT INTO scan_assignment_questions (problem_id, position, prompt, marks, type, options, correct_option_id, word_limit, starter_code, test_cases)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          `INSERT INTO scan_assignment_questions (problem_id, position, prompt, marks, type, options, correct_option_id, word_limit, starter_code, test_cases, image_key)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
           [problemId, i, q.prompt, q.marks, q.type,
             q.options ? JSON.stringify(q.options) : null, q.correctOptionId, q.wordLimit,
-            q.starterCode ? JSON.stringify(q.starterCode) : null, q.testCases ? JSON.stringify(q.testCases) : null]
+            q.starterCode ? JSON.stringify(q.starterCode) : null, q.testCases ? JSON.stringify(q.testCases) : null, q.imageKey]
         );
       }
     }
@@ -478,15 +491,15 @@ router.get('/api/admin/problems/:id', authenticateToken, requireAdminOrTeacher, 
     let questions = [];
     if (problem.submission_mode === 'scan') {
       const questionsRes = await pool.query(
-        `SELECT prompt, marks, type, options, correct_option_id, word_limit, starter_code, test_cases
+        `SELECT prompt, marks, type, options, correct_option_id, word_limit, starter_code, test_cases, image_key
          FROM scan_assignment_questions WHERE problem_id = $1 ORDER BY position ASC`,
         [problemId]
       );
-      questions = questionsRes.rows.map((q) => ({
+      questions = await withQuestionImageUrls(questionsRes.rows.map((q) => ({
         prompt: q.prompt, marks: q.marks, type: q.type,
         options: q.options, correctOptionId: q.correct_option_id, wordLimit: q.word_limit,
-        starterCode: q.starter_code, testCases: q.test_cases,
-      }));
+        starterCode: q.starter_code, testCases: q.test_cases, imageKey: q.image_key,
+      })));
     } else {
       const codeRes = await pool.query(
         'SELECT language, code FROM starter_code WHERE problem_id = $1',
@@ -603,11 +616,11 @@ router.put('/api/admin/problems/:id', authenticateToken, requireAdminOrTeacher, 
       for (let i = 0; i < questions.length; i++) {
         const q = questions[i];
         await client.query(
-          `INSERT INTO scan_assignment_questions (problem_id, position, prompt, marks, type, options, correct_option_id, word_limit, starter_code, test_cases)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          `INSERT INTO scan_assignment_questions (problem_id, position, prompt, marks, type, options, correct_option_id, word_limit, starter_code, test_cases, image_key)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
           [problemId, i, q.prompt, q.marks, q.type,
             q.options ? JSON.stringify(q.options) : null, q.correctOptionId, q.wordLimit,
-            q.starterCode ? JSON.stringify(q.starterCode) : null, q.testCases ? JSON.stringify(q.testCases) : null]
+            q.starterCode ? JSON.stringify(q.starterCode) : null, q.testCases ? JSON.stringify(q.testCases) : null, q.imageKey]
         );
       }
       await client.query('COMMIT');

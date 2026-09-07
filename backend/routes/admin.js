@@ -8,6 +8,8 @@
 // below is the exact full path it always was.
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
+const path = require('path');
 const { parse: parseCsv } = require('csv-parse/sync');
 const { pool } = require('../lib/db');
 const {
@@ -21,7 +23,7 @@ const {
 const { checkStudentCap } = require('../lib/billing');
 const { findOrCreateGlobalUser, sendStudentWelcomeEmail } = require('../lib/misc');
 const { logSecurityEvent } = require('../lib/securityEvents');
-const { isB2Configured, orgLogoObjectKey, uploadScanPdf, getScanPdfUrl } = require('../storage');
+const { isB2Configured, orgLogoObjectKey, questionImageObjectKey, uploadScanPdf, getScanPdfUrl } = require('../storage');
 const { avatarUpload, csvUpload } = require('../lib/uploads');
 const { sendEmail } = require('../mailer');
 const { cached, invalidate } = require('../cache');
@@ -624,6 +626,30 @@ router.post('/api/admin/organization/logo', authenticateToken, requireAdmin, ava
   } catch (err) {
     console.error('Upload organization logo error:', err);
     res.status(500).json({ error: 'Failed to upload logo' });
+  }
+});
+
+// Uploads one image to attach to an assignment/exam question — separate
+// from AssignmentForm/ExamForm's own create/update submit since a question
+// in the form builder has no row (and so no id to key an object under)
+// until the whole assignment/exam is actually saved. The form uploads the
+// image the moment a teacher picks a file, gets back imageKey, and carries
+// that string in the question's own JSON payload at submit time (see
+// normalizeExamItem in lib/examItems.js). No DB row of its own — an
+// unreferenced upload (a teacher who picks an image then removes the
+// question, or never saves the form) is just an orphaned object in the
+// bucket, the same tradeoff doubts/chat attachments already accept.
+router.post('/api/admin/question-images', authenticateToken, requireAdminOrTeacher, avatarUpload.single('image'), async (req, res) => {
+  if (!isB2Configured()) return res.status(503).json({ error: 'Image storage is not configured yet' });
+  if (!req.file) return res.status(400).json({ error: 'An image is required' });
+  try {
+    const ext = path.extname(req.file.originalname || '') || '.jpg';
+    const storageKey = questionImageObjectKey(req.user.organizationId, crypto.randomUUID(), ext);
+    await uploadScanPdf(storageKey, req.file.buffer, req.file.mimetype);
+    res.status(201).json({ imageKey: storageKey, url: await getScanPdfUrl(storageKey, 900) });
+  } catch (err) {
+    console.error('Upload question image error:', err);
+    res.status(500).json({ error: 'Failed to upload image' });
   }
 });
 

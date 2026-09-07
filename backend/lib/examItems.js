@@ -20,6 +20,14 @@ function normalizeTimeLimitSeconds(value) {
 
 const EXAM_ITEM_TYPES = new Set(['mcq', 'short', 'long', 'coding', 'scan']);
 
+// A question needs SOMETHING to ask — either text, an attached image, or
+// both. Throws the same "question text is required" message an empty
+// prompt always threw, so a question with neither still gets a clear,
+// familiar error rather than a confusing new one.
+function requirePromptOrImage(label, prompt, imageKey) {
+  if (!prompt && !imageKey) throw new Error(`${label}: question text is required`);
+}
+
 // Validates + normalizes one item from the exam builder's payload, returning
 // a clean object ready to insert. Throws a message naming the offending item
 // (1-indexed, matching what the admin sees on screen), which the route
@@ -43,11 +51,17 @@ function normalizeExamItem(raw, index) {
     throw new Error(`${label}: time limit must be a positive number of seconds, or left blank`);
   }
 
-  const base = { type: raw.type, marks: Math.round(marks), timeLimitSeconds };
+  // Set by POST /api/admin/question-images ahead of time — this route never
+  // receives file bytes itself, just the B2 key that upload already
+  // produced (see that route's own comment for why uploads happen
+  // separately from the create/update submit).
+  const imageKey = raw.imageKey ? String(raw.imageKey) : null;
+
+  const base = { type: raw.type, marks: Math.round(marks), timeLimitSeconds, imageKey };
 
   if (raw.type === 'mcq') {
     const prompt = String(raw.prompt || '').trim();
-    if (!prompt) throw new Error(`${label}: question text is required`);
+    requirePromptOrImage(label, prompt, imageKey);
 
     const rawOptions = Array.isArray(raw.options) ? raw.options : [];
     const options = rawOptions
@@ -65,7 +79,7 @@ function normalizeExamItem(raw, index) {
 
   if (raw.type === 'short' || raw.type === 'long') {
     const prompt = String(raw.prompt || '').trim();
-    if (!prompt) throw new Error(`${label}: question text is required`);
+    requirePromptOrImage(label, prompt, imageKey);
 
     let wordLimit = null;
     if (raw.wordLimit !== null && raw.wordLimit !== undefined && raw.wordLimit !== '') {
@@ -81,7 +95,7 @@ function normalizeExamItem(raw, index) {
 
   if (raw.type === 'scan') {
     const prompt = String(raw.prompt || '').trim();
-    if (!prompt) throw new Error(`${label}: question text is required`);
+    requirePromptOrImage(label, prompt, imageKey);
     return { ...base, prompt, options: null, correctOptionId: null, wordLimit: null, problemId: null, starterCode: null, testCases: null };
   }
 
@@ -105,7 +119,7 @@ function normalizeExamItem(raw, index) {
   }
 
   const prompt = String(raw.prompt || '').trim();
-  if (!prompt) throw new Error(`${label}: question text is required`);
+  requirePromptOrImage(label, prompt, imageKey);
 
   const rawStarterCode = raw.starterCode && typeof raw.starterCode === 'object' ? raw.starterCode : {};
   const starterCode = Object.fromEntries(
