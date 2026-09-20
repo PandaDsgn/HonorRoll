@@ -57,7 +57,10 @@ async function sendLockoutOtpEmail(email, name, otp) {
     subject: 'HonorRoll: verification code to unlock your account',
     text: `Hello ${name || 'there'},\n\nYour HonorRoll account is temporarily locked after repeated failed login attempts, but you just entered the correct password — enter this code to lift the lock and finish signing in:\n\n${otp}\n\nThis code expires in ${OTP_EXPIRY.replace('m', ' minutes')}. If you didn't just try to log in, ignore this email; the lock will clear on its own once the cooldown passes.\n\n— HonorRoll`,
   });
-  if (error) console.error(`Lockout OTP email failed to send to ${email}:`, error);
+  if (error) {
+    console.error(`Lockout OTP email failed to send to ${email}:`, error);
+    throw new Error('Failed to send lockout OTP email');
+  }
 }
 
 // Sent the first time a login succeeds from a browser/device this account
@@ -72,7 +75,10 @@ async function sendDeviceVerificationEmail(email, name, otp, userAgent) {
     subject: 'HonorRoll: verify this new device',
     text: `Hello ${name || 'there'},\n\nSomeone just signed in to your HonorRoll account from a device/browser we haven't seen before${userAgent ? ` (${userAgent})` : ''}. If this was you, enter this code to continue:\n\n${otp}\n\nThis code expires in ${OTP_EXPIRY.replace('m', ' minutes')}. If this wasn't you, don't enter it — and consider resetting your password.\n\n— HonorRoll`,
   });
-  if (error) console.error(`Device verification email failed to send to ${email}:`, error);
+  if (error) {
+    console.error(`Device verification email failed to send to ${email}:`, error);
+    throw new Error('Failed to send device verification email');
+  }
 }
 
 // Resend cooldown, shared by both OTP flows' own resend routes: the very
@@ -115,7 +121,7 @@ const LOGIN_AUDIENCES = ['student', 'teacher', 'admin', 'superadmin'];
 // callers just `return completeLoginForUser(...)`.
 async function completeLoginForUser(req, res, user, email, audience) {
   const memberships = await pool.query(
-    `SELECT m.role, m.organization_id, m.org_unit_id, o.name AS organization_name, o.status AS organization_status
+    `SELECT m.role, m.organization_id, m.org_unit_id, o.name AS organization_name, o.status AS organization_status, o.is_single_teacher
      FROM memberships m JOIN organizations o ON o.id = m.organization_id
      WHERE m.user_id = $1
      ORDER BY o.name ASC`,
@@ -199,14 +205,14 @@ async function completeLoginForUser(req, res, user, email, audience) {
         tosPendingToken,
       });
     }
-    const token = mintSessionToken({ user_id: user.id, role: m.role, organization_id: m.organization_id, org_unit_id: m.org_unit_id });
+    const token = mintSessionToken({ user_id: user.id, role: m.role, organization_id: m.organization_id, org_unit_id: m.org_unit_id, is_single_teacher: m.is_single_teacher });
     // Returned in the body, not set as a cookie — see authenticateToken for
     // why. The frontend stores this and attaches it as an Authorization
     // header on every request from here on.
     return res.status(200).json({
       message: 'Login successful',
       token,
-      user: { id: user.id, email, role: m.role, name: user.name, organization_name: m.organization_name },
+      user: { id: user.id, email, role: m.role, name: user.name, organization_name: m.organization_name, organizationId: m.organization_id, isSingleTeacher: !!m.is_single_teacher },
     });
   }
 
@@ -601,7 +607,7 @@ router.post('/api/login/select-organization', async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT u.id AS user_id, u.email, u.name, u.tos_accepted_at, m.role, m.organization_id, m.org_unit_id,
-              o.name AS organization_name, o.status AS organization_status
+              o.name AS organization_name, o.status AS organization_status, o.is_single_teacher
        FROM memberships m
        JOIN users u ON u.id = m.user_id
        JOIN organizations o ON o.id = m.organization_id
@@ -639,7 +645,7 @@ router.post('/api/login/select-organization', async (req, res) => {
     res.status(200).json({
       message: 'Login successful',
       token,
-      user: { id: m.user_id, email: m.email, role: m.role, name: m.name, organization_name: m.organization_name },
+      user: { id: m.user_id, email: m.email, role: m.role, name: m.name, organization_name: m.organization_name, organizationId: m.organization_id, isSingleTeacher: !!m.is_single_teacher },
     });
   } catch (error) {
     console.error('Select-organization error:', error);
@@ -676,18 +682,19 @@ router.post('/api/login/accept-tos', async (req, res) => {
     if (result.rows.length === 0) return res.status(401).json({ error: 'Session no longer valid' });
     const user = result.rows[0];
 
-    const orgRes = await pool.query('SELECT name FROM organizations WHERE id = $1', [payload.organizationId]);
+    const orgRes = await pool.query('SELECT name, is_single_teacher FROM organizations WHERE id = $1', [payload.organizationId]);
 
     const token = mintSessionToken({
       user_id: payload.userId,
       role: payload.role,
       organization_id: payload.organizationId,
       org_unit_id: payload.orgUnitId,
+      is_single_teacher: orgRes.rows[0]?.is_single_teacher,
     });
     res.status(200).json({
       message: 'Login successful',
       token,
-      user: { id: user.id, email: user.email, role: payload.role, name: user.name, organization_name: orgRes.rows[0]?.name },
+      user: { id: user.id, email: user.email, role: payload.role, name: user.name, organization_name: orgRes.rows[0]?.name, organizationId: payload.organizationId, isSingleTeacher: !!orgRes.rows[0]?.is_single_teacher },
     });
   } catch (error) {
     console.error('Accept-ToS error:', error);

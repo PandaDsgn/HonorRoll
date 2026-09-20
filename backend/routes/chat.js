@@ -29,7 +29,13 @@ async function canChat(me, otherUserId) {
   if (otherRes.rows.length === 0) return false;
   const other = otherRes.rows[0];
 
-  if (me.role === 'student' && other.role === 'teacher') {
+  // An admin can chat with a student too, in any org (not just a
+  // single-teacher one) — the same subject_teachers-membership check a
+  // real teacher goes through either way, so an admin only actually shows
+  // up as a contact once they're assigned to a subject (auto-assigned for
+  // a single-teacher org's founder, see POST /api/admin/subjects; a manual
+  // "add teacher" for anyone else).
+  if (me.role === 'student' && (other.role === 'teacher' || other.role === 'admin')) {
     const visibleSubjectIds = await getVisibleSubjectIds(me.orgUnitId);
     if (visibleSubjectIds.length === 0) return false;
     const check = await pool.query(
@@ -38,7 +44,7 @@ async function canChat(me, otherUserId) {
     );
     return check.rows.length > 0;
   }
-  if (me.role === 'teacher' && other.role === 'student') {
+  if ((me.role === 'teacher' || me.role === 'admin') && other.role === 'student') {
     const { unitIds } = await getTeacherScope(me.userId, me.organizationId);
     return unitIds.includes(other.org_unit_id);
   }
@@ -62,7 +68,7 @@ router.get('/api/chat/contacts', authenticateToken, async (req, res) => {
          ORDER BY u.name ASC NULLS LAST, u.email ASC`,
         [visibleSubjectIds]
       );
-    } else if (req.user.role === 'teacher') {
+    } else if (req.user.role === 'teacher' || req.user.role === 'admin') {
       const { unitIds } = await getTeacherScope(req.user.userId, req.user.organizationId);
       result = unitIds.length === 0 ? { rows: [] } : await pool.query(
         `SELECT DISTINCT u.id, u.name, u.email, k.public_key_jwk

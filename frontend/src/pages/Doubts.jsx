@@ -328,6 +328,7 @@ export function DoubtDetail({ doubtId, onBack, role }) {
   const [error, setError] = useState('');
   const [replyText, setReplyText] = useState('');
   const [posting, setPosting] = useState(false);
+  const [followBusy, setFollowBusy] = useState(false);
 
   const fetchDetail = useCallback(() => {
     setError('');
@@ -337,6 +338,20 @@ export function DoubtDetail({ doubtId, onBack, role }) {
   }, [doubtId]);
 
   useEffect(() => { fetchDetail(); }, [fetchDetail]);
+
+  const toggleFollow = async () => {
+    setFollowBusy(true);
+    setError('');
+    try {
+      const method = data.doubt.isFollowing ? 'delete' : 'post';
+      await axios({ method, url: `${API}/api/doubts/${doubtId}/follow`, withCredentials: true });
+      setData((prev) => ({ ...prev, doubt: { ...prev.doubt, isFollowing: !prev.doubt.isFollowing } }));
+    } catch (err) {
+      setError(err.response?.data?.error || 'Failed to update follow status.');
+    } finally {
+      setFollowBusy(false);
+    }
+  };
 
   const postReply = async () => {
     if (!replyText.trim()) return;
@@ -362,13 +377,23 @@ export function DoubtDetail({ doubtId, onBack, role }) {
 
       {data && (() => {
         const { doubt, replies } = data;
-        const canReply = role === 'teacher' || (role === 'student' && doubt.isMine);
+        // Backend allows any student who can see the subject to reply (a
+        // follow-up question), not just the original asker — see POST
+        // /api/doubts/:id/replies' own visibility check.
+        const canReply = role === 'teacher' || role === 'student';
         return (
           <>
             <div className="panel" style={{ padding: 20, marginBottom: 16 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center' }}>
                 <h3 style={{ margin: 0 }}>{doubt.subjectName}</h3>
-                <span className={`chip ${STATUS_CLASS[doubt.status]}`}><span className="dot" />{doubt.status}</span>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                  {role === 'student' && !doubt.isMine && (
+                    <button type="button" className="btn btn-ghost btn-sm" disabled={followBusy} onClick={toggleFollow}>
+                      {doubt.isFollowing ? 'Following' : 'Follow'}
+                    </button>
+                  )}
+                  <span className={`chip ${STATUS_CLASS[doubt.status]}`}><span className="dot" />{doubt.status}</span>
+                </div>
               </div>
               <p className="auth-sub" style={{ margin: '4px 0 12px' }}>
                 Asked by {doubt.isMine ? 'you' : (doubt.askerName || 'Anonymous')} to {doubt.teacherName || 'any teacher'} · {formatDate(doubt.createdAt)}

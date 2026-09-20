@@ -174,10 +174,12 @@ describe('doubts routes', () => {
     expect(res.status).toBe(403);
   });
 
-  it('POST /api/doubts/:id/replies rejects a student who is neither the asker nor the teacher', async () => {
+  it('POST /api/doubts/:id/replies still rejects a student with no visibility into the subject at all', async () => {
+    const outsider = await createStudent(app, adminToken, { name: 'Outsider', orgUnitId: null });
+    const outsiderToken = await loginFirstTime(app, outsider.email, outsider.tempPassword, 'student');
     const res = await request(app)
       .post(`/api/doubts/${doubtId}/replies`)
-      .set('Authorization', `Bearer ${student2Token}`)
+      .set('Authorization', `Bearer ${outsiderToken}`)
       .send({ bodyText: 'Not my doubt to answer' });
     expect(res.status).toBe(403);
   });
@@ -232,6 +234,30 @@ describe('doubts routes', () => {
     const detail = await request(app).get(`/api/doubts/${doubtId}`).set('Authorization', `Bearer ${teacherToken}`);
     expect(detail.body.doubt.status).toBe('open');
     expect(detail.body.replies).toHaveLength(2);
+  });
+
+  it('POST /api/doubts/:id/follow then a reply notifies the follower, DELETE unfollows', async () => {
+    const followRes = await request(app).post(`/api/doubts/${doubtId}/follow`).set('Authorization', `Bearer ${student2Token}`);
+    expect(followRes.status).toBe(200);
+    expect(followRes.body.isFollowing).toBe(true);
+
+    const detail = await request(app).get(`/api/doubts/${doubtId}`).set('Authorization', `Bearer ${student2Token}`);
+    expect(detail.body.doubt.isFollowing).toBe(true);
+
+    await request(app)
+      .post(`/api/doubts/${doubtId}/replies`)
+      .set('Authorization', `Bearer ${teacherToken}`)
+      .send({ bodyText: 'Yes, it applies generally.' });
+
+    const notifRes = await request(app).get('/api/notifications').set('Authorization', `Bearer ${student2Token}`);
+    expect(notifRes.body.notifications.some((n) => n.type === 'doubt' && n.doubtId === doubtId)).toBe(true);
+
+    const unfollowRes = await request(app).delete(`/api/doubts/${doubtId}/follow`).set('Authorization', `Bearer ${student2Token}`);
+    expect(unfollowRes.status).toBe(200);
+    expect(unfollowRes.body.isFollowing).toBe(false);
+
+    const detail2 = await request(app).get(`/api/doubts/${doubtId}`).set('Authorization', `Bearer ${student2Token}`);
+    expect(detail2.body.doubt.isFollowing).toBe(false);
   });
 
   // Subject-wide doubts — no teacherId at all, so every teacher of the

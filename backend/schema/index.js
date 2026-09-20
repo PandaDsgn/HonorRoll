@@ -893,6 +893,16 @@ async function ensureOrganizationVerificationSchema() {
     await pool.query('ALTER TABLE organizations ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ');
     await pool.query('ALTER TABLE organizations ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ');
     await pool.query('ALTER TABLE organizations ADD COLUMN IF NOT EXISTS approved_by TEXT');
+    // A small tuition center where the founder is both its own admin and
+    // its own (only) teacher — no separate staff, no institutional email
+    // domain. Set at signup (POST /api/organizations/signup or POST
+    // /api/me/start-institution), never changed after: it relaxes the
+    // personal-webmail rejection at signup time only, and elsewhere gates
+    // auto-enrolling that admin into subject_teachers on every subject
+    // they create (see POST /api/admin/subjects) and the admin/teacher
+    // acting-role toggle on the frontend dashboard — none of which real
+    // multi-staff institutions should get by default.
+    await pool.query('ALTER TABLE organizations ADD COLUMN IF NOT EXISTS is_single_teacher BOOLEAN NOT NULL DEFAULT false');
   } catch (err) {
     console.error('Failed to ensure organization verification schema:', err);
   }
@@ -1541,11 +1551,71 @@ function ensureDoubtsSchema() {
         )
       `);
       await pool.query('CREATE INDEX IF NOT EXISTS doubt_replies_doubt_id_idx ON doubt_replies(doubt_id)');
+
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS doubt_followers (
+          doubt_id INTEGER NOT NULL REFERENCES doubts(id) ON DELETE CASCADE,
+          student_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (doubt_id, student_id)
+        )
+      `);
     })().catch((err) => console.error('Failed to ensure doubts schema:', err));
   }
   return doubtsSchemaPromise;
 }
 bootSchemaStep(ensureDoubtsSchema);
+
+// ============================================================================
+// LIVE CLASSES — a teacher broadcasts their own camera to a subject's
+// students (routes/liveClasses.js) over a self-hosted mediasoup SFU
+// (media-server/, a fully separate deploy — see that folder's own README
+// for why). Phase A only: start/end a session, nothing about the
+// recording yet — recording_status and the chunk-tracking table are added
+// in a later ALTER once that part of the feature lands, not speculatively
+// here. No room/vendor-object column to persist: this row's own id IS the
+// session identifier everywhere (media-server creates its mediasoup
+// Router lazily, keyed off it, entirely in its own process memory — see
+// that file's own comment on why nothing about an active call needs to
+// survive here). teacher_id is NOT NULL (unlike doubts.teacher_id) since a
+// live session is always started by one specific person acting as the
+// subject's teacher, never "any teacher of this subject" the way an
+// unaddressed doubt is.
+// ============================================================================
+let liveSessionsSchemaPromise = null;
+function ensureLiveSessionsSchema() {
+  if (!liveSessionsSchemaPromise) {
+    liveSessionsSchemaPromise = (async () => {
+      await ensureSubjectsSchema();
+      await ensureUsersSchema();
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS live_sessions (
+          id SERIAL PRIMARY KEY,
+          organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+          subject_id INTEGER NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
+          teacher_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          status TEXT NOT NULL DEFAULT 'live' CHECK (status IN ('live', 'ended')),
+          started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          ended_at TIMESTAMPTZ,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `);
+      // Brings an already-created table (from before the Daily->mediasoup
+      // switch) in line — safe to re-run on every boot, same pattern
+      // organizations_status_check's own comment already uses for
+      // evolving a table after the fact.
+      await pool.query('ALTER TABLE live_sessions DROP COLUMN IF EXISTS room_name');
+      await pool.query('CREATE INDEX IF NOT EXISTS live_sessions_subject_id_idx ON live_sessions(subject_id)');
+      // Looked up by GET /api/live-sessions/:subjectId/current — "is there
+      // a live one right now for this subject" — a partial index on just
+      // the live rows keeps that check cheap regardless of how many ended
+      // sessions have piled up.
+      await pool.query("CREATE INDEX IF NOT EXISTS live_sessions_subject_live_idx ON live_sessions(subject_id) WHERE status = 'live'");
+    })().catch((err) => console.error('Failed to ensure live sessions schema:', err));
+  }
+  return liveSessionsSchemaPromise;
+}
+bootSchemaStep(ensureLiveSessionsSchema);
 
 // ============================================================================
 // E2EE CHAT — a private 1:1 channel between a student and a teacher of a
@@ -1700,6 +1770,7 @@ function ensureNotificationsSchema() {
       await ensureExamSchema();
       await ensureDoubtsSchema();
       await ensureChatMessageReportsSchema();
+      await ensureLiveSessionsSchema();
       await pool.query(`
         CREATE TABLE IF NOT EXISTS notifications (
           id SERIAL PRIMARY KEY,
@@ -1733,6 +1804,9 @@ function ensureNotificationsSchema() {
       // "A message you sent got reported" — admin-facing only, see POST
       // /api/chat/:otherUserId/messages/:messageId/report.
       await pool.query('ALTER TABLE notifications ADD COLUMN IF NOT EXISTS chat_report_id INTEGER REFERENCES chat_message_reports(id) ON DELETE SET NULL');
+      // "A class you can see just went live" (student) / recording-ready
+      // (once Phase B/C land) — see POST /api/teacher/live-sessions.
+      await pool.query('ALTER TABLE notifications ADD COLUMN IF NOT EXISTS live_session_id INTEGER REFERENCES live_sessions(id) ON DELETE CASCADE');
     })().catch((err) => console.error('Failed to ensure notifications schema:', err));
   }
   return notificationsSchemaPromise;

@@ -182,10 +182,29 @@ function mintSessionToken(membership) {
       role: membership.role,
       organizationId: membership.organization_id,
       orgUnitId: membership.org_unit_id ?? null,
+      // Single-teacher orgs (a small tuition center where the founder is
+      // both its admin and its only teacher — see organizations.is_single_
+      // teacher's own comment in schema/index.js) let that one admin act
+      // as a teacher too, in this org specifically — see isActingTeacher
+      // below. Baked into the token itself, same as organizationId/
+      // orgUnitId, so every route can check it with zero extra query.
+      isSingleTeacher: !!membership.is_single_teacher,
     },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRATION || '24h' }
   );
+}
+
+// The single place that decides "does this session get to do
+// teacher-shaped things" — true for a real teacher everywhere, or for a
+// single-teacher org's own admin (see mintSessionToken's own comment)
+// acting in THAT org specifically. Deliberately NOT true for admin
+// generally — chat is the one teacher-shaped capability every admin gets
+// everywhere (see routes/chat.js's canChat), a separate, narrower
+// allowance; this helper is for the rest (answering doubts, posting
+// notes, ...), which stay single-teacher-org-only.
+function isActingTeacher(user) {
+  return user.role === 'teacher' || (user.role === 'admin' && !!user.isSingleTeacher);
 }
 
 // A teacher/student account is always created BY an admin (CSV import, the
@@ -226,5 +245,6 @@ module.exports = {
   requirePlatformSecret,
   DENYLISTED_EMAIL_DOMAINS,
   mintSessionToken,
+  isActingTeacher,
   mintTosPendingToken,
 };

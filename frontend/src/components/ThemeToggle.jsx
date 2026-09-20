@@ -1,3 +1,5 @@
+import ThemeCustomizer from './ThemeCustomizer';
+
 function SunIcon() {
   return (
     <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" aria-hidden="true">
@@ -19,14 +21,25 @@ export default function ThemeToggle({ theme, onToggle }) {
   const isDark = theme === 'dark';
 
   return (
-    <button
-      type="button"
-      className="icon-btn"
-      onClick={onToggle}
-      aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-      title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-    >
-      {isDark ? <SunIcon /> : <MoonIcon />}
-    </button>
+    // A single wrapping element (not a bare Fragment) so callers that place
+    // ThemeToggle with justify-content: space-between (Login.jsx's
+    // .auth-card-head) treat customize+toggle as one group instead of
+    // spreading them apart — internal gap keeps the two icons adjacent
+    // wherever this lands.
+    <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+      {/* Rendered here (rather than each of the ~20 pages that use
+          ThemeToggle adding it individually) so it lands in every top bar,
+          right before this button, with zero per-page changes. */}
+      <ThemeCustomizer />
+      <button
+        type="button"
+        className="icon-btn"
+        onClick={onToggle}
+        aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+        title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+      >
+        {isDark ? <SunIcon /> : <MoonIcon />}
+      </button>
+    </div>
   );
 }

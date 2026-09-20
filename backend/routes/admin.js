@@ -958,6 +958,22 @@ router.post('/api/admin/subjects', authenticateToken, requireAdmin, async (req, 
       'INSERT INTO subjects (organization_id, org_unit_id, name) VALUES ($1, $2, $3) RETURNING id, org_unit_id, name',
       [req.user.organizationId, orgUnitId, name]
     );
+
+    // A single-teacher org's admin IS its only teacher — no separate
+    // "assign a teacher" step exists for them to take, so every subject
+    // they create auto-enrolls them into subject_teachers right away
+    // (same table a real teacher assignment writes to, see POST
+    // /api/admin/subjects/:id/teachers above). Real multi-staff orgs never
+    // hit this — is_single_teacher defaults false and is only ever set at
+    // signup.
+    const org = await pool.query('SELECT is_single_teacher FROM organizations WHERE id = $1', [req.user.organizationId]);
+    if (org.rows[0]?.is_single_teacher) {
+      await pool.query(
+        'INSERT INTO subject_teachers (subject_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [result.rows[0].id, req.user.userId]
+      );
+    }
+
     res.status(201).json({ subject: result.rows[0] });
   } catch (err) {
     console.error('Create subject error:', err);
@@ -1015,13 +1031,17 @@ router.post('/api/admin/subjects/:id/teachers', authenticateToken, requireAdmin,
     const subject = await pool.query('SELECT id, org_unit_id FROM subjects WHERE id = $1 AND organization_id = $2', [req.params.id, req.user.organizationId]);
     if (subject.rows.length === 0) return res.status(404).json({ error: 'Subject not found' });
 
+    // An admin is org-wide by definition (no single org_unit of their own —
+    // see memberships.org_unit_id, always NULL for an admin membership), so
+    // the unit-match check below only applies to an actual teacher-role
+    // target; an admin can be assigned to any subject in their own org.
     const teacher = await pool.query(
-      `SELECT u.id, m.org_unit_id FROM users u JOIN memberships m ON m.user_id = u.id
-       WHERE u.id = $1 AND m.organization_id = $2 AND m.role = 'teacher'`,
+      `SELECT u.id, m.role, m.org_unit_id FROM users u JOIN memberships m ON m.user_id = u.id
+       WHERE u.id = $1 AND m.organization_id = $2 AND m.role IN ('teacher', 'admin')`,
       [userId, req.user.organizationId]
     );
     if (teacher.rows.length === 0) return res.status(404).json({ error: 'Teacher not found in your organization' });
-    if (teacher.rows[0].org_unit_id !== subject.rows[0].org_unit_id) {
+    if (teacher.rows[0].role === 'teacher' && teacher.rows[0].org_unit_id !== subject.rows[0].org_unit_id) {
       return res.status(400).json({ error: "This teacher isn't part of the subject's unit" });
     }
 

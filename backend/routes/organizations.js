@@ -6,10 +6,9 @@
 const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { pool } = require('../lib/db');
-const { DENYLISTED_EMAIL_DOMAINS, requirePlatformSecret } = require('../lib/auth');
+const { DENYLISTED_EMAIL_DOMAINS, requirePlatformSecret, mintSessionToken } = require('../lib/auth');
 const { createOrganizationWithDefaults } = require('../lib/org');
 const { logSecurityEvent } = require('../lib/securityEvents');
 const { sendEmail } = require('../mailer');
@@ -17,7 +16,7 @@ const { sendEmail } = require('../mailer');
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 
 router.post('/api/organizations/signup', async (req, res) => {
-  const { organizationName, email, password, name, accessCode, acceptedTos } = req.body;
+  const { organizationName, email, password, name, accessCode, acceptedTos, isSingleTeacher } = req.body;
   if (!organizationName || !String(organizationName).trim()) {
     return res.status(400).json({ error: 'Organization name is required' });
   }
@@ -49,7 +48,11 @@ router.post('/api/organizations/signup', async (req, res) => {
   }
 
   const emailDomain = String(email).split('@')[1]?.toLowerCase() || '';
-  if (DENYLISTED_EMAIL_DOMAINS.has(emailDomain)) {
+  // A single-teacher tuition center has no institutional domain to begin
+  // with — the founder's own personal Gmail/Yahoo/etc. IS their login,
+  // same as everyone else here, just without this one rejection. Every
+  // other org still needs a real institutional address.
+  if (!isSingleTeacher && DENYLISTED_EMAIL_DOMAINS.has(emailDomain)) {
     return res.status(400).json({ error: 'Please sign up with your institutional email address, not a personal webmail account' });
   }
 
@@ -82,6 +85,7 @@ router.post('/api/organizations/signup', async (req, res) => {
       emailDomain,
       verificationTokenHash,
       verificationTokenExpiry: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      isSingleTeacher: !!isSingleTeacher,
     });
 
     // Reuses the matched existing identity's password untouched if one
@@ -128,16 +132,14 @@ router.post('/api/organizations/signup', async (req, res) => {
     });
     if (emailError) console.error('Verification email failed to send:', emailError);
 
-    const token = jwt.sign(
-      { userId, role: 'admin', organizationId: org.id, orgUnitId: null },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRATION || '24h' }
-    );
+    const token = mintSessionToken({
+      user_id: userId, role: 'admin', organization_id: org.id, org_unit_id: null, is_single_teacher: org.is_single_teacher,
+    });
 
     res.status(201).json({
       message: 'Organization created and approved — you can start adding students right away. Check your email when you get a chance to confirm your address.',
       token,
-      user: { id: userId, email, role: 'admin', name: effectiveName, organization_name: org.name },
+      user: { id: userId, email, role: 'admin', name: effectiveName, organization_name: org.name, isSingleTeacher: !!org.is_single_teacher },
     });
   } catch (err) {
     await client.query('ROLLBACK');

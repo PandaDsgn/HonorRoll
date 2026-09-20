@@ -17,9 +17,9 @@ const crypto = require('crypto');
 async function createOrganizationWithDefaults(client, name, extra = {}) {
   const webhookSecret = crypto.randomBytes(16).toString('hex');
   const orgRes = await client.query(
-    `INSERT INTO organizations (name, webhook_secret, status, email_domain, verification_token_hash, verification_token_expiry)
-     VALUES ($1, $2, 'approved', $3, $4, $5) RETURNING id, name`,
-    [name, webhookSecret, extra.emailDomain || null, extra.verificationTokenHash || null, extra.verificationTokenExpiry || null]
+    `INSERT INTO organizations (name, webhook_secret, status, email_domain, verification_token_hash, verification_token_expiry, is_single_teacher)
+     VALUES ($1, $2, 'approved', $3, $4, $5, $6) RETURNING id, name, is_single_teacher`,
+    [name, webhookSecret, extra.emailDomain || null, extra.verificationTokenHash || null, extra.verificationTokenExpiry || null, !!extra.isSingleTeacher]
   );
   const org = orgRes.rows[0];
 

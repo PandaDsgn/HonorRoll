@@ -1,24 +1,31 @@
 /* ---------- tokens ---------- */
-/* Brutalist system per industrial-brutalist-ui: dark theme commits fully to
-   Tactical Telemetry (CRT terminal), light theme commits fully to Swiss
-   Industrial Print (documentation paper) — never blended on one screen.
-   One accent only (hazard red) shared by both, one reserved terminal-green
-   readout in dark mode only. Token NAMES are unchanged from earlier passes
-   on purpose — every component file reads --bg/--surface/--accent etc., so
-   reassigning the values here is what makes the palette cascade through all
-   ~90 files without touching each one. */
+/* Minimalist Brutalist: minimalist-ui's surfaces (warm neutral canvas,
+   hairline borders, near-flat cards, diffuse-or-no shadow, soft corners)
+   carrying industrial-brutalist-ui's typography (heavy uppercase Archivo
+   Black macro headers, tight negative tracking, JetBrains Mono telemetry
+   labels) — the loud, confident type voice stays; the zero-radius/hard-
+   offset-shadow/CRT-noise geometry that used to carry it is gone. Token
+   NAMES are unchanged from earlier passes on purpose — every component
+   file reads --bg/--surface/--accent etc., so reassigning the values here
+   is what makes the palette cascade through all ~90 files without
+   touching each one. */
 :root {
-  /* Tactical Telemetry — deactivated-CRT black, not pure #000. */
-  --bg: #0a0a0a;
-  --surface: #121212;
-  --surface-2: #171717;
-  --surface-3: #1d1d1d;
-  --border: #333333;
-  --border-strong: #4d4d4d;
+  /* Warm near-black canvas, not a harsh CRT black — minimalist's "color as
+     a scarce resource" applied to dark mode: quiet surfaces, all the
+     contrast saved for the type. */
+  --bg: #171613;
+  /* -base is the real color; --surface/-2/-3 (below) are always the
+     computed, opacity-applied values everything else actually reads — see
+     that block's own comment for why. */
+  --surface-base: #1d1c19;
+  --surface-2-base: #232220;
+  --surface-3-base: #2a2926;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
 
-  --text: #adadad;
-  --text-dim: #6b6b6b;
-  --text-h: #eaeaea;
+  --text: #c9c7c0;
+  --text-dim: #8a8883;
+  --text-h: #f5f4f0;
 
   /* A confident blue — the ONLY accent color, per the skill's color system.
      Used for primary actions and the active/selected state. Danger/error
@@ -51,20 +58,42 @@
   --font-display: "Archivo Black", "Arial Black", var(--font-sans);
   --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", "SF Mono", Menlo, monospace;
 
-  /* Zero radius everywhere — 90-degree corners are non-negotiable. */
-  --radius: 0;
-  --radius-sm: 0;
-  /* A hard offset "stamp," not a blurred drop shadow — visible against the
-     near-black surface as a lighter debossed edge. */
-  --shadow-lg: 4px 4px 0 var(--border-strong);
+  /* Soft, crisp corners per minimalist-ui section 5 (8px/12px max) — the
+     brutalist skill's mandatory 90-degree corners are exactly what this
+     pass is dialing back; the type carries the brutalist voice instead. */
+  --radius: 10px;
+  --radius-sm: 8px;
+  /* Ultra-diffuse, low-opacity — minimalist-ui explicitly bans anything
+     resembling a hard offset stamp. Present on hover/elevation only, never
+     baked into a card's resting state. */
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.32);
 
+  /* No longer used for the general page background (see body{} below —
+     minimalist-ui wants a clean flat canvas, not ruled-paper texture) but
+     kept defined: Visualizer.css's own dot-grid diagram backdrop still
+     reads it, same "a genuinely technical surface earns its own register"
+     exception as the console tokens right below. */
   --grid-dot: rgba(255, 255, 255, 0.06);
 
-  /* the console always keeps its terminal look, regardless of theme */
+  /* the console always keeps its terminal look, regardless of theme —
+     the one deliberate exception to the minimalist canvas, since a genuine
+     code/terminal surface (Sandbox, IDE console) earns a different register
+     than the rest of the app's chrome. */
   --console-bg: #050505;
   --console-out: #eaeaea;
   --console-err: #e2603f;
   --console-pending: #6b6b6b;
+
+  /* Every card/panel surface in the app resolves through these three,
+     never through -base directly — lets a student's "card transparency"
+     slider (ThemeCustomizer.jsx → --card-opacity) fade every surface at
+     once by blending toward transparent, without any component needing to
+     know opacity exists. Defined once here (not duplicated in the light
+     block below) since var() re-resolves -base/--card-opacity from
+     whichever theme is actually active at paint time. */
+  --surface: color-mix(in srgb, var(--surface-base) var(--card-opacity, 100%), transparent);
+  --surface-2: color-mix(in srgb, var(--surface-2-base) var(--card-opacity, 100%), transparent);
+  --surface-3: color-mix(in srgb, var(--surface-3-base) var(--card-opacity, 100%), transparent);
 
   /* Without this, Chrome/Safari assume the page is light-themed for
      anything they paint natively (autofill's own default colors, form
@@ -76,19 +105,20 @@
 }
 
 /* ---------- light theme ---------- */
-/* Swiss Industrial Print — matte documentation paper, carbon ink, the same
-   blue accent. */
+/* Warm Bone — minimalist-ui's canvas (off-white, near-flat cards, hairline
+   dividers), same restrained blue accent and Archivo Black/JetBrains Mono
+   type system as dark mode. */
 [data-theme='light'] {
-  --bg: #f4f4f0;
-  --surface: #eae8e3;
-  --surface-2: #e0ddd6;
-  --surface-3: #d3cfc4;
-  --border: #111111;
-  --border-strong: #050505;
+  --bg: #fbfbfa;
+  --surface-base: #ffffff;
+  --surface-2-base: #f7f6f3;
+  --surface-3-base: #efeee9;
+  --border: #eaeaea;
+  --border-strong: #d8d8d3;
 
-  --text: #2b2b2b;
-  --text-dim: #5c5c5c;
-  --text-h: #050505;
+  --text: #2f3437;
+  --text-dim: #787774;
+  --text-h: #111111;
 
   --accent: #2f6fe4;
   --accent-strong: #1d4fb3;
@@ -107,8 +137,12 @@
   --blue: #2563eb;
   --blue-dim: rgba(37, 99, 235, 0.12);
 
-  --grid-dot: rgba(5, 5, 5, 0.06);
-  --shadow-lg: 4px 4px 0 var(--text-h);
+  /* Ultra-diffuse per minimalist-ui — real opacity budget (< 0.05) rather
+     than the hard 4px offset stamp this used to be. */
+  --shadow-lg: 0 2px 10px rgba(17, 17, 17, 0.06);
+
+  /* Visualizer.css exception, see :root's own comment. */
+  --grid-dot: rgba(17, 17, 17, 0.06);
 
   color-scheme: light;
 }
@@ -122,9 +156,9 @@ html { scroll-behavior: smooth; }
 
 body {
   margin: 0;
-  /* Single-axis ruled-paper lines, not a crosshatch grid — a crosshatch
-     read as "matrix background" rather than documentation paper. */
-  background-image: repeating-linear-gradient(0deg, var(--grid-dot) 0 1px, transparent 1px 40px);
+  /* Flat canvas, no ruled-paper/noise texture — minimalist-ui wants a
+     clean surface; the brutalist "documentation paper" grain used to live
+     here, dropped in favor of the type carrying the voice instead. */
   background-color: var(--bg);
   color: var(--text);
   font-family: var(--font-sans);
@@ -135,20 +169,18 @@ body {
 
 #root { display: flex; flex-direction: column; }
 
-/* ---------- analog degradation (skill section 7) ---------- */
-/* A unified physical grain across the whole app, both themes — fixed,
-   pointer-events:none, so it never intercepts input. Self-contained SVG
-   feTurbulence data-uri rather than an image asset. */
-body::before {
-  content: '';
-  position: fixed;
-  inset: 0;
-  z-index: 9999;
-  pointer-events: none;
-  opacity: 0.05;
-  mix-blend-mode: overlay;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-}
+/* A student's custom wallpaper/looping video (CustomBackgroundLayer.jsx,
+   mounted first inside <HashRouter> in App.jsx). z-index MUST be negative,
+   not 0 — position: fixed + z-index: 0 makes this a positioned stacking
+   context, and per CSS paint order positioned z-index:0 elements paint
+   ABOVE plain non-positioned (static) content regardless of DOM order,
+   which is what nearly every page's own layout is. A negative z-index
+   drops it into the root stacking context's background layer instead, so
+   ordinary page content reliably paints over it. Cards also need
+   --card-opacity turned down (see :root's own --surface computation) for
+   this to actually show through anywhere. */
+.custom-bg-layer { position: fixed; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
+.custom-bg-media { width: 100%; height: 100%; object-fit: cover; }
 
 /* Macro headers: heavy grotesk, uppercase, tight/negative tracking,
    compressed leading — per skill section 3.1. h3 stays a heavy sans (not
@@ -318,8 +350,8 @@ button.brand:hover .brand-honor { color: var(--accent); }
   letter-spacing: 0.02em;
   text-transform: uppercase;
   padding: 10px 18px;
-  border-radius: 0;
-  border: 2px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
   cursor: pointer;
   transition: background 0.1s linear, border-color 0.1s linear, color 0.1s linear, transform 0.1s linear;
   display: inline-flex;
@@ -370,8 +402,8 @@ button.brand:hover .brand-honor { color: var(--accent); }
 .field input {
   width: 100%;
   background: var(--surface-2);
-  border: 2px solid var(--border-strong);
-  border-radius: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
   padding: 11px 12px;
   color: var(--text-h);
   font-size: 15px;
@@ -394,8 +426,8 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator { cursor: pointe
 .field textarea {
   width: 100%;
   background: var(--surface-2);
-  border: 2px solid var(--border-strong);
-  border-radius: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
   padding: 11px 12px;
   color: var(--text-h);
   font-family: var(--font-mono);
@@ -558,8 +590,17 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator { cursor: pointe
   flex-wrap: wrap;
   gap: 8px;
 }
+/* Login's 4-way audience picker (Student/Teacher/Admin/Super Admin) — plain
+   inline-flex wraps 3-then-1, leaving the last button stranded alone on its
+   own line. A fixed 2x2 grid keeps all four the same width and evenly
+   balanced regardless of label length. */
+.segmented-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+}
+.segmented-grid button { width: 100%; }
 .segmented button {
-  border: 2px solid var(--border-strong);
+  border: 1px solid var(--border-strong);
   background: var(--surface-2);
   color: var(--text-dim);
   font-family: var(--font-sans);
@@ -568,18 +609,18 @@ input[type='datetime-local']::-webkit-calendar-picker-indicator { cursor: pointe
   letter-spacing: 0.02em;
   text-transform: uppercase;
   padding: 7px 14px;
-  border-radius: 0;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   transition: background 0.1s linear, border-color 0.1s linear, color 0.1s linear;
 }
 .segmented button:hover:not(.active) { background: var(--surface-3); color: var(--text); border-color: var(--text-dim); }
-/* Inverse video, not the red accent — a tab row's "currently selected" is a
-   frequent, ordinary state, not an alert; red stays reserved for CTAs and
-   actual danger so it doesn't cry wolf across every filter row in the app. */
+/* Tied to --accent (not --text-h) specifically so a student's "Primary
+   text" customization (ThemeCustomizer.jsx) never bleeds into an unrelated
+   UI surface like this tab's own active-state background. */
 .segmented button.active {
-  background: var(--text-h);
-  border-color: var(--text-h);
-  color: var(--bg);
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
 }
 
 /* ---------- select (every dropdown in the app) ---------- */
@@ -603,8 +644,8 @@ select {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6' fill='none'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%237d8288' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 12px center;
-  border: 2px solid var(--border-strong);
-  border-radius: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
   color: var(--text);
   font-family: var(--font-sans);
   font-weight: 600;
@@ -639,8 +680,8 @@ select:focus {
 input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='color']):not([type='file']) {
   padding: 9px 12px;
   background: var(--surface-2);
-  border: 2px solid var(--border-strong);
-  border-radius: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
   color: var(--text-h);
   font-size: 14px;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
@@ -687,7 +728,7 @@ input[type='checkbox'] {
   width: 16px;
   height: 16px;
   margin: 0;
-  border-radius: 0;
+  border-radius: 4px;
   border: 1px solid var(--border-strong);
   background: var(--surface-2);
   cursor: pointer;
@@ -825,8 +866,8 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 0;
-  border: 2px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
   background: var(--surface-2);
   color: var(--text-dim);
   cursor: pointer;
@@ -859,7 +900,7 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   padding: 10px 16px;
   background: var(--accent);
   color: var(--on-accent);
-  border-bottom: 2px solid var(--border-strong);
+  border-bottom: 1px solid var(--border-strong);
   font-family: var(--font-sans);
   font-size: 13px;
   font-weight: 600;
@@ -877,7 +918,7 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   background-color: var(--bg);
   color: var(--accent);
   border: 2px solid var(--bg);
-  border-radius: 0;
+  border-radius: var(--radius-sm);
   padding: 3px 24px 3px 10px;
   font-size: 12px;
 }
@@ -885,7 +926,7 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   background: var(--bg);
   color: var(--accent);
   border: 2px solid var(--bg);
-  border-radius: 0;
+  border-radius: var(--radius-sm);
   padding: 4px 12px;
   font-family: var(--font-sans);
   font-weight: 700;
@@ -907,8 +948,8 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   right: 24px;
   width: 52px;
   height: 52px;
-  border-radius: 0;
-  border: 2px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
   background: var(--surface-2);
   color: var(--danger);
   display: inline-flex;
@@ -953,8 +994,8 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   width: 48px;
   height: 48px;
   margin: 0 auto 14px;
-  border-radius: 0;
-  border: 2px solid var(--danger);
+  border-radius: 50%;
+  border: 1px solid var(--danger);
   background: var(--danger-dim);
   color: var(--danger);
   display: flex;
@@ -1044,7 +1085,7 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   padding: 64px;
   overflow: hidden;
   background: var(--bg);
-  border-right: 2px solid var(--border-strong);
+  border-right: 1px solid var(--border-strong);
 }
 .auth-panel-eyebrow {
   position: relative;
@@ -1124,8 +1165,8 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   width: 100%;
   padding: 14px 16px;
   background: var(--surface-2);
-  border: 2px solid var(--border-strong);
-  border-radius: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
   cursor: pointer;
   text-align: left;
   font: inherit;
@@ -1393,7 +1434,7 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   flex-direction: column;
 }
 
-.rule { border: none; border-top: 2px solid var(--border-strong); margin: 0; width: 100%; }
+.rule { border: none; border-top: 1px solid var(--border-strong); margin: 0; width: 100%; }
 
 .hero-band {
   flex: 1;
@@ -1453,7 +1494,7 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
    rest of the page (paper in Swiss Print, near-black in Tactical
    Telemetry) rather than permanently dark, so it doesn't sit as a
    dark island on an otherwise fully-committed light page. */
-.code-window-card { background: var(--bg); border: 2px solid var(--border-strong); box-shadow: var(--shadow-lg); }
+.code-window-card { background: var(--bg); border: 1px solid var(--border-strong); box-shadow: var(--shadow-lg); }
 
 /* Seamless, non-interactive feature showcase: three frames stacked in the
    same box, each fading in/out on its own third of one shared 18s loop —
@@ -1512,8 +1553,8 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   padding: 10px 16px;
   margin-top: 12px;
   background: var(--surface-2);
-  border-top: 2px solid var(--border-strong);
-  border-bottom: 2px solid var(--border-strong);
+  border-top: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border-strong);
   font-family: var(--font-mono);
   font-size: 12px;
   letter-spacing: 0.03em;
@@ -1536,7 +1577,7 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   justify-content: space-between;
   padding: 10px 16px;
   background: var(--surface-3);
-  border-top: 2px solid var(--border-strong);
+  border-top: 1px solid var(--border-strong);
   font-family: var(--font-mono);
   font-size: 12px;
 }
@@ -1564,7 +1605,7 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
 .showcase-exam-options { display: flex; flex-direction: column; gap: 8px; }
 .showcase-exam-opt {
   padding: 10px 14px;
-  border: 2px solid var(--border-strong);
+  border: 1px solid var(--border-strong);
   font-family: var(--font-sans);
   font-size: 14px;
   color: var(--text);
@@ -1581,7 +1622,7 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   position: relative;
   flex: 1;
   background: var(--surface-2);
-  border: 2px solid var(--border-strong);
+  border: 1px solid var(--border-strong);
   padding: 20px;
   display: flex;
   flex-direction: column;
@@ -1609,8 +1650,8 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   grid-template-rows: repeat(2, 1fr);
   gap: 2px;
   background: var(--border-strong);
-  border-top: 2px solid var(--border-strong);
-  border-bottom: 2px solid var(--border-strong);
+  border-top: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border-strong);
 }
 .feature-card { background: var(--bg); padding: 32px; display: flex; flex-direction: column; justify-content: center; }
 .feature-card-title { font-size: 16px; font-weight: 800; text-transform: uppercase; letter-spacing: -0.01em; color: var(--text-h); margin: 0 0 10px; }

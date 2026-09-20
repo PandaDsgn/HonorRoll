@@ -27,10 +27,13 @@ export default function MyProfile() {
   const [organizations, setOrganizations] = useState(null);
   const [error, setError] = useState('');
   const [cardOrgId, setCardOrgId] = useState(null);
+  const [switchingId, setSwitchingId] = useState(null);
+  const [switchError, setSwitchError] = useState('');
 
   const [showStartForm, setShowStartForm] = useState(false);
   const [orgName, setOrgName] = useState('');
   const [accessCode, setAccessCode] = useState('');
+  const [startIsSingleTeacher, setStartIsSingleTeacher] = useState(false);
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState('');
   const [startResult, setStartResult] = useState('');
@@ -52,7 +55,7 @@ export default function MyProfile() {
     try {
       const res = await axios.post(
         `${API}/api/me/start-institution`,
-        { organizationName: orgName.trim(), accessCode: accessCode.trim() },
+        { organizationName: orgName.trim(), accessCode: accessCode.trim(), isSingleTeacher: startIsSingleTeacher },
         { withCredentials: true }
       );
       // The response carries a fresh session token scoped to the new org
@@ -64,6 +67,7 @@ export default function MyProfile() {
       setStartResult(res.data.message);
       setOrgName('');
       setAccessCode('');
+      setStartIsSingleTeacher(false);
       setShowStartForm(false);
       fetchOrganizations();
     } catch (err) {
@@ -74,6 +78,31 @@ export default function MyProfile() {
   };
 
   const canStartInstitution = organizations?.some((o) => o.role === 'teacher');
+
+  // Flips the whole session over to a different org this user also belongs
+  // to (a teacher/admin can have a membership at more than one institution,
+  // same as a student — see auth.js's own "a student who also tutors at a
+  // separate institution" comment) — mirrors MyPerformance.jsx's identical
+  // switchTo for the student dashboard's own institutions table. A hard
+  // reload after, not just a state update, so no page's already-loaded,
+  // OLD-org-scoped data (subjects, contacts, notifications, ...) lingers —
+  // the same fresh-boot state a real re-login would leave it in. navigate()
+  // first, not a raw window.location.href assignment, since this app runs
+  // under a HashRouter — an href assignment would drop the `#/` prefix
+  // routing needs.
+  const switchTo = async (organizationId) => {
+    setSwitchingId(organizationId);
+    setSwitchError('');
+    try {
+      const res = await axios.post(`${API}/api/me/switch-organization`, { organizationId }, { withCredentials: true });
+      login(res.data.token, res.data.user);
+      navigate('/profile');
+      window.location.reload();
+    } catch (err) {
+      setSwitchError(err.response?.data?.error || 'Failed to switch organization.');
+      setSwitchingId(null);
+    }
+  };
 
   return (
     <div className="sb-shell">
@@ -110,6 +139,7 @@ export default function MyProfile() {
             View or download your ID card for each institution you belong to.
           </p>
 
+          {switchError && <div className="alert" style={{ marginBottom: 12 }}><span className="alert-icon">!</span><span>{switchError}</span></div>}
           {!organizations && !error && <p className="sb-loading">Loading…</p>}
           {organizations && organizations.length === 0 && (
             <p className="sb-loading">You aren't a member of any institution yet.</p>
@@ -117,19 +147,36 @@ export default function MyProfile() {
           {organizations && organizations.length > 0 && (
             <div className="admin-table-wrap">
               <table className="admin-table">
-                <thead><tr><th>Institution</th><th>Role</th><th /></tr></thead>
+                <thead><tr><th>Institution</th><th style={{ textAlign: 'center' }} /><th>Role</th><th /></tr></thead>
                 <tbody>
-                  {organizations.map((o) => (
-                    <tr key={o.organization_id}>
-                      <td className="admin-cell-strong">{o.organization_name}</td>
-                      <td><span className="chip chip-neutral"><span className="dot" />{o.role}</span></td>
-                      <td>
-                        <button type="button" className="btn btn-ghost btn-sm" onClick={() => setCardOrgId(o.organization_id)}>
-                          View ID Card
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                  {organizations.map((o) => {
+                    const isActive = o.organization_id === user?.organizationId;
+                    return (
+                      <tr key={o.organization_id}>
+                        <td className="admin-cell-strong">{o.organization_name}</td>
+                        <td style={{ textAlign: 'center' }}>
+                          {isActive ? (
+                            <span className="chip chip-easy"><span className="dot" />Active</span>
+                          ) : (
+                            <button
+                              type="button"
+                              className="btn btn-ghost btn-sm"
+                              disabled={switchingId !== null}
+                              onClick={() => switchTo(o.organization_id)}
+                            >
+                              {switchingId === o.organization_id ? 'Switching…' : 'Switch'}
+                            </button>
+                          )}
+                        </td>
+                        <td><span className="chip chip-neutral"><span className="dot" />{o.role}</span></td>
+                        <td>
+                          <button type="button" className="btn btn-ghost btn-sm" onClick={() => setCardOrgId(o.organization_id)}>
+                            View ID Card
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -158,6 +205,15 @@ export default function MyProfile() {
                     <label htmlFor="start-access-code">Access code</label>
                     <input id="start-access-code" type="password" value={accessCode} onChange={(e) => setAccessCode(e.target.value)} required />
                   </div>
+                  <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13.5 }}>
+                    <input
+                      type="checkbox"
+                      checked={startIsSingleTeacher}
+                      onChange={(e) => setStartIsSingleTeacher(e.target.checked)}
+                      style={{ marginTop: 2 }}
+                    />
+                    <span>This is a single-teacher organization — you'll be both its admin and its only teacher.</span>
+                  </label>
                   <div style={{ display: 'flex', gap: 8 }}>
                     <button type="submit" className="btn btn-primary btn-sm" disabled={starting}>
                       {starting ? 'Creating…' : 'Create institution'}

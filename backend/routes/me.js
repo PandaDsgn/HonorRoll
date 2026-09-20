@@ -10,7 +10,8 @@
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../lib/db');
-const { authenticateToken, applySuperadminOrgOverride } = require('../lib/auth');
+const { authenticateToken, applySuperadminOrgOverride, mintSessionToken } = require('../lib/auth');
+const { logSecurityEvent } = require('../lib/securityEvents');
 const { avatarUpload } = require('../lib/uploads');
 const { createOrganizationWithDefaults } = require('../lib/org');
 const {
@@ -38,7 +39,7 @@ router.get('/api/me', authenticateToken, async (req, res) => {
 
     const result = await pool.query(
       `SELECT u.id, u.email, u.name, m.role, m.org_unit_id, o.name AS organization_name,
-              o.is_demo, o.demo_expires_at
+              o.is_demo, o.demo_expires_at, o.is_single_teacher
        FROM users u
        JOIN memberships m ON m.user_id = u.id AND m.organization_id = $2
        JOIN organizations o ON o.id = m.organization_id
@@ -50,7 +51,7 @@ router.get('/api/me', authenticateToken, async (req, res) => {
       // admin removed them from this org, or the account itself is gone)
       return res.status(401).json({ error: 'Session no longer valid' });
     }
-    res.status(200).json({ user: result.rows[0] });
+    res.status(200).json({ user: { ...result.rows[0], organizationId: req.user.organizationId } });
   } catch (error) {
     console.error('Get current user error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -103,6 +104,46 @@ router.get('/api/me/organizations', authenticateToken, async (req, res) => {
   } catch (err) {
     console.error('List my organizations error:', err);
     res.status(500).json({ error: 'Failed to load organizations' });
+  }
+});
+
+// Swap the current session for another org the same user belongs to —
+// the already-logged-in counterpart to POST /api/login/select-organization,
+// which only ever runs pre-auth. Re-derives role/org from the DB for THIS
+// session's own userId, same as that route, so a tampered organizationId
+// can't grant membership the caller doesn't actually hold. Mints a whole
+// new token rather than mutating anything server-side: there's no session
+// store to mutate — role/organizationId live only inside the JWT itself
+// (see mintSessionToken's own comment).
+router.post('/api/me/switch-organization', authenticateToken, async (req, res) => {
+  const organizationId = Number(req.body.organizationId);
+  if (!organizationId) return res.status(400).json({ error: 'organizationId is required' });
+
+  try {
+    const result = await pool.query(
+      `SELECT u.id AS user_id, u.email, u.name, m.role, m.organization_id, m.org_unit_id,
+              o.name AS organization_name, o.status AS organization_status, o.is_single_teacher
+       FROM memberships m
+       JOIN users u ON u.id = m.user_id
+       JOIN organizations o ON o.id = m.organization_id
+       WHERE m.user_id = $1 AND m.organization_id = $2`,
+      [req.user.userId, organizationId]
+    );
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Not a member of that organization' });
+    if (result.rows[0].organization_status === 'terminated') {
+      return res.status(403).json({ error: "This institution's access has been suspended by the platform owner. Contact your administrator." });
+    }
+
+    const m = result.rows[0];
+    logSecurityEvent(req, 'org_switch', { actorUserId: m.user_id, actorEmail: m.email, actorRole: m.role, organizationId: m.organization_id });
+    const token = mintSessionToken(m);
+    res.status(200).json({
+      token,
+      user: { id: m.user_id, email: m.email, role: m.role, name: m.name, organization_name: m.organization_name, organizationId: m.organization_id, isSingleTeacher: !!m.is_single_teacher },
+    });
+  } catch (err) {
+    console.error('Switch organization error:', err);
+    res.status(500).json({ error: 'Failed to switch organization' });
   }
 });
 
@@ -224,39 +265,40 @@ router.put('/api/me/organizations/:organizationId/photo', authenticateToken, asy
 // that route's identity-creation and email-verification steps entirely
 // since the caller is already a known, authenticated identity.
 router.post('/api/me/start-institution', authenticateToken, async (req, res) => {
-  const { organizationName, accessCode } = req.body;
+  const { organizationName, accessCode, isSingleTeacher } = req.body;
   if (!organizationName || !String(organizationName).trim()) {
     return res.status(400).json({ error: 'Organization name is required' });
   }
   if (!process.env.PLATFORM_OWNER_SECRET || accessCode !== process.env.PLATFORM_OWNER_SECRET) {
-    return res.status(403).json({ error: "Invalid or missing access code. If you don't have one, the highest authority at your institution must contact honorroll.admin@gmail.com to request one." });
+    return res.status(403).json({ error: "Invalid or missing access code. If you don't have one, the highest authority at your institution must contact <a href=\"mailto:honorroll.admin@gmail.com\">honorroll.admin@gmail.com</a> to request one." });
   }
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const org = await createOrganizationWithDefaults(client, organizationName.trim());
+    const org = await createOrganizationWithDefaults(client, organizationName.trim(), { isSingleTeacher: !!isSingleTeacher });
     await client.query(
       `INSERT INTO memberships (user_id, organization_id, role) VALUES ($1, $2, 'admin')`,
       [req.user.userId, org.id]
     );
     await client.query('COMMIT');
 
-    // Mints a session scoped to the new org right away — same shape as
-    // POST /api/login/select-organization's own token — so the caller can
-    // act as admin there immediately instead of needing a separate
-    // re-login step just to pick up the new membership.
-    const token = jwt.sign(
-      { userId: req.user.userId, role: 'admin', organizationId: org.id, orgUnitId: null },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRATION || '24h' }
-    );
+    // mintSessionToken, not a raw jwt.sign — this route used to hand-roll
+    // its own token here (and, in doing so, never actually imported `jwt`
+    // at all: every call to this route was throwing a plain
+    // ReferenceError, caught by the try/catch below and surfaced as a
+    // generic 500). Routing through the same helper every other
+    // token-minting route already uses fixes that for free.
+    const token = mintSessionToken({
+      user_id: req.user.userId, role: 'admin', organization_id: org.id, org_unit_id: null, is_single_teacher: org.is_single_teacher,
+    });
 
     res.status(201).json({
       message: `"${org.name}" created — you're now its admin.`,
       token,
       organizationId: org.id,
       organizationName: org.name,
+      isSingleTeacher: !!org.is_single_teacher,
     });
   } catch (err) {
     await client.query('ROLLBACK');

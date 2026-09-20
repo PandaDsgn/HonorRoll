@@ -10,8 +10,8 @@
   left: 24px;
   width: 52px;
   height: 52px;
-  border-radius: 0;
-  border: 2px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
   background: var(--surface-2);
   color: var(--accent);
   display: inline-flex;

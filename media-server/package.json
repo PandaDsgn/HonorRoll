@@ -1,0 +1,20 @@
+{
+  "name": "honorroll-media-server",
+  "version": "1.0.0",
+  "description": "Self-hosted mediasoup SFU for HonorRoll live classes — deployed to its own VM (Render can't route WebRTC's UDP media to a container), see media-server/README.md.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "license": "ISC",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mediasoup": "^3.14.0",
+    "ws": "^8.21.3"
+  }
+}

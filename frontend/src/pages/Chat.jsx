@@ -212,6 +212,10 @@ export function ChatWidget() {
   // disabled "Reported" state without needing to reload the whole
   // thread just to reflect one flag.
   const [reportedIds, setReportedIds] = useState(() => new Set());
+  // A reported message starts redacted in the reporter's own view (see the
+  // bubble render below) — this tracks which ones they've since clicked
+  // "Show reported text" on to reveal again, local-only like reportedIds.
+  const [revealedIds, setRevealedIds] = useState(() => new Set());
   // Same shape as the report fields above, for the sender's own "Edit"
   // affordance instead of the recipient's "Report" one.
   const [editingId, setEditingId] = useState(null);
@@ -306,6 +310,7 @@ export function ChatWidget() {
     setReportingId(null);
     setReportNote('');
     setReportedIds(new Set());
+    setRevealedIds(new Set());
     setEditingId(null);
     setEditDraft('');
     loadThread(contact);
@@ -496,10 +501,26 @@ export function ChatWidget() {
             {!messages && !error && !keyError && <p className="sb-loading">Loading…</p>}
 
             <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 12 }}>
-              {messages && messages.map((m) => (
+              {messages && messages.map((m) => {
+                const isReported = !m.fromMe && m.messageType === 'text' && (m.reportedByMe || reportedIds.has(m.id));
+                const isRevealed = revealedIds.has(m.id);
+                return (
                 <div key={m.id} style={{ alignSelf: m.fromMe ? 'flex-end' : 'flex-start', maxWidth: '75%' }}>
                   <div className="panel" style={{ padding: '8px 12px', background: m.fromMe ? 'var(--accent-dim)' : 'var(--surface-2)' }}>
-                    <MessageBubbleContent message={m} />
+                    {isReported && !isRevealed ? (
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <em style={{ color: 'var(--text-dim)' }}>&lt;Redacted&gt;</em>
+                        <button
+                          type="button"
+                          onClick={() => setRevealedIds((prev) => new Set(prev).add(m.id))}
+                          style={{ background: 'none', border: 'none', padding: 0, font: 'inherit', color: 'inherit', cursor: 'pointer', textDecoration: 'underline' }}
+                        >
+                          Show
+                        </button>
+                      </span>
+                    ) : (
+                      <MessageBubbleContent message={m} />
+                    )}
                   </div>
                   <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 2, textAlign: m.fromMe ? 'right' : 'left', display: 'flex', gap: 8, justifyContent: m.fromMe ? 'flex-end' : 'flex-start' }}>
                     <span>{formatTime(m.createdAt)}</span>
@@ -568,7 +589,8 @@ export function ChatWidget() {
                     </div>
                   )}
                 </div>
-              ))}
+                );
+              })}
               <div ref={bottomRef} />
             </div>
 

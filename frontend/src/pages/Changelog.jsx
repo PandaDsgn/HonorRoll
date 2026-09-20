@@ -4,8 +4,21 @@ import LegalShell from '../components/LegalShell';
 // history, not a promise of exact release timestamps.
 const ENTRIES = [
   {
-    date: '06 September 2026',
+    date: '18 September 2026',
     tag: 'Latest',
+    items: [
+      'Doubt threads now have a Follow button — follow one you\'re not the asker of to get notified on every new reply, and post your own follow-up question in it too.',
+      'A message you\'ve reported in chat now shows as "<Redacted>" instead of its original text, with a button to reveal it again if you want to re-read it.',
+      'Added an institution switcher — anyone who belongs to more than one institution (a student tutoring elsewhere, a teacher moonlighting at a second school, ...) can now flip between them right from their dashboard, instead of logging out and signing back in.',
+      'Admins can now message students directly in chat, in every institution, once they\'re assigned to teach a subject — the same way a teacher already could.',
+      'Small tuition centers can now sign up as a "Single Teacher Organization" — no institutional email address required. The founder is automatically set up to teach every subject they create, and can toggle between an admin view and a teacher view from their dashboard.',
+      'Added a feature to host live classes — teachers can start a class, students can join in real-time and interact with the teacher.',
+      'Teachers have access to a record feature that allows recording of the camera of the teacher during the live class.'
+    ],
+  },
+  {
+    date: '06 September 2026',
+    tag: 'Added',
     items: [
       'Added a live demo — try HonorRoll as a student, teacher, or admin without creating an account. You can switch roles mid-session without losing your place, and all demo data resets automatically once the session expires.',
       'Added proper pages for "page not found," "access denied," and unexpected errors, instead of a blank screen or a silent redirect.',

@@ -5,7 +5,7 @@
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../lib/db');
-const { authenticateToken, requireAdminOrTeacher } = require('../lib/auth');
+const { authenticateToken, requireAdminOrTeacher, isActingTeacher } = require('../lib/auth');
 const { getVisibleSubjectIds, getTeacherScope } = require('../lib/performance');
 const { notesUpload } = require('../lib/uploads');
 const { isB2Configured, notesObjectKey, uploadScanPdf, deleteScanPdf, getScanPdfUrl } = require('../storage');
@@ -54,7 +54,7 @@ async function serializeNoteRow(row, b2Configured) {
 router.get('/api/notes/subjects', authenticateToken, async (req, res) => {
   try {
     let subjectIds;
-    if (req.user.role === 'teacher') {
+    if (isActingTeacher(req.user)) {
       subjectIds = (await getTeacherScope(req.user.userId, req.user.organizationId)).subjectIds;
     } else if (req.user.role === 'student') {
       subjectIds = await getVisibleSubjectIds(req.user.orgUnitId);

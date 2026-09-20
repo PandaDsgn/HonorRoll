@@ -606,7 +606,7 @@ export default function Login() {
         <h2 className="auth-title">Sign in to your workspace</h2>
         <p className="auth-sub">Use your {audienceLabel.toLowerCase()} credentials to continue.</p>
 
-        <div className="segmented" role="tablist" aria-label="Signing in as" style={{ margin: '4px 0 20px' }}>
+        <div className="segmented segmented-grid" role="tablist" aria-label="Signing in as" style={{ margin: '4px 0 20px' }}>
           {AUDIENCES.map((a) => (
             <button
               key={a.key}

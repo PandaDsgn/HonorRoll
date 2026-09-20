@@ -458,12 +458,15 @@ const FIELD_OPTIONS = [
 ];
 
 function MyInfoPanel() {
-  const { user } = useAuth();
+  const navigate = useNavigate();
+  const { user, login } = useAuth();
   const [organizations, setOrganizations] = useState(null);
   const [requests, setRequests] = useState(null);
   const [error, setError] = useState('');
 
   const [cardOrgId, setCardOrgId] = useState(null);
+  const [switchingId, setSwitchingId] = useState(null);
+  const [switchError, setSwitchError] = useState('');
 
   const [field, setField] = useState('name');
   const [customField, setCustomField] = useState('');
@@ -487,6 +490,32 @@ function MyInfoPanel() {
   };
 
   useEffect(fetchAll, []);
+
+  // Flips the whole session over to a different org this student also
+  // belongs to (see auth.js's own "a student who also tutors at a separate
+  // institution" comment) — same POST-and-remint-a-token shape as
+  // POST /api/login/select-organization, just callable while already
+  // signed in. A hard reload after, not just a state update: every page in
+  // the app has already loaded data scoped to the OLD organization
+  // (subjects, contacts, notifications, ...), and reloading is the
+  // simplest way to guarantee none of that lingers post-switch — the same
+  // fresh-boot state a real re-login would leave it in. navigate() first,
+  // not a raw window.location.href assignment, since this app runs under a
+  // HashRouter — an href assignment would drop the `#/` prefix routing
+  // needs.
+  const switchTo = async (organizationId) => {
+    setSwitchingId(organizationId);
+    setSwitchError('');
+    try {
+      const res = await axios.post(`${API}/api/me/switch-organization`, { organizationId }, { withCredentials: true });
+      login(res.data.token, res.data.user);
+      navigate('/performance');
+      window.location.reload();
+    } catch (err) {
+      setSwitchError(err.response?.data?.error || 'Failed to switch organization.');
+      setSwitchingId(null);
+    }
+  };
 
   const submitRequest = async (e) => {
     e.preventDefault();
@@ -528,23 +557,41 @@ function MyInfoPanel() {
         <PhotoPicker />
 
         <h4 style={{ margin: '20px 0 8px', fontSize: 13, color: 'var(--text-dim)' }}>Your institutions</h4>
+        {switchError && <div className="alert" style={{ marginBottom: 12 }}><span className="alert-icon">!</span><span>{switchError}</span></div>}
         <div className="admin-table-wrap">
           <table className="admin-table">
-            <thead><tr><th>Institution</th><th>Role</th><th>Unit</th><th>Roll number</th><th /></tr></thead>
+            <thead><tr><th>Institution</th><th style={{ textAlign: 'center' }} /><th>Role</th><th>Unit</th><th>Roll number</th><th /></tr></thead>
             <tbody>
-              {organizations.map((o) => (
-                <tr key={o.organization_id}>
-                  <td className="admin-cell-strong">{o.organization_name}</td>
-                  <td><span className="chip chip-neutral"><span className="dot" />{o.role}</span></td>
-                  <td>{o.org_unit_id != null ? o.org_unit_id : '—'}</td>
-                  <td>{o.roll_number || '—'}</td>
-                  <td>
-                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => setCardOrgId(o.organization_id)}>
-                      View ID Card
-                    </button>
-                  </td>
-                </tr>
-              ))}
+              {organizations.map((o) => {
+                const isActive = o.organization_id === user?.organizationId;
+                return (
+                  <tr key={o.organization_id}>
+                    <td className="admin-cell-strong">{o.organization_name}</td>
+                    <td style={{ textAlign: 'center' }}>
+                      {isActive ? (
+                        <span className="chip chip-easy"><span className="dot" />Active</span>
+                      ) : (
+                        <button
+                          type="button"
+                          className="btn btn-ghost btn-sm"
+                          disabled={switchingId !== null}
+                          onClick={() => switchTo(o.organization_id)}
+                        >
+                          {switchingId === o.organization_id ? 'Switching…' : 'Switch'}
+                        </button>
+                      )}
+                    </td>
+                    <td><span className="chip chip-neutral"><span className="dot" />{o.role}</span></td>
+                    <td>{o.org_unit_id != null ? o.org_unit_id : '—'}</td>
+                    <td>{o.roll_number || '—'}</td>
+                    <td>
+                      <button type="button" className="btn btn-ghost btn-sm" onClick={() => setCardOrgId(o.organization_id)}>
+                        View ID Card
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

@@ -1,6 +1,8 @@
 // Change BrowserRouter to HashRouter
 import { HashRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { AuthProvider } from './context/AuthContext';
+import { CustomThemeProvider } from './context/CustomThemeContext';
+import CustomBackgroundLayer from './components/CustomBackgroundLayer';
 import ProtectedRoute from './components/ProtectedRoute';
 import Home from './pages/Home';
 import Login from './pages/Login';
@@ -43,8 +45,13 @@ import NotFound from './pages/NotFound';
 function App() {
   return (
     <AuthProvider>
+      <CustomThemeProvider>
       {/* Wrap your app in HashRouter instead of BrowserRouter */}
       <HashRouter>
+        {/* First in the DOM on purpose — see its own comment and
+            index.css's .custom-bg-layer rule for why paint order depends
+            on it staying first. */}
+        <CustomBackgroundLayer />
         <a href="#main-content" className="skip-link">Skip to content</a>
         <PageMeta />
         <DemoBanner />
@@ -128,6 +135,7 @@ function App() {
         </ErrorBoundary>
         <AssistantWidget />
       </HashRouter>
+      </CustomThemeProvider>
     </AuthProvider>
   );
 }

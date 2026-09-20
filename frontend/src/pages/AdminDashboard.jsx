@@ -43,6 +43,22 @@ export default function AdminDashboard() {
   const [selectedStudentId, setSelectedStudentId] = useState(null);
   const [selectedMyStudentId, setSelectedMyStudentId] = useState(null);
 
+  // A single-teacher org's founder holds one membership row (role='admin'
+  // — see organizations.is_single_teacher's own comment in schema/
+  // index.js) but genuinely does both jobs, so every tab/panel gate below
+  // reads `actingRole`, not `user.role` directly, with a small toggle
+  // (rendered further down) letting them flip between the two views. For
+  // every other org this is never shown and actingRole just IS user.role
+  // — zero behavior change. Read once at mount, not resynced to user.role
+  // afterward: an org switch (AuthContext's login() + a hard reload, see
+  // MyProfile.jsx's own switchTo) already remounts this whole page fresh.
+  const [actingRole, setActingRole] = useState(user?.role);
+  const canActAsEither = user?.role === 'admin' && user?.is_single_teacher;
+  // Chat is a universal admin capability (see routes/chat.js's canChat),
+  // not tied to the acting-role toggle below — an admin can always reach
+  // it regardless of which view they're currently switched into.
+  const canUseChat = user?.role === 'teacher' || user?.role === 'admin';
+
   // Mobile-only dropdown for the section tab bar below — see .space-nav-mobile
   // in index.css and SpaceSwitcher's own identical pattern for why both the
   // full row and this toggle/dropdown stay in the DOM at all times.
@@ -61,8 +77,8 @@ export default function AdminDashboard() {
   // routes — a teacher landing here on the default tab would just see a
   // 403. Bounce them to their own scoped tab once `user` has loaded.
   useEffect(() => {
-    if (user?.role === 'teacher' && tab === 'students') setTab('my-students');
-  }, [user?.role, tab]);
+    if (actingRole === 'teacher' && tab === 'students') setTab('my-students');
+  }, [actingRole, tab]);
 
   // Bumped whenever OrgStructureBuilder changes units/levels, so the
   // sibling panels below it (which each keep their own unit-picker copy)
@@ -86,10 +102,28 @@ export default function AdminDashboard() {
         <div className="admin-head">
           <div>
             <h1 className="problems-title" style={{ marginBottom: 4 }}>
-              {user?.role === 'teacher' ? 'Teacher Dashboard' : 'Admin Dashboard'}
+              {actingRole === 'teacher' ? 'Teacher Dashboard' : 'Admin Dashboard'}
             </h1>
             {user?.name && <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-h)' }}>{user.name}</div>}
             {user?.organization_name && <div style={{ fontSize: 13, color: 'var(--text-dim)', marginTop: 2 }}>{user.organization_name}</div>}
+            {canActAsEither && (
+              <div className="segmented" role="tablist" aria-label="Acting as" style={{ marginTop: 8 }}>
+                <button
+                  type="button" role="tab" aria-pressed={actingRole === 'admin'}
+                  className={actingRole === 'admin' ? 'active' : ''}
+                  onClick={() => { setActingRole('admin'); setTab('students'); }}
+                >
+                  Admin view
+                </button>
+                <button
+                  type="button" role="tab" aria-pressed={actingRole === 'teacher'}
+                  className={actingRole === 'teacher' ? 'active' : ''}
+                  onClick={() => { setActingRole('teacher'); setTab('my-students'); }}
+                >
+                  Teacher view
+                </button>
+              </div>
+            )}
           </div>
           {(() => {
             // Same list rendered twice below (full row on desktop, dropdown
@@ -98,13 +132,13 @@ export default function AdminDashboard() {
             // keeps the two renders from drifting out of sync with each
             // other as tabs get added/removed.
             const adminTabs = [
-              user?.role === 'admin' && { id: 'students', label: 'Students', onClick: () => { setTab('students'); setSelectedStudentId(null); } },
-              user?.role === 'teacher' && { id: 'my-students', label: 'My Students', onClick: () => { setTab('my-students'); setSelectedMyStudentId(null); } },
-              user?.role === 'teacher' && { id: 'assignments', label: 'Assignments', onClick: () => setTab('assignments') },
+              actingRole === 'admin' && { id: 'students', label: 'Students', onClick: () => { setTab('students'); setSelectedStudentId(null); } },
+              actingRole === 'teacher' && { id: 'my-students', label: 'My Students', onClick: () => { setTab('my-students'); setSelectedMyStudentId(null); } },
+              actingRole === 'teacher' && { id: 'assignments', label: 'Assignments', onClick: () => setTab('assignments') },
               { id: 'exams', label: 'Exams', onClick: () => setTab('exams') },
               { id: 'gradebook', label: 'Gradebook', onClick: () => setTab('gradebook') },
-              user?.role === 'teacher' && { id: 'uploads', label: 'Uploads', onClick: () => setTab('uploads') },
-              user?.role === 'teacher' && { id: 'doubts', label: 'Doubts', onClick: () => setTab('doubts') },
+              actingRole === 'teacher' && { id: 'uploads', label: 'Uploads', onClick: () => setTab('uploads') },
+              actingRole === 'teacher' && { id: 'doubts', label: 'Doubts', onClick: () => setTab('doubts') },
               // Chat itself dropped from this row — it's now the standing
               // icon beside the notification bell (SpaceSwitcher.jsx's
               // ChatShortcut), same as it was pulled out of the student
@@ -112,13 +146,13 @@ export default function AdminDashboard() {
               // 'chat'` render branch further down stays, though — that's
               // still how ChatShortcut's own navigate(..., {state:{tab:
               // 'chat'}}) actually lands on it.
-              user?.role === 'admin' && { id: 'notices', label: 'Notices', onClick: () => setTab('notices') },
-              user?.role === 'admin' && { id: 'grade-scale', label: 'Grading', onClick: () => setTab('grade-scale') },
-              user?.role === 'admin' && { id: 'structure', label: 'Structure', onClick: () => setTab('structure') },
-              user?.role === 'admin' && { id: 'institution', label: 'Institution', onClick: () => setTab('institution') },
-              user?.role === 'admin' && { id: 'billing', label: 'Billing', onClick: () => setTab('billing') },
-              user?.role === 'admin' && { id: 'contact-superadmin', label: 'Contact Superadmin', onClick: () => setTab('contact-superadmin') },
-              user?.role === 'admin' && { id: 'chat-reports', label: 'Chat Reports', onClick: () => setTab('chat-reports') },
+              actingRole === 'admin' && { id: 'notices', label: 'Notices', onClick: () => setTab('notices') },
+              actingRole === 'admin' && { id: 'grade-scale', label: 'Grading', onClick: () => setTab('grade-scale') },
+              actingRole === 'admin' && { id: 'structure', label: 'Structure', onClick: () => setTab('structure') },
+              actingRole === 'admin' && { id: 'institution', label: 'Institution', onClick: () => setTab('institution') },
+              actingRole === 'admin' && { id: 'billing', label: 'Billing', onClick: () => setTab('billing') },
+              actingRole === 'admin' && { id: 'contact-superadmin', label: 'Contact Superadmin', onClick: () => setTab('contact-superadmin') },
+              actingRole === 'admin' && { id: 'chat-reports', label: 'Chat Reports', onClick: () => setTab('chat-reports') },
             ].filter(Boolean);
 
             return (
@@ -154,7 +188,7 @@ export default function AdminDashboard() {
         </div>
 
         {tab === 'students' ? (
-          user?.role === 'admin' ? (
+          actingRole === 'admin' ? (
             selectedStudentId ? (
               <StudentDetailPanel studentId={selectedStudentId} onBack={() => setSelectedStudentId(null)} />
             ) : (
@@ -162,7 +196,7 @@ export default function AdminDashboard() {
             )
           ) : null
         ) : tab === 'my-students' ? (
-          user?.role === 'teacher' ? (
+          actingRole === 'teacher' ? (
             selectedMyStudentId ? (
               <TeacherStudentDetailPanel studentId={selectedMyStudentId} onBack={() => setSelectedMyStudentId(null)} />
             ) : (
@@ -170,21 +204,25 @@ export default function AdminDashboard() {
             )
           ) : null
         ) : tab === 'assignments' ? (
-          user?.role === 'teacher' ? <AssignmentsPanel /> : null
+          actingRole === 'teacher' ? <AssignmentsPanel /> : null
         ) : tab === 'exams' ? (
           <ExamsPanel />
         ) : tab === 'gradebook' ? (
           <GradebookPanel />
         ) : tab === 'uploads' ? (
-          user?.role === 'teacher' ? <TeacherUploadsPanel /> : null
+          actingRole === 'teacher' ? <TeacherUploadsPanel /> : null
         ) : tab === 'doubts' ? (
-          user?.role === 'teacher' ? <DoubtsPanel /> : null
+          actingRole === 'teacher' ? <DoubtsPanel /> : null
         ) : tab === 'chat' ? (
-          user?.role === 'teacher' ? <ChatPanel /> : null
+          // Admin can chat with students too now, in any org — see
+          // routes/chat.js's canChat — reached the same icon-only way a
+          // teacher's own chat is (ChatShortcut's navigate(...,
+          // {state:{tab:'chat'}}), never its own row button either).
+          canUseChat ? <ChatPanel /> : null
         ) : tab === 'notices' ? (
-          user?.role === 'admin' ? <AdminNoticesPanel /> : null
+          actingRole === 'admin' ? <AdminNoticesPanel /> : null
         ) : tab === 'structure' ? (
-          user?.role === 'admin' ? (
+          actingRole === 'admin' ? (
             <>
               <OrgStructureBuilder onChange={() => setUnitsVersion((v) => v + 1)} />
               <SubjectsPanel refreshSignal={unitsVersion} />
@@ -193,18 +231,18 @@ export default function AdminDashboard() {
             </>
           ) : null
         ) : tab === 'billing' ? (
-          user?.role === 'admin' ? <BillingPanel /> : null
+          actingRole === 'admin' ? <BillingPanel /> : null
         ) : tab === 'institution' ? (
-          user?.role === 'admin' ? <OrgLogoPanel /> : null
+          actingRole === 'admin' ? <OrgLogoPanel /> : null
         ) : tab === 'contact-superadmin' ? (
-          user?.role === 'admin' ? (
+          actingRole === 'admin' ? (
             <>
               <RequestAddAdminPanel />
               <AdminRequestsPanel />
             </>
           ) : null
         ) : tab === 'chat-reports' ? (
-          user?.role === 'admin' ? <ChatReportsPanel /> : null
+          actingRole === 'admin' ? <ChatReportsPanel /> : null
         ) : tab === 'grade-scale' ? (
           // Every panel here is an org-wide policy call (which tags students
           // see, the grade-band cutoffs, the plagiarism-similarity
@@ -214,7 +252,7 @@ export default function AdminDashboard() {
           // to 403. The tab button itself is admin-only for the same reason
           // (see the segmented control above); this check is just the
           // belt-and-braces backstop.
-          user?.role === 'admin' ? (
+          actingRole === 'admin' ? (
             <>
               <IntegrationsPanel />
               <TagVisibilityPanel />

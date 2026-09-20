@@ -11,7 +11,7 @@ const express = require('express');
 const router = express.Router();
 const path = require('path');
 const { pool } = require('../lib/db');
-const { authenticateToken, requireAdminOrTeacher } = require('../lib/auth');
+const { authenticateToken, requireAdminOrTeacher, isActingTeacher } = require('../lib/auth');
 const { getVisibleSubjectIds, getTeacherScope } = require('../lib/performance');
 const { notesUpload } = require('../lib/uploads');
 const { isB2Configured, doubtsObjectKey, uploadScanPdf, getScanPdfUrl } = require('../storage');
@@ -65,7 +65,7 @@ async function serializeDoubtRow(row, viewerIsOwnerOrTeacher, b2Configured) {
 router.get('/api/doubts/subjects', authenticateToken, async (req, res) => {
   try {
     let subjectIds;
-    if (req.user.role === 'teacher') {
+    if (isActingTeacher(req.user)) {
       subjectIds = (await getTeacherScope(req.user.userId, req.user.organizationId)).subjectIds;
     } else if (req.user.role === 'student') {
       subjectIds = await getVisibleSubjectIds(req.user.orgUnitId);
@@ -315,6 +315,7 @@ router.get('/api/doubts/:id', authenticateToken, async (req, res) => {
     const row = doubtRes.rows[0];
 
     let viewerIsOwnerOrTeacher;
+    let isFollowing = false;
     if (req.user.role === 'student') {
       const isOwner = row.student_id === req.user.userId;
       if (!isOwner) {
@@ -322,7 +323,9 @@ router.get('/api/doubts/:id', authenticateToken, async (req, res) => {
         if (!visibleSubjectIds.includes(row.subject_id)) return res.status(404).json({ error: 'Doubt not found' });
       }
       viewerIsOwnerOrTeacher = isOwner;
-    } else if (req.user.role === 'teacher') {
+      const followRes = await pool.query('SELECT 1 FROM doubt_followers WHERE doubt_id = $1 AND student_id = $2', [doubtId, req.user.userId]);
+      isFollowing = followRes.rows.length > 0;
+    } else if (isActingTeacher(req.user)) {
       if (!(await teacherCanAccessDoubt(req.user.userId, row.teacher_id, row.subject_id))) {
         return res.status(403).json({ error: 'Not your doubt to view' });
       }
@@ -351,10 +354,47 @@ router.get('/api/doubts/:id', authenticateToken, async (req, res) => {
 
     const configured = isB2Configured();
     const doubt = await serializeDoubtRow({ ...row, is_mine: row.student_id === req.user.userId }, viewerIsOwnerOrTeacher, configured);
-    res.status(200).json({ doubt, replies });
+    res.status(200).json({ doubt: { ...doubt, isFollowing }, replies });
   } catch (err) {
     console.error('Get doubt error:', err);
     res.status(500).json({ error: 'Failed to load doubt' });
+  }
+});
+
+// Follow / unfollow a thread — student only, same visibility rule as
+// replying (see the reply route below): must be able to see the subject.
+// Followers get notified on every future reply, same as the asker.
+router.post('/api/doubts/:id/follow', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'student') return res.status(403).json({ error: 'Not available for this role' });
+  const doubtId = Number(req.params.id);
+
+  try {
+    const doubtRes = await pool.query('SELECT subject_id FROM doubts WHERE id = $1', [doubtId]);
+    if (doubtRes.rows.length === 0) return res.status(404).json({ error: 'Doubt not found' });
+    const visibleSubjectIds = await getVisibleSubjectIds(req.user.orgUnitId);
+    if (!visibleSubjectIds.includes(doubtRes.rows[0].subject_id)) return res.status(404).json({ error: 'Doubt not found' });
+
+    await pool.query(
+      'INSERT INTO doubt_followers (doubt_id, student_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [doubtId, req.user.userId]
+    );
+    res.status(200).json({ isFollowing: true });
+  } catch (err) {
+    console.error('Follow doubt error:', err);
+    res.status(500).json({ error: 'Failed to follow this doubt' });
+  }
+});
+
+router.delete('/api/doubts/:id/follow', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'student') return res.status(403).json({ error: 'Not available for this role' });
+  const doubtId = Number(req.params.id);
+
+  try {
+    await pool.query('DELETE FROM doubt_followers WHERE doubt_id = $1 AND student_id = $2', [doubtId, req.user.userId]);
+    res.status(200).json({ isFollowing: false });
+  } catch (err) {
+    console.error('Unfollow doubt error:', err);
+    res.status(500).json({ error: 'Failed to unfollow this doubt' });
   }
 });
 
@@ -456,25 +496,38 @@ router.post('/api/doubts/:id/replies', authenticateToken, async (req, res) => {
     const doubt = doubtRes.rows[0];
 
     let authorRole;
-    let notifyUserIds;
-    if (req.user.role === 'student' && doubt.student_id === req.user.userId) {
+    let notifyUserIds = [];
+    if (req.user.role === 'student') {
+      const visibleSubjectIds = await getVisibleSubjectIds(req.user.orgUnitId);
+      if (!visibleSubjectIds.includes(doubt.subject_id)) return res.status(403).json({ error: 'Not your doubt to reply to' });
       authorRole = 'student';
-      // Addressed doubt -> just that one teacher. Unaddressed -> every
-      // teacher of the subject, same fan-out as the original post's own
-      // notification (a single NULL teacher_id has nobody to notify on
-      // its own).
+      // Notify the teacher(s)
       if (doubt.teacher_id) {
-        notifyUserIds = [doubt.teacher_id];
+        notifyUserIds.push(doubt.teacher_id);
       } else {
         const subjectTeachers = await pool.query('SELECT user_id FROM subject_teachers WHERE subject_id = $1', [doubt.subject_id]);
-        notifyUserIds = subjectTeachers.rows.map((t) => t.user_id);
+        notifyUserIds.push(...subjectTeachers.rows.map((t) => t.user_id));
       }
-    } else if (req.user.role === 'teacher' && await teacherCanAccessDoubt(req.user.userId, doubt.teacher_id, doubt.subject_id)) {
+      // Notify the asker if the replier is not the asker
+      if (doubt.student_id !== req.user.userId) notifyUserIds.push(doubt.student_id);
+    } else if (isActingTeacher(req.user) && await teacherCanAccessDoubt(req.user.userId, doubt.teacher_id, doubt.subject_id)) {
+      // Stored as 'teacher' regardless of whether the replier's real
+      // membership role is 'teacher' or a single-teacher org's own admin
+      // acting as one — same redaction/notification treatment either way
+      // (see GET /api/doubts/:id's own author-name comment): the asker
+      // sees a teacher's answer, not an admin's.
       authorRole = 'teacher';
-      notifyUserIds = [doubt.student_id];
+      notifyUserIds.push(doubt.student_id);
     } else {
       return res.status(403).json({ error: 'Not your doubt to reply to' });
     }
+
+    // Add followers to the notification list
+    const followers = await pool.query('SELECT student_id FROM doubt_followers WHERE doubt_id = $1', [doubtId]);
+    followers.rows.forEach(f => notifyUserIds.push(f.student_id));
+    
+    // Remove duplicates and self from notifyUserIds
+    notifyUserIds = [...new Set(notifyUserIds)].filter(id => id !== req.user.userId);
 
     await pool.query(
       'INSERT INTO doubt_replies (doubt_id, author_id, author_role, body_text) VALUES ($1, $2, $3, $4)',

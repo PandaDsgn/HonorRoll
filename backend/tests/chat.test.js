@@ -93,6 +93,35 @@ describe('chat routes', () => {
     expect(res.body.contacts.map((c) => c.id)).toContain(studentId);
   });
 
+  // Admin-student chat is universal (see routes/chat.js's own canChat
+  // comment) — not tied to a single-teacher org at all, unlike the deeper
+  // teacher-only capabilities (doubts, notes) covered in
+  // tests/singleTeacherOrg.test.js. This is a perfectly ordinary
+  // multi-staff org; the admin just needs to actually be assigned to a
+  // subject (same subject_teachers row a real teacher assignment writes),
+  // same as any teacher would.
+  it('an admin manually assigned to a subject can chat with that subject\'s student, in a regular org', async () => {
+    const meRes = await request(app).get('/api/me').set('Authorization', `Bearer ${adminToken}`);
+    // Reused the Chemistry subject already assigned to teacherToken above —
+    // fetched via the teacher's own subject list (there's no GET /api/admin/
+    // subjects route this file could use instead).
+    const teacherSubjectsRes = await request(app).get('/api/doubts/subjects').set('Authorization', `Bearer ${teacherToken}`);
+    const chemistrySubjectId = teacherSubjectsRes.body.subjects.find((s) => s.name === 'Chemistry').id;
+
+    const assignRes = await request(app)
+      .post(`/api/admin/subjects/${chemistrySubjectId}/teachers`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ userId: meRes.body.user.id });
+    expect(assignRes.status).toBe(201);
+
+    const contactsRes = await request(app).get('/api/chat/contacts').set('Authorization', `Bearer ${studentToken}`);
+    expect(contactsRes.body.contacts.map((c) => c.id)).toContain(meRes.body.user.id);
+
+    const adminContactsRes = await request(app).get('/api/chat/contacts').set('Authorization', `Bearer ${adminToken}`);
+    expect(adminContactsRes.status).toBe(200);
+    expect(adminContactsRes.body.contacts.map((c) => c.id)).toContain(studentId);
+  });
+
   it('GET /api/chat/keys/me returns 404 before any key is uploaded', async () => {
     const res = await request(app).get('/api/chat/keys/me').set('Authorization', `Bearer ${studentToken}`);
     expect(res.status).toBe(404);

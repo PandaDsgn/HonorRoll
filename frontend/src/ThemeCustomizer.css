@@ -1,0 +1,92 @@
+/* Top-bar "customize appearance" control — rendered by ThemeToggle.jsx
+   immediately before its own sun/moon button, so it shows up in every
+   page's .sb-actions row with zero changes to the ~20 pages that render
+   ThemeToggle. Trigger reuses .icon-btn (index.css) directly; only the
+   dropdown below needs its own rules, same anchored-panel shape as
+   NotificationBell's own dropdown. */
+
+.customize-container { position: relative; }
+
+.customize-dropdown {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  width: min(280px, calc(100vw - 32px));
+  max-height: min(560px, calc(100vh - 100px));
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  z-index: 50;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.customize-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.customize-row label {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+/* Native color input — a full RGB picker (with an eyedropper in most
+   browsers) for free, no picker library needed. Excluded from index.css's
+   global bare-input reset (see that file's own :not([type='color'])), so
+   it keeps its native swatch chrome here. */
+.customize-row input[type='color'] {
+  width: 40px;
+  height: 32px;
+  padding: 2px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  cursor: pointer;
+}
+
+.customize-row-stack { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+.customize-row-stack label {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.customize-row-stack input[type='range'] { width: 100%; accent-color: var(--accent); }
+
+.customize-divider { height: 1px; background: var(--border); margin: 0 -14px; }
+
+.customize-bg-upload-buttons { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.customize-image-preview {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
+.customize-media-thumb {
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+}
+
+.customize-error {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.customize-reset { align-self: flex-start; }
+
+/* admin.css's own .btn-sm isn't loaded on every page (Home/Login/etc never
+   import it), and this dropdown is reachable from every page — sized down
+   locally instead of depending on a class that may not exist here. */
+.customize-dropdown .btn { padding: 6px 12px; font-size: 12.5px; }

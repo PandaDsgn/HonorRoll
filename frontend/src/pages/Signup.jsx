@@ -20,6 +20,7 @@ export default function Signup() {
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [acceptedTos, setAcceptedTos] = useState(false);
+  const [isSingleTeacher, setIsSingleTeacher] = useState(false);
   const [error, setError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
 
@@ -34,7 +35,7 @@ export default function Signup() {
 
     try {
       const response = await axios.post(`${API}/api/organizations/signup`, {
-        organizationName, accessCode, name, email, password, acceptedTos,
+        organizationName, accessCode, name, email, password, acceptedTos, isSingleTeacher,
       });
       login(response.data.token, response.data.user);
       navigate('/admin', { replace: true });
@@ -93,6 +94,19 @@ export default function Signup() {
             />
           </div>
 
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13.5, margin: '4px 0 0' }}>
+            <input
+              type="checkbox"
+              checked={isSingleTeacher}
+              onChange={(e) => setIsSingleTeacher(e.target.checked)}
+              style={{ marginTop: 2 }}
+            />
+            <span>
+              This is a single-teacher organization (a small tuition center where you're both the admin and the only
+              teacher) — signs up without needing an institutional email address.
+            </span>
+          </label>
+
           <div className="field">
             <label htmlFor="name">Your name</label>
             <input
@@ -111,12 +125,18 @@ export default function Signup() {
             <input
               id="email"
               type="email"
-              placeholder="you@example.com"
+              placeholder={isSingleTeacher ? 'you@gmail.com' : 'you@example.com'}
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               required
               autoComplete="email"
             />
+            {!isSingleTeacher && (
+              <p className="auth-sub" style={{ margin: '6px 0 0' }}>
+                Use your institutional email address, not a personal Gmail/Yahoo/etc. account — check the box above
+                if you're a small tuition center without one.
+              </p>
+            )}
           </div>
 
           <div className="field">

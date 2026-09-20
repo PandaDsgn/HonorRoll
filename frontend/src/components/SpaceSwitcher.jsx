@@ -259,7 +259,7 @@ export default function SpaceSwitcher({ activeTab }) {
 // reason.)
 export function SpaceNotifications() {
   const { role } = useAuth();
-  return (role === 'student' || role === 'teacher') ? (
+  return (role === 'student' || role === 'teacher' || role === 'admin') ? (
     <>
       <ChatShortcut />
       <NotificationBell />

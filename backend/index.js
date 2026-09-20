@@ -163,6 +163,7 @@ app.use(require('./routes/notes'));
 app.use(require('./routes/notices'));
 app.use(require('./routes/notifications'));
 app.use(require('./routes/doubts'));
+app.use(require('./routes/liveClasses'));
 app.use(require('./routes/chat'));
 app.use(require('./routes/auth'));
 app.use(require('./routes/organizations'));

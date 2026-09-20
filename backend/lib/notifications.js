@@ -17,11 +17,11 @@ const { sendToUser } = require('./realtime');
 // Single recipient — used wherever the recipient list already has to be
 // resolved one-by-one anyway (e.g. doubts.js fanning out to a specific set
 // of teachers or a specific student).
-async function createNotification({ organizationId, userId, type, title, body = null, noteId = null, noticeId = null, problemId = null, examId = null, doubtId = null }) {
+async function createNotification({ organizationId, userId, type, title, body = null, noteId = null, noticeId = null, problemId = null, examId = null, doubtId = null, liveSessionId = null }) {
   const result = await pool.query(
-    `INSERT INTO notifications (organization_id, user_id, type, title, body, note_id, notice_id, problem_id, exam_id, doubt_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id, created_at`,
-    [organizationId, userId, type, title, body, noteId, noticeId, problemId, examId, doubtId]
+    `INSERT INTO notifications (organization_id, user_id, type, title, body, note_id, notice_id, problem_id, exam_id, doubt_id, live_session_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id, created_at`,
+    [organizationId, userId, type, title, body, noteId, noticeId, problemId, examId, doubtId, liveSessionId]
   );
   sendToUser(userId, 'notification', {});
   return result.rows[0];

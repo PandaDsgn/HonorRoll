@@ -82,6 +82,11 @@
    The colored band (below) carries the one deliberate accent moment; the
    body stays flat and dark so the band, the photo, and the QR chip are
    the only things competing for attention. */
+/* Deliberately exempt from the minimalist-brutalist surface pass: this is
+   a printed-badge artifact (own --idcard-* tokens, hard offset stamp
+   shadow, exported to PNG), not app chrome — same "a genuinely different
+   surface earns its own register" exception as the console/Visualizer
+   tokens in index.css. Keeps its sharp corners and hard shadow on purpose. */
 .idcard {
   position: relative;
   width: 100%;
