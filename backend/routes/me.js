@@ -80,6 +80,39 @@ router.put('/api/me', authenticateToken, async (req, res) => {
   }
 });
 
+// Personal look-and-feel (ThemeCustomizer.jsx) — global per-identity like
+// users.name/tos_accepted_at above, not per-org, so it follows the person
+// across organization switches and devices rather than resetting. Open to
+// every authenticated role (student/teacher/admin/superadmin alike) —
+// nothing here is role-specific. Body size for the PUT is governed by the
+// larger, path-scoped express.json() limit registered in index.js (a
+// background image/video's base64 data URL routinely exceeds the app's
+// normal 100kb JSON default).
+router.get('/api/me/custom-theme', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT custom_theme FROM users WHERE id = $1', [req.user.userId]);
+    if (result.rows.length === 0) return res.status(401).json({ error: 'Session no longer valid' });
+    res.status(200).json({ customTheme: result.rows[0].custom_theme || {} });
+  } catch (err) {
+    console.error('Get custom theme error:', err);
+    res.status(500).json({ error: 'Failed to load custom theme' });
+  }
+});
+
+router.put('/api/me/custom-theme', authenticateToken, async (req, res) => {
+  const { customTheme } = req.body;
+  if (customTheme !== null && (typeof customTheme !== 'object' || Array.isArray(customTheme))) {
+    return res.status(400).json({ error: 'customTheme must be an object' });
+  }
+  try {
+    await pool.query('UPDATE users SET custom_theme = $1 WHERE id = $2', [customTheme ? JSON.stringify(customTheme) : null, req.user.userId]);
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error('Update custom theme error:', err);
+    res.status(500).json({ error: 'Failed to save custom theme' });
+  }
+});
+
 // Every organization this user belongs to, with their role in each — the
 // authenticated equivalent of the org-picker query POST /api/login already
 // runs pre-auth for a multi-membership user (see the preAuthToken flow),

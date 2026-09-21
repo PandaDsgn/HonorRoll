@@ -78,7 +78,6 @@ export default function Home() {
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
         </div>
       </header>
-      <hr className="rule" />
 
       <main className="hero-band">
         <div className="hero-copy">
@@ -144,13 +143,12 @@ export default function Home() {
         <section className="callout-coral">
           <h2 className="callout-coral-title">Ready to set your institution up?</h2>
           <p className="callout-coral-sub">Isolated workspaces, per-role access, and grading that stays consistent across every class.</p>
-          <button type="button" className="btn callout-coral-btn" onClick={() => navigate('/signup', { replace: true })}>
+          <button type="button" className="btn btn-primary callout-coral-btn" onClick={() => navigate('/signup', { replace: true })}>
             Set up your school or college
           </button>
         </section>
       )}
 
-      <hr className="rule" />
       <footer className="landing-footer">
         <div className="landing-footer-links">
           <button type="button" className="landing-footer-link" onClick={() => navigate('/terms')}>Terms of Service</button>

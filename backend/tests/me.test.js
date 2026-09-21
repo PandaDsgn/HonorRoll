@@ -104,3 +104,41 @@ describe('POST /api/me/switch-organization', () => {
     expect(res.status).toBe(404);
   });
 });
+
+describe('GET/PUT /api/me/custom-theme', () => {
+  it('rejects an unauthenticated request', async () => {
+    const res = await request(app).get('/api/me/custom-theme');
+    expect(res.status).toBe(401);
+  });
+
+  it('returns an empty object before anything has ever been saved', async () => {
+    const { adminToken } = await createOrgWithAdmin(app);
+    const res = await request(app).get('/api/me/custom-theme').set('Authorization', `Bearer ${adminToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.customTheme).toEqual({});
+  });
+
+  it('round-trips a saved theme', async () => {
+    const { adminToken } = await createOrgWithAdmin(app);
+    const theme = { accent: '#ff8800', cardOpacity: 60 };
+
+    const putRes = await request(app)
+      .put('/api/me/custom-theme')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ customTheme: theme });
+    expect(putRes.status).toBe(200);
+
+    const getRes = await request(app).get('/api/me/custom-theme').set('Authorization', `Bearer ${adminToken}`);
+    expect(getRes.status).toBe(200);
+    expect(getRes.body.customTheme).toEqual(theme);
+  });
+
+  it('rejects a non-object customTheme', async () => {
+    const { adminToken } = await createOrgWithAdmin(app);
+    const res = await request(app)
+      .put('/api/me/custom-theme')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ customTheme: 'not-an-object' });
+    expect(res.status).toBe(400);
+  });
+});

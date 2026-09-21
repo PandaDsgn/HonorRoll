@@ -1,4 +1,7 @@
-import { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
+import axios from 'axios';
+import { API } from '../config';
+import { useAuth } from './AuthContext';
 
 // One shared store (Context, not a bare hook) — ThemeCustomizer.jsx (the
 // settings dropdown) and CustomBackgroundLayer.jsx (the fixed image/video
@@ -95,6 +98,44 @@ function extractDominantColor({ bgImage, bgVideo }) {
 
 export function CustomThemeProvider({ children }) {
   const [custom, setCustom] = useState(loadStored);
+  const { user, loading: authLoading } = useAuth();
+  // undefined = "haven't seen an auth result yet" — distinct from null
+  // (confirmed logged out) so the very first resolution on a page a
+  // visitor was never logged in on doesn't get treated as a "logout".
+  const lastUserIdRef = useRef(undefined);
+  // Set right before a setCustom call that came FROM the server/a logout
+  // reset, so the sync-to-server effect below doesn't immediately PUT that
+  // same value straight back (or PUT a reset caused by logging out, which
+  // has no session to send it with anyway).
+  const skipNextSyncRef = useRef(false);
+
+  // Account sync: adopt the signed-in user's own saved theme (so a
+  // different device/browser shows the same look), and clear back to
+  // defaults on logout so this account's customization doesn't leak to
+  // whoever uses the browser next.
+  useEffect(() => {
+    if (authLoading) return;
+    const uid = user?.id ?? null;
+    if (uid === lastUserIdRef.current) return;
+    const hadKnownUser = lastUserIdRef.current !== undefined;
+    lastUserIdRef.current = uid;
+
+    if (uid) {
+      (async () => {
+        try {
+          const res = await axios.get(`${API}/api/me/custom-theme`);
+          skipNextSyncRef.current = true;
+          setCustom(res.data.customTheme || {});
+        } catch {
+          // Offline or the request failed — keep whatever's already
+          // applied (local cache) rather than wiping a working look.
+        }
+      })();
+    } else if (hadKnownUser) {
+      skipNextSyncRef.current = true;
+      setCustom({});
+    }
+  }, [user, authLoading]);
 
   useEffect(() => {
     const root = document.documentElement.style;
@@ -151,7 +192,28 @@ export function CustomThemeProvider({ children }) {
       // ponytail: localStorage ceiling — move media to IndexedDB if
       // "quota exceeded" turns out to be a common complaint, not before.
     }
-  }, [custom]);
+
+    // A value that just arrived FROM the server (or a logout reset) has
+    // nowhere useful to go back to — skip once rather than round-tripping
+    // it right back to PUT.
+    if (skipNextSyncRef.current) {
+      skipNextSyncRef.current = false;
+      return;
+    }
+    if (!user?.id) return;
+    // Debounced — a color input fires on every drag tick, not just on
+    // release, and a background image/video turns this into a real
+    // multi-MB request that a student's typo-fast clicking shouldn't repeat
+    // dozens of times a second.
+    const timer = setTimeout(() => {
+      axios.put(`${API}/api/me/custom-theme`, { customTheme: custom }).catch(() => {
+        // Best-effort, same posture as NotificationBell's mark-read call —
+        // worst case this device's look doesn't reach the account this
+        // time; it'll try again on the next change.
+      });
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [custom, user?.id]);
 
   const setAccent = useCallback((hex) => setCustom((c) => ({ ...c, accent: hex })), []);
   const setBg = useCallback((hex) => setCustom((c) => ({ ...c, bg: hex })), []);

@@ -1,45 +1,10 @@
 import ThemeCustomizer from './ThemeCustomizer';
 
-function SunIcon() {
-  return (
-    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" aria-hidden="true">
-      <circle cx="10" cy="10" r="3.2" />
-      <path d="M10 1.5v2M10 16.5v2M18.5 10h-2M3.5 10h-2M15.7 4.3l-1.4 1.4M5.7 14.3l-1.4 1.4M15.7 15.7l-1.4-1.4M5.7 5.7 4.3 4.3" />
-    </svg>
-  );
-}
-
-function MoonIcon() {
-  return (
-    <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
-      <path d="M15.5 12.6A6.8 6.8 0 0 1 7.4 4.5a.6.6 0 0 0-.8-.7A7.9 7.9 0 1 0 16.2 13.4a.6.6 0 0 0-.7-.8Z" />
-    </svg>
-  );
-}
-
+// Thin passthrough — kept as its own file/name since ~20 pages already
+// import ThemeToggle, but the actual light/dark control now lives inside
+// ThemeCustomizer's single settings dropdown (bundled with accent/
+// background/text customization per the user's own request), not as a
+// separate button next to it.
 export default function ThemeToggle({ theme, onToggle }) {
-  const isDark = theme === 'dark';
-
-  return (
-    // A single wrapping element (not a bare Fragment) so callers that place
-    // ThemeToggle with justify-content: space-between (Login.jsx's
-    // .auth-card-head) treat customize+toggle as one group instead of
-    // spreading them apart — internal gap keeps the two icons adjacent
-    // wherever this lands.
-    <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-      {/* Rendered here (rather than each of the ~20 pages that use
-          ThemeToggle adding it individually) so it lands in every top bar,
-          right before this button, with zero per-page changes. */}
-      <ThemeCustomizer />
-      <button
-        type="button"
-        className="icon-btn"
-        onClick={onToggle}
-        aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-        title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-      >
-        {isDark ? <SunIcon /> : <MoonIcon />}
-      </button>
-    </div>
-  );
+  return <ThemeCustomizer theme={theme} onToggle={onToggle} />;
 }

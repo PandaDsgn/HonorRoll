@@ -166,6 +166,26 @@ async function ensureUsersFailedLoginLockoutColumn() {
 }
 bootSchemaStep(ensureUsersFailedLoginLockoutColumn);
 
+// Global per-identity, not per-org — a personal look-and-feel preference
+// (ThemeCustomizer.jsx's accent/background/text/card-opacity choices, plus
+// a background image/video's own base64 data URL) should follow the
+// person across organizations and devices, same "belongs to them, not the
+// institution" reasoning as tos_accepted_at above. One JSONB blob rather
+// than a column per field — the shape is entirely frontend-owned and
+// expected to grow, so keeping it schemaless here avoids a migration every
+// time ThemeCustomizer.jsx adds another customizable property. Postgres
+// TOASTs large JSONB values automatically, so a multi-MB background media
+// string here is unremarkable at the storage layer.
+async function ensureUsersCustomThemeColumn() {
+  await ensureUsersSchema();
+  try {
+    await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS custom_theme JSONB');
+  } catch (err) {
+    console.error('Failed to ensure users.custom_theme:', err);
+  }
+}
+bootSchemaStep(ensureUsersCustomThemeColumn);
+
 // The other founding table nothing ever created — same gap as `users`
 // (see ensureUsersSchema's own comment): every ALTER-column function below
 // (org/subject/submission_mode/time_limit) and everything that joins

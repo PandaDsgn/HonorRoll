@@ -1,9 +1,11 @@
-/* Top-bar "customize appearance" control — rendered by ThemeToggle.jsx
-   immediately before its own sun/moon button, so it shows up in every
+/* Top-bar "Settings" control — rendered by ThemeToggle.jsx (which is now
+   just a thin passthrough to this component), so it shows up in every
    page's .sb-actions row with zero changes to the ~20 pages that render
-   ThemeToggle. Trigger reuses .icon-btn (index.css) directly; only the
-   dropdown below needs its own rules, same anchored-panel shape as
-   NotificationBell's own dropdown. */
+   ThemeToggle. Bundles the light/dark switch and all appearance
+   customization into one dropdown instead of two separate buttons.
+   Trigger reuses .icon-btn (index.css) directly; only the dropdown below
+   needs its own rules, same anchored-panel shape as NotificationBell's own
+   dropdown. */
 
 .customize-container { position: relative; }
 
@@ -59,6 +61,18 @@
   color: var(--text);
 }
 .customize-row-stack input[type='range'] { width: 100%; accent-color: var(--accent); }
+
+/* Light/Dark — two equal buttons filling the dropdown's width, rather than
+   .segmented's usual content-hugging size, so it reads as a real switch
+   instead of two stray buttons. */
+.customize-mode-toggle { width: 100%; flex-wrap: nowrap; }
+.customize-mode-toggle button {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
 
 .customize-divider { height: 1px; background: var(--border); margin: 0 -14px; }
 

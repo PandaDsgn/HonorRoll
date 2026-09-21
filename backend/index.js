@@ -59,6 +59,15 @@ app.set('trust proxy', 'loopback, linklocal, uniquelocal');
 // one has already consumed the stream, making it a no-op. This costs
 // nothing for every other route (multer's multipart CSV upload is never
 // touched by express.json() regardless).
+// Registered ahead of the general parser below so it wins for this one
+// path — a custom background image/video's base64 data URL can land well
+// north of the app-wide 100kb JSON default. body-parser skips re-parsing
+// once req._body is already set, so falling through to the general
+// express.json() call right after this is a safe no-op for these requests,
+// while every other path is untouched and still gets the small default
+// (raising the limit globally would mean any unauthenticated route also
+// accepts multi-MB bodies, not just this authenticated one).
+app.use('/api/me/custom-theme', express.json({ limit: '15mb' }));
 app.use(express.json({
   verify: (req, res, buf) => { req.rawBody = buf; },
 }));

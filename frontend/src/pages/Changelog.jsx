@@ -4,16 +4,24 @@ import LegalShell from '../components/LegalShell';
 // history, not a promise of exact release timestamps.
 const ENTRIES = [
   {
-    date: '18 September 2026',
+    date: '21 September 2026',
     tag: 'Latest',
+    items: [
+      'Added a personal appearance customizer to every page\'s top bar — pick your own accent, background, card, and text colors instead of just switching between light and dark.',
+      'A custom background can now be a solid color, an uploaded image, or a looping video, with a one-click option to auto-pick an accent color from whatever you upload.',
+      'Added a card transparency slider, so a busy background image or video can actually show through your cards instead of being hidden behind them.',
+      'Your customized appearance now follows your account across every device and browser you sign in on, instead of resetting each time.',
+    ],
+  },
+  {
+    date: '18 September 2026',
+    tag: 'Added',
     items: [
       'Doubt threads now have a Follow button — follow one you\'re not the asker of to get notified on every new reply, and post your own follow-up question in it too.',
       'A message you\'ve reported in chat now shows as "<Redacted>" instead of its original text, with a button to reveal it again if you want to re-read it.',
       'Added an institution switcher — anyone who belongs to more than one institution (a student tutoring elsewhere, a teacher moonlighting at a second school, ...) can now flip between them right from their dashboard, instead of logging out and signing back in.',
       'Admins can now message students directly in chat, in every institution, once they\'re assigned to teach a subject — the same way a teacher already could.',
       'Small tuition centers can now sign up as a "Single Teacher Organization" — no institutional email address required. The founder is automatically set up to teach every subject they create, and can toggle between an admin view and a teacher view from their dashboard.',
-      'Added a feature to host live classes — teachers can start a class, students can join in real-time and interact with the teacher.',
-      'Teachers have access to a record feature that allows recording of the camera of the teacher during the live class.'
     ],
   },
   {

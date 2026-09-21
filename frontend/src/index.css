@@ -1425,16 +1425,22 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
 .error-page-actions { margin-top: 8px; }
 
 /* ---------- landing / home page ---------- */
-/* Blueprint layout: bleeding macro headline, hard rules spanning full
-   width, a grid-with-1px-gap feature strip, one hazard-red callout block.
-   See Home.jsx for the markup this styles. */
+/* Macro headline stays bleeding-huge (the brutalist type voice this pass
+   keeps on purpose), but the surrounding geometry is minimalist-ui's: real
+   cards with their own border/radius/whitespace instead of edge-to-edge
+   tiles and a solid full-bleed accent block. See Home.jsx for the markup
+   this styles. .rule itself is also used by ErrorPage.jsx (same
+   .landing-shell wrapper) — Home no longer renders it at all (its own
+   .sb-topbar already carries a border-bottom, so a second hard rule right
+   under it was pure redundancy) but the class stays defined for that
+   other caller. */
 .landing-shell {
   min-height: 100%;
   display: flex;
   flex-direction: column;
 }
 
-.rule { border: none; border-top: 1px solid var(--border-strong); margin: 0; width: 100%; }
+.rule { border: none; border-top: 1px solid var(--border); margin: 0; width: 100%; }
 
 .hero-band {
   flex: 1;
@@ -1638,55 +1644,57 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
 .showcase-scan-lines span { display: block; height: 8px; background: var(--border-strong); }
 
 /* Four equal cards, two on each side — a 2x2 grid, not a 3-across row.
-   Grid-with-1px-gap trick (skill directive #1): the parent's own background
-   IS the dividing line color, so cells need no border declarations of their
-   own to get razor-thin rules between them. */
+   Real gap + each card as its own bordered/radiused surface, not the old
+   edge-to-edge "parent background is the divider line" trick — that read
+   as a tiled industrial panel; floating cards in whitespace is the
+   minimalist read of the exact same four items. */
 .feature-row {
   max-width: 1280px;
   width: 100%;
   margin: 0 auto;
+  padding: 72px 24px;
   display: grid;
   grid-template-columns: repeat(2, 1fr);
   grid-template-rows: repeat(2, 1fr);
-  gap: 2px;
-  background: var(--border-strong);
-  border-top: 1px solid var(--border-strong);
-  border-bottom: 1px solid var(--border-strong);
+  gap: 20px;
 }
-.feature-card { background: var(--bg); padding: 32px; display: flex; flex-direction: column; justify-content: center; }
+.feature-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 32px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  transition: box-shadow 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+}
+.feature-card:hover { border-color: var(--border-strong); box-shadow: var(--shadow-lg); transform: translateY(-2px); }
 .feature-card-title { font-size: 16px; font-weight: 800; text-transform: uppercase; letter-spacing: -0.01em; color: var(--text-h); margin: 0 0 10px; }
 .feature-card-desc { font-size: 14px; color: var(--text-dim); line-height: 1.6; margin: 0; }
 
-/* The one hazard-red block on the page — everything else stays monochrome
-   so this actually reads as the one place demanding attention. */
+/* Was a solid full-bleed accent-fill block — minimalist-ui explicitly
+   bans a primary-colored background on a large section ("no bright blue/
+   green/red hero sections"). Same title/sub/button, same one CTA, just a
+   contained neutral card now; the accent lives on the button alone
+   (.btn-primary), which is where minimalist wants color spent. */
 .callout-coral {
   max-width: 1280px;
   width: 100%;
-  margin: 0 auto;
-  padding: 56px 24px;
-  background: var(--accent);
-  color: var(--on-accent);
+  margin: 0 auto 24px;
+  padding: 64px 24px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
   text-align: center;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 12px;
 }
-.callout-coral-title { color: var(--on-accent); font-size: clamp(24px, 3vw, 36px); }
-.callout-coral-sub { max-width: 480px; font-size: 15px; line-height: 1.5; font-family: var(--font-sans); }
-.callout-coral-btn {
-  margin-top: 10px;
-  background: var(--bg);
-  color: var(--accent);
-  border-color: var(--bg);
-  padding: 12px 26px;
-  font-size: 13px;
-}
-/* Not a fade toward a neutral gray surface (reads as "disabled," not
-   "hovered") — flips to the accent's own hover shade instead, which is a
-   different blue in both themes (darker in Swiss Print, brighter in
-   Tactical Telemetry) against the band's flat accent fill, plus a lift. */
-.callout-coral-btn:hover { background: var(--accent-strong); color: var(--bg); border-color: var(--accent-strong); transform: translateY(-1px); }
+.callout-coral-title { color: var(--text-h); font-size: clamp(24px, 3vw, 36px); }
+.callout-coral-sub { max-width: 480px; font-size: 15px; line-height: 1.5; font-family: var(--font-sans); color: var(--text-dim); }
+.callout-coral-btn { margin-top: 10px; padding: 12px 26px; font-size: 13px; }
 
 .landing-footer {
   display: flex;
@@ -1694,6 +1702,10 @@ input[type='file']::file-selector-button:hover { color: var(--text); border-colo
   align-items: center;
   gap: 8px;
   padding: 24px 24px 28px;
+  /* Replaces the standalone <hr> Home.jsx used to render right before this
+     — one hairline divider, owned by the element it actually separates,
+     instead of a free-floating rule tag. */
+  border-top: 1px solid var(--border);
 }
 
 .landing-footer-links { display: flex; align-items: center; gap: 10px; }
