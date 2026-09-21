@@ -1,0 +1,29 @@
+name: Keep backend alive
+
+# Render's free tier spins the backend down after ~15 minutes with no
+# traffic, so the next real request pays a cold start (the whole Node
+# process + DB pool warming back up, several seconds slow). A ping well
+# under that window keeps it warm. /health is the right target — already
+# exempt from the app's own rate limiter (see backend/index.js's own
+# comment on that route) and runs a real `SELECT 1` against Postgres, so a
+# non-200 here means something actually is wrong, not just "cold."
+#
+# Note: GitHub auto-disables scheduled workflows after 60 days with no
+# commits to the repo — not a concern for an actively-worked repo, but
+# worth knowing if this one ever goes quiet.
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping backend health check
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' https://codejudge-6tnw.onrender.com/health)
+          echo "Health check responded with $status"
+          if [ "$status" -ne 200 ]; then
+            echo "::warning::Backend health check returned $status"
+          fi
